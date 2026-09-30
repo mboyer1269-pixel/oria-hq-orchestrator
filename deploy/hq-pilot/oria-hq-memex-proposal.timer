@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep HQ scoped Memex proposal credential current
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=20min
+AccuracySec=30s
+Unit=oria-hq-memex-proposal.service
+
+[Install]
+WantedBy=timers.target

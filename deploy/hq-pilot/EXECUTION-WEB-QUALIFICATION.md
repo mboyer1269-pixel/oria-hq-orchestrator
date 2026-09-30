@@ -1,0 +1,11 @@
+# Current web candidate — authenticated preparation
+
+2026-09-30: review staging at VPS loopback3334 now runs web image `sha256:5b3b486a13a9d34017c0fc7bc39153ece8d692a366eeeeb0cdfe6d7ccead2400`. Active HQ at3321 was not replaced. Previous staging container retained stopped as `oria-hq-tool-review-staging-before-execution-6225d49c`; no volume or database deletion. The replacement script validated the exact previous image, loopback binding and absence of mounts before changing staging. On failure it would preserve the failed candidate and restore the previous listener.
+
+Health200. Launch and tool-review flags remain0, durable draft creationfalse. Confirmation capability remains1 as in previous staging; no confirmation was submitted. Staging uses the existing owner/Supabase configuration and real database, so this is not a disposable-data environment.
+
+Actual IAB browser tab17 reloaded `/hq/missions` successfully using the existing user session. It displayed the existing persisted development mission, unassigned and without a reported result. Opening preparation showed no configured project memory. Read-only preparation using commit `d4a37f9a3c85615e03cca89b5c47de094581594c`, executor1.50.0 and budgets100c/20000tokens/20iterations/600seconds returned the matching dossier and the message that no authorization had been recorded. The confirmation checkbox remained unchecked and the reservation button disabled. No mission authorization, reservation, tool approval or model request was submitted.
+
+This proves authenticated owner access and preparation for the observed session/mission. It does not prove other-user rejection/RLS isolation, a memory-attached v2 dossier, reservation, launch or a successful coding mission. Without the governed project memory connection, this preparation is not eligible for the integrated project-source consumer. Attach memory before preparing and confirming the final dossier; do not treat this intermediate preview as executable.
+
+Next: approved project memory publication and scoped read handle, staging connection registry/TLS mounts, v2 preparation; pending Claude consent and provider profile; then owner-confirmed execution and independent review. Browser tab retained for continuation. No app source files changed in this deployment step.

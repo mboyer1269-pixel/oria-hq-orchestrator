@@ -1,0 +1,37 @@
+{
+  "launchId": "a01be79f-f769-4e5a-b603-5fc8bdb9e575",
+  "image": "sha256:ecfafc87bc148d922dd4d43c3c5d3bb80f4a0828e4ff9af22ef80b7bd5c2924d",
+  "syntheticAcp": true,
+  "actualSdkAndEntryPoint": true,
+  "process": {
+    "status": "exited",
+    "exitCode": 0,
+    "elapsedSeconds": 9.77,
+    "containerStopped": true,
+    "containerRetained": true,
+    "deadlineExceeded": false,
+    "interrupted": false,
+    "providerCancellationVerified": false,
+    "hardTokenLimitEnforced": false
+  },
+  "outcome": {
+    "payloadHash": "b35a74bceb42814a9368855aaf883c9c9d80c602fb73ba0973524d9b44b34ad0",
+    "state": "agent_returned",
+    "independentValidationPassed": false,
+    "hardTokenLimitEnforced": false,
+    "permissions": "default_deny",
+    "externalDeadlineRequired": true,
+    "sdkExecutionStatus": "finished"
+  },
+  "transport": {
+    "syntheticAcp": true,
+    "proxyEnvironmentVerified": true,
+    "accountConnectorsDisabled": true,
+    "providerTlsVerified": true,
+    "foreignHostDenied": true,
+    "modelRequests": 0
+  },
+  "gatewayState": "closed",
+  "alteredBindingsRefused": 3,
+  "modelRequests": 0
+}

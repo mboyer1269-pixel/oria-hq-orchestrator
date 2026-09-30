@@ -1,0 +1,116 @@
+{
+  "services": {
+    "antigravity-runner": {
+      "image": "oria-provider-ssh-runner:paperclip-29c8fb0",
+      "user": "1000:1000",
+      "restart": "no",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cpus": "1.00",
+      "mem_limit": "1536m",
+      "memswap_limit": "1536m",
+      "pids_limit": 192,
+      "environment": {
+        "HOME": "/paperclip",
+        "NODE_OPTIONS": "--max-old-space-size=768"
+      },
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=192m,mode=1777"
+      ],
+      "volumes": [
+        "antigravity-home:/paperclip",
+        "antigravity-workspace:/workspace",
+        "antigravity-hostkeys:/var/lib/oria-ssh",
+        {
+          "type": "bind",
+          "source": "${ANTIGRAVITY_BINARY_PATH:?Set verified Antigravity binary path}",
+          "target": "/opt/antigravity/antigravity",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${ANTIGRAVITY_MODULE_PATH:?Set reviewed integration module directory}",
+          "target": "/opt/oria-antigravity",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${ANTIGRAVITY_DEADLINE_WRAPPER:?Set reviewed bounded-command.sh path}",
+          "target": "/opt/oria-runner/bounded-command.sh",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "configs": [
+        {
+          "source": "antigravity-authorized-keys",
+          "target": "/etc/oria-runner/authorized_keys",
+          "mode": 292
+        }
+      ],
+      "networks": [
+        "antigravity-control",
+        "antigravity-egress"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "const s=require('node:net').connect(2222,'127.0.0.1');s.setTimeout(2000);s.on('data',d=>{s.destroy();process.exit(d.toString().startsWith('SSH-2.0-')?0:1)});s.on('error',()=>process.exit(1));s.on('timeout',()=>process.exit(1));"
+        ],
+        "interval": "15s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "10s"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "configs": {
+    "antigravity-authorized-keys": {
+      "file": "${ANTIGRAVITY_AUTHORIZED_KEYS_FILE:?Set dedicated public authorized_keys file}"
+    }
+  },
+  "volumes": {
+    "antigravity-home": {
+      "name": "oria-antigravity-home",
+      "external": true
+    },
+    "antigravity-workspace": {
+      "name": "oria-antigravity-workspace"
+    },
+    "antigravity-hostkeys": {
+      "name": "oria-antigravity-ssh-hostkeys"
+    }
+  },
+  "networks": {
+    "antigravity-control": {
+      "name": "oria-antigravity-control",
+      "internal": true
+    },
+    "antigravity-egress": {
+      "name": "oria-antigravity-egress",
+      "internal": false
+    }
+  }
+}

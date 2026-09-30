@@ -1,0 +1,95 @@
+{
+  "results": [
+    {
+      "launchId": "a4c3d210-bd34-462d-8f4a-fea0287efc77",
+      "intentionalFailure": false,
+      "journalState": "closed",
+      "resourcesAbsent": true,
+      "probe": {
+        "passed": true,
+        "checks": [
+          {
+            "case": "example.com:443",
+            "method": "CONNECT",
+            "denied": true
+          },
+          {
+            "case": "127.0.0.1:443",
+            "method": "CONNECT",
+            "denied": true
+          },
+          {
+            "case": "169.254.169.254:443",
+            "method": "CONNECT",
+            "denied": true
+          },
+          {
+            "case": "api.anthropic.com:80",
+            "method": "CONNECT",
+            "denied": true
+          },
+          {
+            "case": "api.anthropic.com.evil.example:443",
+            "method": "CONNECT",
+            "denied": true
+          },
+          {
+            "case": "http://api.anthropic.com/",
+            "method": "GET",
+            "denied": true
+          },
+          {
+            "case": "allowed-provider-tls",
+            "host": "api.anthropic.com",
+            "verified": true,
+            "protocol": "TLSv1.3",
+            "elapsedMs": 37
+          },
+          {
+            "case": "allowed-provider-tls",
+            "host": "claude.ai",
+            "verified": true,
+            "protocol": "TLSv1.3",
+            "elapsedMs": 39
+          },
+          {
+            "case": "allowed-provider-tls",
+            "host": "claude.com",
+            "verified": true,
+            "protocol": "TLSv1.3",
+            "elapsedMs": 38
+          },
+          {
+            "case": "allowed-provider-tls",
+            "host": "platform.claude.com",
+            "verified": true,
+            "protocol": "TLSv1.3",
+            "elapsedMs": 38
+          },
+          {
+            "case": "direct-1.1.1.1",
+            "blocked": true
+          },
+          {
+            "case": "direct-169.254.169.254",
+            "blocked": true
+          },
+          {
+            "case": "cli-loopback-relay",
+            "allowedTlsVerified": true,
+            "foreignHostDenied": true
+          }
+        ],
+        "modelRequests": 0
+      }
+    },
+    {
+      "launchId": "eba0d1cb-1c34-4b20-8c09-241c40b9394b",
+      "intentionalFailure": true,
+      "journalState": "closed",
+      "resourcesAbsent": true
+    }
+  ],
+  "modelRequests": 0,
+  "productionChanged": false
+}

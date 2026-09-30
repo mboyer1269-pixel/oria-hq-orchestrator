@@ -1,0 +1,11 @@
+{
+  "$meta": {"version": 1, "updatedAt": "2026-09-29T00:00:00.000Z", "source": "configure"},
+  "database": {"mode": "postgres", "backup": {"enabled": false}},
+  "logging": {"mode": "file", "logDir": "/paperclip/instances/pilot/logs"},
+  "server": {"deploymentMode": "authenticated", "exposure": "private", "host": "0.0.0.0", "port": 3100, "allowedHostnames": ["localhost", "127.0.0.1"], "serveUi": true},
+  "auth": {"baseUrlMode": "explicit", "publicBaseUrl": "http://localhost:3310", "disableSignUp": true},
+  "telemetry": {"enabled": false},
+  "updates": {"checkEnabled": false},
+  "storage": {"provider": "local_disk", "localDisk": {"baseDir": "/paperclip/instances/pilot/data/storage"}},
+  "secrets": {"provider": "local_encrypted", "strictMode": true, "localEncrypted": {"keyFilePath": "/paperclip/instances/pilot/secrets/master.key"}}
+}

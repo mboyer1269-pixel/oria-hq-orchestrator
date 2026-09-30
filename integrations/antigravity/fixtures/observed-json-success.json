@@ -1,0 +1,14 @@
+{
+  "conversation_id": "11111111-1111-4111-8111-111111111111",
+  "status": "SUCCESS",
+  "response": "ANTIGRAVITY_READY\n",
+  "duration_seconds": 2.439259748,
+  "num_turns": 1,
+  "usage": {
+    "input_tokens": 13807,
+    "output_tokens": 6,
+    "thinking_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_tokens": 13813
+  }
+}

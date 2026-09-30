@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!claude-agent-acp
+!package.json
+!package-lock.json

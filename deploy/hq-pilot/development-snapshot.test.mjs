@@ -1,0 +1,24 @@
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {execFileSync} from 'node:child_process';
+import {classifyPath,validateEnvTemplate,planDevelopmentSnapshot,exportDevelopmentSnapshot} from './development-snapshot.mjs';
+function fixture(){const parent=fs.mkdtempSync(path.join(os.tmpdir(),'hq-dev-snapshot-'));const source=path.join(parent,'repo');fs.mkdirSync(source);execFileSync('git',['init','--quiet',source]);
+ const write=(rel,text)=>{const file=path.join(source,rel);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,text);};
+ for(const file of ['package.json','package-lock.json','tsconfig.json'])write(file,'{}');for(const file of ['AGENTS.md','SOUL.md','run-tests.mjs'])write(file,'// fixture\n');write('src/example.test.mjs','// test\n');write('.gitignore','.env.local\nnode_modules/\n.next/\n');
+ execFileSync('git',['-C',source,'add','.']);return {parent,source,write,clean:()=>fs.rmSync(parent,{recursive:true,force:true})};}
+test('tracked and new source preserved with test infrastructure; ignored/runtime absent',()=>{const f=fixture();try{
+ f.write('src/new.ts','export const value=1;');f.write('docs/guide.md','# Guide');f.write('scripts/audit/check.mjs','// check');f.write('.github/workflows/ci.yml','name: test');f.write('db/schema.sql','select 1;');f.write('.env.example','API_KEY=\nORIA_ENABLE_TEST=0\n');
+ for(const file of ['.env.local','node_modules/private.js','.next/cache.json','memory/runtime.md','db/documents.json','src/secrets/key.pem'])f.write(file,'PRIVATE');
+ const out=path.join(f.parent,'export');const result=exportDevelopmentSnapshot(f.source,out);assert.ok(result.files>6);
+ for(const file of ['AGENTS.md','SOUL.md','run-tests.mjs','src/new.ts','scripts/audit/check.mjs','.github/workflows/ci.yml','.env.example'])assert.equal(fs.readFileSync(path.join(out,file),'utf8'),fs.readFileSync(path.join(f.source,file),'utf8'));
+ for(const file of ['.git','.env.local','node_modules','.next','memory','db/documents.json','src/secrets'])assert.equal(fs.existsSync(path.join(out,file)),false);
+ const manifest=JSON.parse(fs.readFileSync(path.join(out,'development-source-manifest.json'),'utf8'));assert.ok(manifest.files.find(x=>x.path==='src/new.ts').sha256);assert.equal(manifest.dependenciesIncluded,false);
+ }finally{f.clean();}});
+test('invalid template and hardcoded credential-like payload abort before destination created',()=>{const f=fixture();try{f.write('.env.example','API_KEY=nonempty\n');const out=path.join(f.parent,'export');assert.throws(()=>exportDevelopmentSnapshot(f.source,out),/template/);assert.equal(fs.existsSync(out),false);fs.unlinkSync(path.join(f.source,'.env.example'));f.write('src/private.ts','const value="'+'sk-proj-'+'a'.repeat(40)+'";');assert.throws(()=>planDevelopmentSnapshot(f.source),/Credential-like/);}finally{f.clean();}});
+test('binary masquerading as source and selected directory symlink refused',()=>{const f=fixture();try{f.write('src/binary.ts',Buffer.from([0,255,0]));assert.throws(()=>planDevelopmentSnapshot(f.source),/Non-text|Binary/);fs.unlinkSync(path.join(f.source,'src/binary.ts'));const outside=path.join(f.parent,'outside');fs.mkdirSync(outside);fs.writeFileSync(path.join(outside,'unsafe.ts'),'secret');fs.symlinkSync(outside,path.join(f.source,'src/linked'),'junction');assert.throws(()=>planDevelopmentSnapshot(f.source),/Symlink|tests missing/);}finally{f.clean();}});
+test('path and destination boundaries, template flags default off only',()=>{for(const p of ['../escape','src/../escape','C:/private','src\\private','/root'])assert.throws(()=>classifyPath(p));assert.equal(classifyPath('src/.env.production'),'private_or_runtime');assert.equal(classifyPath('src/token.json'),'private_or_runtime');assert.throws(()=>validateEnvTemplate('ORIA_ENABLE_TEST=1'));const f=fixture();try{assert.throws(()=>exportDevelopmentSnapshot(f.source,path.join(f.source,'export')),/outside/);assert.throws(()=>exportDevelopmentSnapshot(f.source,f.source),/exists/);}finally{f.clean();}});
+
+test('npmrc permits only engine strict with harmless comments, refuses auth and registry before copy',()=>{const f=fixture();try{
+ f.write('.npmrc','# Require supported Node\n; Development setting\nengine-strict=true\n');const valid=planDevelopmentSnapshot(f.source);assert.ok(valid.files.some(file=>file.path==='.npmrc'));
+ for(const text of ['engine-strict=true\n//registry.example/:_authToken=synthetic\n','engine-strict=true\nregistry=https://registry.example\n','engine-strict=false\n','engine-strict=true\n# _authToken=synthetic\n']){
+  f.write('.npmrc',text);const out=path.join(f.parent,'export');assert.throws(()=>exportDevelopmentSnapshot(f.source,out),/npm configuration/);assert.equal(fs.existsSync(out),false);
+ }
+ }finally{f.clean();}});

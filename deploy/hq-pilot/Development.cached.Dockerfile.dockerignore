@@ -1,0 +1,17 @@
+# Development tests/docs are required here, unlike the runtime Docker context.
+.git
+node_modules
+.next
+coverage
+*.tsbuildinfo
+.env*
+**/.env*
+!.env.example
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.db
+**/*.sqlite
+.agentmemory
+.ssh

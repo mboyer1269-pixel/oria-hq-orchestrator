@@ -1,0 +1,81 @@
+// Runs both real repositories against disposable local databases; never touches runtime credentials.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+const [hqArg, memexArg] = process.argv.slice(2);
+if (!hqArg || !memexArg) throw Error('Expected HQ and Memex repository directories');
+const hq = fs.realpathSync(hqArg), memex = fs.realpathSync(memexArg);
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-memex-contribution-'));
+process.env.AGENTMEMORY_VAULT_PATH = path.join(root, 'vault');
+process.env.AGENTMEMORY_HANDLE_SECRET = crypto.randomBytes(32).toString('hex');
+process.env.GATEWAY_DEFAULT_ACCESS = 'read_write';
+delete process.env.GATEWAY_TOKEN;
+delete process.env.GATEWAY_NAMESPACES;
+const load = relative => import(pathToFileURL(path.join(memex,relative)).href);
+const { initGraph, closeGraph } = await load('src/graph.ts');
+const { initIntake, getIntakeDb } = await load('src/db/intake.ts');
+const { createHttpApp } = await load('src/mcp/unified-server.ts');
+const { mintHandle } = await load('src/mcp/handles.ts');
+const { createJiti } = await import(pathToFileURL(path.join(hq,'node_modules/jiti/lib/jiti.mjs')).href);
+const jiti = createJiti(path.join(hq,'package.json'),{alias:{'@':path.join(hq,'src'),'server-only':path.join(hq,'src/scripts/smoke/server-only-stub.mjs')}});
+const { createMemexProposalService } = await jiti.import(path.join(hq,'src/server/memory/memex-proposal-service.ts'));
+const { createMemorySearchHandler } = await jiti.import(path.join(hq,'src/app/api/memory/search/search-handler.ts'));
+initGraph(path.join(root,'graph.db'));
+initIntake(path.join(root,'intake.db'));
+const server = await new Promise(resolve => { const s=createHttpApp().listen(0,'127.0.0.1',()=>resolve(s)); });
+try {
+  const namespace='org:workspace:contract';
+  const env={ORIA_ENABLE_MEMEX_PROPOSALS:'1',MEMEX_HTTP_HQ_WORKSPACE_ID:'contract',MEMEX_HTTP_ENDPOINT:`http://127.0.0.1:${server.address().port}/mcp`,MEMEX_HTTP_PROPOSAL_HANDLE:mintHandle('hq-contract','read_write',process.env.AGENTMEMORY_HANDLE_SECRET,120,new Date(),[namespace])};
+  const service=createMemexProposalService({env:()=>env});
+  const input={workspaceId:'contract',requestId:crypto.randomUUID(),content:'Synthetic contract fact for isolated test only.'};
+  const first=await service.submitMemexProposal(input);
+  assert.equal(first.status,'received'); assert.equal(first.proposalStatus,'proposed');
+  initIntake(path.join(root,'intake.db'));
+  assert.deepEqual(await service.getMemexProposalReceipt(input),first);
+  assert.deepEqual(await service.submitMemexProposal(input),first);
+  assert.deepEqual(await service.submitMemexProposal({...input,content:'Changed payload'}),{status:'conflict'});
+  assert.equal(getIntakeDb().prepare('SELECT count(*) AS n FROM intake_proposals').get().n,1);
+  const other=createMemexProposalService({env:()=>({...env,MEMEX_HTTP_PROPOSAL_HANDLE:mintHandle('other-subject','read_write',process.env.AGENTMEMORY_HANDLE_SECRET,120,new Date(),[namespace])})});
+  assert.deepEqual(await other.getMemexProposalReceipt(input),{status:'not_found'});
+  assert.deepEqual(await service.getMemexProposalReceipt({...input,workspaceId:'foreign'}),{status:'workspace_unbound'});
+  assert.equal(getIntakeDb().prepare('SELECT status FROM intake_proposals').get().status,'proposed');
+  const readEnv = {...env, ORIA_ENABLE_MEMEX_HTTP_READONLY:'1', MEMEX_HTTP_READ_HANDLE:mintHandle('hq-reader','read_only',process.env.AGENTMEMORY_HANDLE_SECRET,120,new Date(),[namespace])};
+  const search=createMemorySearchHandler({authorize:async()=>null,workspaceId:()=>input.workspaceId,env:()=>readEnv});
+  const read=async()=>await (await search(new Request('http://hq.test/api/memory/search'))).json();
+  assert.deepEqual((await read()).records,[], 'Pending proposals must not enter agent read graph');
+  if (process.argv.includes('--review')) {
+    const { readProposal, promoteApprovedProposal } = await load('src/intake/promotion.ts');
+    const { reviewProposal, proposalReviewHash } = await load('src/intake/review.ts');
+    const snapshot=readProposal(first.proposalId);
+    const decision={namespace,proposalId:first.proposalId,expectedPayloadHash:proposalReviewHash(snapshot),reviewerId:'synthetic-human-reviewer',decisionId:crypto.randomUUID(),decision:'approve'};
+    assert.throws(()=>reviewProposal({...decision,expectedPayloadHash:'0'.repeat(64)}));
+    assert.throws(()=>reviewProposal({...decision,namespace:'org:workspace:foreign'}));
+    const reviewed=reviewProposal(decision);
+    initIntake(path.join(root,'intake.db'));
+    assert.deepEqual(reviewProposal(decision),reviewed);
+    assert.equal((await service.getMemexProposalReceipt(input)).proposalStatus,'approved');
+    assert.deepEqual((await read()).records,[], 'Approval alone must not publish');
+    promoteApprovedProposal(first.proposalId);
+    promoteApprovedProposal(first.proposalId);
+    closeGraph(); initGraph(path.join(root,'graph.db'),true);
+    initIntake(path.join(root,'intake.db'));
+    const published=await read();
+    assert.equal(published.status,'ready'); assert.equal(published.records.length,1);
+    assert.equal(published.records[0].content,input.content);
+    assert.equal(published.records[0].id,`publication:${first.proposalId}`);
+    assert.equal((await service.getMemexProposalReceipt(input)).proposalStatus,'promoted');
+    assert.equal(getIntakeDb().prepare("SELECT count(*) AS n FROM memory_publications WHERE phase='complete'").get().n,1);
+    const foreignSearch=createMemorySearchHandler({authorize:async()=>null,workspaceId:()=> 'foreign',env:()=>readEnv});
+    assert.equal((await (await foreignSearch(new Request('http://hq.test/api/memory/search'))).json()).status,'workspace_unbound');
+  }
+  console.log(JSON.stringify({realHttp:true,durableReceipt:'pass',retry:'same_id',conflict:'pass',subjectIsolation:'pass',workspaceIsolation:'pass',publication:process.argv.includes('--review')?'governed_local_review_and_HQ_read_pass':'not_performed'}));
+} finally {
+  server.closeAllConnections(); await new Promise(resolve=>server.close(resolve));
+  getIntakeDb().close(); closeGraph();
+  // Only the fixed-prefix temp directory created by this process is eligible for cleanup.
+  if (path.dirname(root)!==fs.realpathSync(os.tmpdir()) || !path.basename(root).startsWith('hq-memex-contribution-')) throw Error('Refuse cleanup outside test directory');
+  fs.rmSync(root,{recursive:true,force:true});
+}

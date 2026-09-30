@@ -1,0 +1,14 @@
+[Unit]
+Description=Renew project-only HQ Memex read access
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/oria-hq-pilot/rotate-project-memory-read.py
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/oria-hq-pilot/memex-project-read

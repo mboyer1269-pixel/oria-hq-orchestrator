@@ -1,0 +1,2 @@
+# The context has already been filtered and hashed by development-snapshot.mjs.
+# Preserve every exported file so the manifest can be verified inside the image.

@@ -1,0 +1,11 @@
+[
+  {
+    "workspaceId": "michael-hq",
+    "projectId": "oria-hq",
+    "label": "ORIA HQ — développement",
+    "namespace": "org:project:oria-hq",
+    "centerEntityId": "oria-hq-project-foundation-v1",
+    "endpoint": "https://memex-tls:3443/mcp",
+    "readHandleFile": "/run/memex-project-read/handle"
+  }
+]

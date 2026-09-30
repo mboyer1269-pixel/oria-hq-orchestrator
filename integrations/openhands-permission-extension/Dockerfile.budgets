@@ -1,0 +1,8 @@
+# Qualification only. The patch rejects a base with unexpected SDK source.
+FROM oria-openhands-claude:qualification1
+USER 0:0
+COPY *.py /extension/
+RUN python /extension/apply_budget_patch.py
+USER 10001:10001
+WORKDIR /tmp
+ENTRYPOINT ["python", "/extension/qualify_session_budgets.py"]

@@ -1,0 +1,18 @@
+{
+  "source": "https://github.com/paperclipai/paperclip.git",
+  "commit": "29c8fb0b66cb01167f71e7107a89628e36b5e032",
+  "scanHighFindings": 38,
+  "knowledgePackApprovedForIndex": false,
+  "executionPerformed": true,
+  "executionScope": "Root started the attested official image in the isolated VPS pilot; no downloaded source scripts were executed",
+  "observedOfficialImage": "ghcr.io/paperclipai/paperclip@sha256:c735428fa81a719c0f8ca194bb345d0cdaaf3187f2fbecea1933a8d0513caf86",
+  "observedLinuxAmd64Manifest": "sha256:5d1afe5e93cf20c43b7d5159dd45efa266fa79afa8822b03fd1586b24d7d5c0a",
+  "observationSource": "Root registry inspection; not independently verified by preparation agent",
+  "attestationVerified": true,
+  "attestationEvidence": "../../.validation/paperclip-attestation.json (root workspace)",
+  "attestationSigner": "paperclipai/paperclip/.github/workflows/docker.yml",
+  "postgresImage": "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+  "postgresObservedAmd64Version": "17.11-alpine3.24",
+  "deploymentApproved": true,
+  "deploymentScope": "Private synthetic pilot only under existing user mandate; no public rollout or provider execution"
+}

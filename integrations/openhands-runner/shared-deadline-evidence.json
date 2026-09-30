@@ -1,0 +1,17 @@
+{
+  "expiredDeadlinePreventedStart": true,
+  "nominalBudgetSeconds": 10,
+  "remainingBudgetSeconds": 1,
+  "process": {
+    "status": "deadline_exceeded",
+    "exitCode": 137,
+    "elapsedSeconds": 1.146,
+    "containerStopped": true,
+    "containerRetained": true,
+    "deadlineExceeded": true,
+    "interrupted": false,
+    "providerCancellationVerified": false,
+    "hardTokenLimitEnforced": false
+  },
+  "modelRequests": 0
+}

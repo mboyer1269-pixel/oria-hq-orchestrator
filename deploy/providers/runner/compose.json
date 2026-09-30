@@ -1,0 +1,186 @@
+{
+  "name": "oria-provider-runners",
+  "services": {
+    "gemini-runner": {
+      "image": "oria-provider-ssh-runner:paperclip-29c8fb0",
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "user": "1000:1000",
+      "restart": "no",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cpus": "1.00",
+      "mem_limit": "1536m",
+      "memswap_limit": "1536m",
+      "pids_limit": 192,
+      "environment": {
+        "HOME": "/paperclip",
+        "NODE_OPTIONS": "--max-old-space-size=768"
+      },
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=192m,mode=1777"
+      ],
+      "volumes": [
+        "gemini-home:/paperclip",
+        "gemini-workspace:/workspace",
+        "gemini-hostkeys:/var/lib/oria-ssh"
+      ],
+      "configs": [
+        {
+          "source": "gemini-authorized-keys",
+          "target": "/etc/oria-runner/authorized_keys",
+          "mode": 292
+        }
+      ],
+      "networks": [
+        "gemini-control",
+        "gemini-egress"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "const s=require('node:net').connect(2222,'127.0.0.1');s.setTimeout(2000);s.on('data',d=>{s.destroy();process.exit(d.toString().startsWith('SSH-2.0-')?0:1)});s.on('error',()=>process.exit(1));s.on('timeout',()=>process.exit(1));"
+        ],
+        "interval": "15s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "10s"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    },
+    "cursor-runner": {
+      "image": "oria-provider-ssh-runner:paperclip-29c8fb0",
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "user": "1000:1000",
+      "restart": "no",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cpus": "1.00",
+      "mem_limit": "1536m",
+      "memswap_limit": "1536m",
+      "pids_limit": 192,
+      "environment": {
+        "HOME": "/paperclip",
+        "NODE_OPTIONS": "--max-old-space-size=768"
+      },
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=192m,mode=1777"
+      ],
+      "volumes": [
+        "cursor-home:/paperclip",
+        "cursor-workspace:/workspace",
+        "cursor-hostkeys:/var/lib/oria-ssh",
+        {
+          "type": "bind",
+          "source": "${CURSOR_DIST_PATH:?Set verified Cursor dist-package directory}",
+          "target": "/opt/cursor",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "configs": [
+        {
+          "source": "cursor-authorized-keys",
+          "target": "/etc/oria-runner/authorized_keys",
+          "mode": 292
+        }
+      ],
+      "networks": [
+        "cursor-control",
+        "cursor-egress"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "const s=require('node:net').connect(2222,'127.0.0.1');s.setTimeout(2000);s.on('data',d=>{s.destroy();process.exit(d.toString().startsWith('SSH-2.0-')?0:1)});s.on('error',()=>process.exit(1));s.on('timeout',()=>process.exit(1));"
+        ],
+        "interval": "15s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "10s"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "configs": {
+    "gemini-authorized-keys": {
+      "file": "${GEMINI_AUTHORIZED_KEYS_FILE:?Set provider-specific public authorized_keys file}"
+    },
+    "cursor-authorized-keys": {
+      "file": "${CURSOR_AUTHORIZED_KEYS_FILE:?Set provider-specific public authorized_keys file}"
+    }
+  },
+  "volumes": {
+    "gemini-home": {
+      "name": "oria-gemini-home",
+      "external": true
+    },
+    "gemini-workspace": {
+      "name": "oria-gemini-workspace"
+    },
+    "gemini-hostkeys": {
+      "name": "oria-gemini-ssh-hostkeys"
+    },
+    "cursor-home": {
+      "name": "oria-cursor-home",
+      "external": true
+    },
+    "cursor-workspace": {
+      "name": "oria-cursor-workspace"
+    },
+    "cursor-hostkeys": {
+      "name": "oria-cursor-ssh-hostkeys"
+    }
+  },
+  "networks": {
+    "gemini-control": {
+      "name": "oria-gemini-control",
+      "internal": true
+    },
+    "gemini-egress": {
+      "name": "oria-gemini-egress",
+      "internal": false
+    },
+    "cursor-control": {
+      "name": "oria-cursor-control",
+      "internal": true
+    },
+    "cursor-egress": {
+      "name": "oria-cursor-egress",
+      "internal": false
+    }
+  }
+}

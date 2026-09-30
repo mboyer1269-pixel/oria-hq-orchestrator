@@ -1,0 +1,16 @@
+{
+  "services": {
+    "paperclip": {
+      "networks": [
+        "pilot-internal",
+        "antigravity-control"
+      ]
+    }
+  },
+  "networks": {
+    "antigravity-control": {
+      "name": "oria-antigravity-control",
+      "external": true
+    }
+  }
+}

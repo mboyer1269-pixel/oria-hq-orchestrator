@@ -1,0 +1,56 @@
+{
+  "services": {
+    "hq": {
+      "environment": {
+        "NODE_EXTRA_CA_CERTS": "/run/memex-ca/ca.crt",
+        "MEMEX_HTTP_ENDPOINT": "https://memex-tls:3443/mcp",
+        "MEMEX_HTTP_READ_HANDLE_FILE": "/run/memex-read/handle",
+        "ORIA_ENABLE_MEMEX_HTTP_READONLY": "1",
+        "MEMEX_HTTP_HQ_WORKSPACE_ID": "michael-hq",
+        "ORIA_ENABLE_MEMEX_PROPOSALS": "1",
+        "MEMEX_HTTP_PROPOSAL_HANDLE_FILE": "/run/memex-proposal/handle",
+        "ORIA_HQ_PUBLIC_ORIGIN": "http://localhost:3321"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${MEMEX_TLS_CA_FILE:?Set public CA certificate file}",
+          "target": "/run/memex-ca/ca.crt",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${MEMEX_HQ_HANDLE_DIRECTORY:?Set dedicated rotating handle directory}",
+          "target": "/run/memex-read",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/opt/oria-hq-pilot/memex-proposal",
+          "target": "/run/memex-proposal",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "networks": [
+        "hq-private",
+        "hq-egress",
+        "memex-tls"
+      ]
+    }
+  },
+  "networks": {
+    "memex-tls": {
+      "name": "oria-memex-tls-private",
+      "external": true
+    }
+  }
+}

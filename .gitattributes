@@ -1,0 +1,2 @@
+# Preserve Linux-compatible line endings for VPS entry points.
+*.sh text eol=lf

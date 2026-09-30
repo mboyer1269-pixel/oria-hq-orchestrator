@@ -1,0 +1,87 @@
+{
+  "runId": "hq-provider-probe-eeff823ee0db",
+  "runtimeImage": "sha256:3d8c97af6b8f1e6979596709f659124ca8f0319d5949e0f6f06f9c0287a7e11e",
+  "credentialsMounted": false,
+  "portsPublished": false,
+  "proxyImage": "sha256:34b6a346ca7be860dd4dc7ec2cf961659816cac77df9f71e9297590532e67325",
+  "policySha256": "0e89f8c258736ce30e465244f56c99cf2a7afc7e455b0887bddef634584c29ba",
+  "dockerBoundariesInspected": true,
+  "probe": {
+    "passed": true,
+    "checks": [
+      {
+        "case": "example.com:443",
+        "method": "CONNECT",
+        "denied": true
+      },
+      {
+        "case": "127.0.0.1:443",
+        "method": "CONNECT",
+        "denied": true
+      },
+      {
+        "case": "169.254.169.254:443",
+        "method": "CONNECT",
+        "denied": true
+      },
+      {
+        "case": "api.anthropic.com:80",
+        "method": "CONNECT",
+        "denied": true
+      },
+      {
+        "case": "api.anthropic.com.evil.example:443",
+        "method": "CONNECT",
+        "denied": true
+      },
+      {
+        "case": "http://api.anthropic.com/",
+        "method": "GET",
+        "denied": true
+      },
+      {
+        "case": "allowed-provider-tls",
+        "host": "api.anthropic.com",
+        "verified": true,
+        "protocol": "TLSv1.3",
+        "elapsedMs": 38
+      },
+      {
+        "case": "allowed-provider-tls",
+        "host": "claude.ai",
+        "verified": true,
+        "protocol": "TLSv1.3",
+        "elapsedMs": 27
+      },
+      {
+        "case": "allowed-provider-tls",
+        "host": "claude.com",
+        "verified": true,
+        "protocol": "TLSv1.3",
+        "elapsedMs": 28
+      },
+      {
+        "case": "allowed-provider-tls",
+        "host": "platform.claude.com",
+        "verified": true,
+        "protocol": "TLSv1.3",
+        "elapsedMs": 26
+      },
+      {
+        "case": "direct-1.1.1.1",
+        "blocked": true
+      },
+      {
+        "case": "direct-169.254.169.254",
+        "blocked": true
+      },
+      {
+        "case": "cli-loopback-relay",
+        "allowedTlsVerified": true,
+        "foreignHostDenied": true
+      }
+    ],
+    "modelRequests": 0
+  },
+  "proxyStats": "{\"BlockIO\":\"0B / 0B\",\"CPUPerc\":\"0.00%\",\"Container\":\"2ffbbf6c92b677d8af56cd4875e768091c86786c88b5b5398791c07b0a3ede5a\",\"ID\":\"2ffbbf6c92b6\",\"MemPerc\":\"4.84%\",\"MemUsage\":\"12.4MiB / 256MiB\",\"Name\":\"hq-provider-probe-eeff823ee0db\",\"NetIO\":\"23.9kB / 10.6kB\",\"PIDs\":\"3\"}"
+}

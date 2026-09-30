@@ -1,0 +1,7 @@
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
+USER 0:0
+COPY fake-acp.py /usr/local/bin/claude-agent-acp
+RUN chmod 0555 /usr/local/bin/claude-agent-acp
+LABEL oria.qualification.synthetic-acp="true"
+USER 10001:10001

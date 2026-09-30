@@ -1,0 +1,13 @@
+{
+  "launchId": "9372c4cf-329e-4d00-96f2-b649417ffb17",
+  "hostKilledBySigkill": true,
+  "proxyStoppedWithoutHostCleanup": true,
+  "proxyExitCode": 124,
+  "elapsedSeconds": 17.562,
+  "lifetimeSeconds": 16,
+  "graceSeconds": 5,
+  "journalStateAfterCrash": "ready",
+  "socketAcceptsConnections": false,
+  "modelRequests": 0,
+  "qualificationResourcesRemoved": true
+}

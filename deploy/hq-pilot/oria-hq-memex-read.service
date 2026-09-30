@@ -1,0 +1,15 @@
+[Unit]
+Description=Renew scoped HQ Memex read credential
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/oria-hq-pilot/rotate-memex-read.py
+UMask=0077
+RuntimeDirectory=oria-hq-memex-read
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/oria-hq-pilot/memex-read /run/oria-hq-memex-read

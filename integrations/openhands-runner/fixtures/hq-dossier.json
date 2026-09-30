@@ -1,0 +1,31 @@
+{
+  "contractVersion": 1,
+  "executor": "openhands",
+  "executorVersion": "1.50.0",
+  "mission": {
+    "id": "465cb356-ebe1-5bd4-8d1a-ad6ab5ea5eb9",
+    "workspaceId": "synthetic-a",
+    "modeId": "hq",
+    "version": "2026-09-30T04:54:18.519Z",
+    "title": "Vérifier le contexte partagé 🧪",
+    "objective": "Préserver les décisions et éviter les doublons.",
+    "scope": "Projet de qualification uniquement",
+    "acceptanceCriteria": "Empreinte identique entre TypeScript et Python.",
+    "expectedOutput": "Périmètre autorisé :\nProjet de qualification uniquement\n\nCritères d’acceptation :\nEmpreinte identique entre TypeScript et Python.\n\nLivrer les changements et les preuves de validation. Aucun déploiement automatique.",
+    "createdBy": "synthetic-operator"
+  },
+  "source": {
+    "commitSha": "7df6de76d92651da7eba1ca8cf587d7a39ffd6d6",
+    "commitVerification": "not_verified"
+  },
+  "budget": {
+    "maxCostCents": 100,
+    "maxTokens": 10000,
+    "maxIterations": 10,
+    "timeoutSeconds": 120
+  },
+  "approvalRequired": true,
+  "executionRequested": false,
+  "idempotencyKey": "hq-openhands-v1-061d1074b6dc6151f42dcc19a3dbb8af1e5f75209fef7e71aa6ef563540e73de",
+  "payloadHash": "ca4a67b2eea511eae2d9b468ee0f9e1b36997dea36f91e152bedd6d1e1139c81"
+}

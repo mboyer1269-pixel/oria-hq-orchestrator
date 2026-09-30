@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!entrypoint.mjs
+!acceptance.mjs
+!mint-read-handle.mjs
+!mint-proposal-handle.mjs

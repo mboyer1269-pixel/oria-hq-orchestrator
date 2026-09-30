@@ -1,0 +1,88 @@
+{
+  "services": {
+    "claude-runner": {
+      "image": "oria-provider-ssh-runner:paperclip-29c8fb0",
+      "user": "1000:1000",
+      "restart": "no",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cpus": "1.00",
+      "mem_limit": "1536m",
+      "memswap_limit": "1536m",
+      "pids_limit": 192,
+      "environment": {
+        "HOME": "/paperclip",
+        "NODE_OPTIONS": "--max-old-space-size=768"
+      },
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=192m,mode=1777"
+      ],
+      "volumes": [
+        "claude-home:/paperclip",
+        "claude-workspace:/workspace",
+        "claude-hostkeys:/var/lib/oria-ssh"
+      ],
+      "configs": [
+        {
+          "source": "claude-authorized-keys",
+          "target": "/etc/oria-runner/authorized_keys",
+          "mode": 292
+        }
+      ],
+      "networks": [
+        "claude-control",
+        "claude-egress"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "const s=require('node:net').connect(2222,'127.0.0.1');s.setTimeout(2000);s.on('data',d=>{s.destroy();process.exit(d.toString().startsWith('SSH-2.0-')?0:1)});s.on('error',()=>process.exit(1));s.on('timeout',()=>process.exit(1));"
+        ],
+        "interval": "15s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "10s"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "configs": {
+    "claude-authorized-keys": {
+      "file": "${CLAUDE_AUTHORIZED_KEYS_FILE:?Set dedicated Claude public authorized_keys file}"
+    }
+  },
+  "volumes": {
+    "claude-workspace": {
+      "name": "oria-claude-workspace"
+    },
+    "claude-hostkeys": {
+      "name": "oria-claude-ssh-hostkeys"
+    },
+    "claude-home": {
+      "name": "oria-claude-home"
+    }
+  },
+  "networks": {
+    "claude-control": {
+      "name": "oria-claude-control",
+      "internal": true
+    },
+    "claude-egress": {
+      "name": "oria-claude-egress",
+      "internal": false
+    }
+  }
+}

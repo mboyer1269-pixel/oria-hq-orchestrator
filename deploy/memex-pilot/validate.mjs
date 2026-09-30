@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const read = name => fs.readFileSync(new URL(name, import.meta.url), 'utf8');
+const config = JSON.parse(read('./compose.json'));
+const service = config.services.memex;
+assert.deepEqual(Object.keys(config.services), ['memex']);
+assert.equal(service.platform, 'linux/amd64');
+assert.equal(service.user, '1000:1000');
+assert.equal(service.read_only, true);
+assert.deepEqual(service.cap_drop, ['ALL']);
+assert.deepEqual(service.security_opt, ['no-new-privileges:true']);
+for (const key of ['ports', 'privileged', 'network_mode', 'env_file', 'devices', 'cap_add']) assert.equal(service[key], undefined, key);
+assert.ok(service.cpus && service.mem_limit && service.pids_limit);
+assert.deepEqual(service.networks, ['memory-private']);
+assert.equal(config.networks['memory-private'].internal, true);
+assert.equal(service.environment.GATEWAY_HOST, '0.0.0.0');
+assert.ok(!Object.keys(service.environment).some(k => /SECRET|TOKEN|KEY/.test(k)));
+assert.equal(new Set(service.volumes.map(v => v.split(':')[0])).size, 3);
+assert.ok(service.volumes.every(v => !v.includes('/') || v.includes(':/runtime/')));
+const dockerfile = read('./Dockerfile');
+assert.equal((dockerfile.match(/FROM node@sha256:[a-f0-9]{64}/g) || []).length, 2);
+assert.ok(dockerfile.includes('npm ci --omit=dev'));
+assert.ok(dockerfile.includes('CREATE VIRTUAL TABLE probe USING fts5'));
+assert.ok(!/COPY\s+\.\s/.test(dockerfile));
+assert.ok(!dockerfile.includes('COPY --from=memex_source node_modules'));
+for (const fixture of ['mcp-tools-list.expected.json', 'mcp-resources-list.expected.json']) {
+  assert.ok(dockerfile.includes(`fixtures/${fixture}`));
+  assert.ok(read('./snapshot.mjs').includes(`fixtures/${fixture}`));
+}
+assert.ok(read('./.dockerignore').startsWith('*\n'));
+console.log('Memex deployment static isolation checks passed; no image build or remote operation performed.');

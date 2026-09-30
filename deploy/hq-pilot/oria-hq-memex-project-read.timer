@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep project-only HQ Memex read access current
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=20min
+AccuracySec=30s
+Unit=oria-hq-memex-project-read.service
+
+[Install]
+WantedBy=timers.target

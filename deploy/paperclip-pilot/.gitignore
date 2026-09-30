@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+*.secret
+*.dump
+*.tar
+*.tar.gz
+bootstrap-output*
+resolved-compose*

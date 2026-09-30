@@ -1,0 +1,95 @@
+{
+  "name": "oria-memex-pilot",
+  "services": {
+    "memex": {
+      "image": "oria-memex-pilot:source-reviewed",
+      "platform": "linux/amd64",
+      "build": {
+        "context": ".",
+        "additional_contexts": {
+          "memex_source": "${MEMEX_SOURCE_SNAPSHOT:?Set frozen source-only snapshot path}"
+        }
+      },
+      "user": "1000:1000",
+      "init": true,
+      "restart": "no",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cpus": "1.00",
+      "mem_limit": "512m",
+      "memswap_limit": "512m",
+      "pids_limit": 96,
+      "environment": {
+        "AGENTMEMORY_DB_PATH": "/runtime/graph/graph.db",
+        "AGENTMEMORY_INTAKE_DB_PATH": "/runtime/intake/intake.db",
+        "AGENTMEMORY_VAULT_PATH": "/runtime/vault",
+        "GATEWAY_HOST": "0.0.0.0",
+        "GATEWAY_PORT": "3000",
+        "GATEWAY_DEFAULT_ACCESS": "read_write",
+        "NODE_OPTIONS": "--max-old-space-size=256"
+      },
+      "volumes": [
+        "memex-graph:/runtime/graph",
+        "memex-intake:/runtime/intake",
+        "memex-vault:/runtime/vault"
+      ],
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=64m,mode=1777"
+      ],
+      "secrets": [
+        {
+          "source": "handle-signing-key",
+          "target": "handle-signing-key"
+        }
+      ],
+      "networks": [
+        "memory-private"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "15s",
+        "timeout": "3s",
+        "retries": 5
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "volumes": {
+    "memex-graph": {
+      "name": "oria-memex-graph-pilot"
+    },
+    "memex-intake": {
+      "name": "oria-memex-intake-pilot"
+    },
+    "memex-vault": {
+      "name": "oria-memex-vault-pilot"
+    }
+  },
+  "networks": {
+    "memory-private": {
+      "name": "oria-memory-private",
+      "internal": true
+    }
+  },
+  "secrets": {
+    "handle-signing-key": {
+      "file": "${MEMEX_HANDLE_SECRET_FILE:?Set external signing-key file readable by uid1000}"
+    }
+  }
+}

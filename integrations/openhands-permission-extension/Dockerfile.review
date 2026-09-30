@@ -1,0 +1,8 @@
+# Qualification update over the already guarded budget runtime.
+ARG RUNTIME_IMAGE=oria-openhands-claude:budgets1
+FROM ${RUNTIME_IMAGE}
+USER 0:0
+COPY permission_agent.py qualify_review_wait.py /extension/
+USER 10001:10001
+WORKDIR /tmp
+ENTRYPOINT ["python", "/extension/qualify_review_wait.py"]

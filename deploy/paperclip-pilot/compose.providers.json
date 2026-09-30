@@ -1,0 +1,6 @@
+{
+  "services": {
+    "paperclip": { "networks": ["pilot-internal", "provider-egress"] }
+  },
+  "networks": { "provider-egress": { "internal": false } }
+}

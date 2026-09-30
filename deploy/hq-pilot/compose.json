@@ -1,0 +1,63 @@
+{
+  "name": "oria-hq-pilot",
+  "services": {
+    "hq": {
+      "image": "sha256:039c64a460dc42ee35f1aba543a89b618e4512722f954ea064da1fe1f5f87c6d",
+      "restart": "unless-stopped",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cpus": "1.50",
+      "mem_limit": "1536m",
+      "memswap_limit": "1536m",
+      "pids_limit": 128,
+      "env_file": [
+        {
+          "path": "runtime.env",
+          "format": "raw"
+        }
+      ],
+      "environment": {
+        "NODE_ENV": "production",
+        "PORT": "3000",
+        "HOSTNAME": "0.0.0.0",
+        "NEXT_TELEMETRY_DISABLED": "1",
+        "MISSION_DURABLE_DRAFTS": "true",
+        "ORIA_ENABLE_MEMEX_READONLY": "0",
+        "ORIA_ENABLE_MEMEX_HTTP_READONLY": "0",
+        "ORIA_ENABLE_PAPERCLIP_READONLY": "0",
+        "ORIA_ENABLE_PAPERCLIP_DISPATCH": "0",
+        "ORIA_ALLOW_DEV_USER_FALLBACK": "false",
+        "ORIA_UNSAFE_ALLOW_FILE_DOCUMENT_STORE_IN_PROD": "false"
+      },
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=128m,mode=1777"
+      ],
+      "networks": [
+        "hq-private",
+        "hq-egress"
+      ],
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "networks": {
+    "hq-private": {
+      "name": "oria-hq-private",
+      "internal": true
+    },
+    "hq-egress": {
+      "name": "oria-hq-egress",
+      "internal": false
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "launchId": "ed982190-2c13-4223-bb4f-1fb78f09128a",
+  "hostKilledBySigkill": true,
+  "proxyStoppedWithoutHostCleanup": true,
+  "proxyExitCode": 124,
+  "elapsedSeconds": 7.618,
+  "lifetimeSeconds": 45,
+  "graceSeconds": 5,
+  "journalStateAfterCrash": "ready",
+  "socketAcceptsConnections": false,
+  "modelRequests": 0,
+  "sharedDeadline": true,
+  "startupDelaySeconds": 2,
+  "sharedBudgetSeconds": 6,
+  "qualificationResourcesRemoved": true
+}

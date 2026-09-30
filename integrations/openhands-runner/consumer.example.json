@@ -1,0 +1,10 @@
+{
+  "bridgeCommand": ["/usr/bin/docker", "exec", "--user", "0:0", "-i", "hq-host-bridge", "node"],
+  "bridgeScriptsRoot": "/workspace/hq/src/scripts",
+  "bridgeConfigRoot": "/protected/hq",
+  "hostConfigRoot": "/var/lib/oria-hq/host-config",
+  "profileFile": "/var/lib/oria-hq/host-config/profile.json",
+  "registryFile": "/etc/oria-hq/project-sources.json",
+  "jobsRoot": "/var/lib/oria-hq/jobs",
+  "controlRoot": "/run/oria-hq-control"
+}

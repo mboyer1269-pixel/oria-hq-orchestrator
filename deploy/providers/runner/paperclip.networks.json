@@ -1,0 +1,21 @@
+{
+  "services": {
+    "paperclip": {
+      "networks": [
+        "pilot-internal",
+        "gemini-control",
+        "cursor-control"
+      ]
+    }
+  },
+  "networks": {
+    "gemini-control": {
+      "external": true,
+      "name": "oria-gemini-control"
+    },
+    "cursor-control": {
+      "external": true,
+      "name": "oria-cursor-control"
+    }
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "name": "oria-paperclip-pilot",
+  "services": {
+    "db": {
+      "image": "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+      "user": "postgres",
+      "restart": "no",
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "cpus": "0.50",
+      "mem_limit": "512m",
+      "memswap_limit": "512m",
+      "pids_limit": 128,
+      "environment": {
+        "POSTGRES_USER": "paperclip_pilot",
+        "POSTGRES_DB": "paperclip_pilot",
+        "POSTGRES_PASSWORD": "${PILOT_DB_PASSWORD:?Set a dedicated random hex password}",
+        "POSTGRES_INITDB_ARGS": "--auth-host=scram-sha-256"
+      },
+      "tmpfs": ["/tmp:rw,nosuid,nodev,size=64m", "/var/run/postgresql:rw,nosuid,nodev,size=16m,mode=1777"],
+      "volumes": ["pilot-postgres:/var/lib/postgresql/data"],
+      "networks": ["pilot-internal"],
+      "healthcheck": {
+        "test": ["CMD", "pg_isready", "-U", "paperclip_pilot", "-d", "paperclip_pilot"],
+        "interval": "5s", "timeout": "3s", "retries": 20, "start_period": "20s"
+      },
+      "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "2"}}
+    },
+    "paperclip": {
+      "image": "ghcr.io/paperclipai/paperclip@sha256:c735428fa81a719c0f8ca194bb345d0cdaaf3187f2fbecea1933a8d0513caf86",
+      "user": "node",
+      "restart": "no",
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "cpus": "1.00",
+      "mem_limit": "1536m",
+      "memswap_limit": "1536m",
+      "pids_limit": 256,
+      "environment": {
+        "DATABASE_URL": "postgres://paperclip_pilot:${PILOT_DB_PASSWORD:?Set dedicated password}@db:5432/paperclip_pilot",
+        "BETTER_AUTH_SECRET": "${PILOT_AUTH_SECRET:?Set dedicated random session signing secret}",
+        "NODE_ENV": "production",
+        "NODE_OPTIONS": "--max-old-space-size=768",
+        "HOME": "/paperclip",
+        "HOST": "0.0.0.0",
+        "PORT": "3100",
+        "SERVE_UI": "true",
+        "PAPERCLIP_HOME": "/paperclip",
+        "PAPERCLIP_CONFIG": "/etc/paperclip/pilot.json",
+        "PAPERCLIP_INSTANCE_ID": "pilot",
+        "PAPERCLIP_DEPLOYMENT_MODE": "authenticated",
+        "PAPERCLIP_DEPLOYMENT_EXPOSURE": "private",
+        "PAPERCLIP_AUTH_BASE_URL_MODE": "explicit",
+        "PAPERCLIP_PUBLIC_URL": "http://localhost:3310",
+        "BETTER_AUTH_TRUSTED_ORIGINS": "http://localhost:3310",
+        "PAPERCLIP_ALLOWED_HOSTNAMES": "localhost,127.0.0.1",
+        "PAPERCLIP_AUTH_DISABLE_SIGN_UP": "${PILOT_DISABLE_SIGN_UP:-true}",
+        "PAPERCLIP_MIGRATION_AUTO_APPLY": "${PILOT_MIGRATION_AUTO_APPLY:-false}",
+        "PAPERCLIP_MIGRATION_PROMPT": "never",
+        "PAPERCLIP_SECRETS_STRICT_MODE": "true",
+        "PAPERCLIP_ANNOUNCEMENTS_ENABLED": "false",
+        "PAPERCLIP_ENABLE_COMPANY_DELETION": "false",
+        "HEARTBEAT_SCHEDULER_ENABLED": "false"
+      },
+      "configs": [{"source": "pilot-config", "target": "/etc/paperclip/pilot.json", "mode": 292}],
+      "tmpfs": ["/tmp:rw,nosuid,nodev,size=128m"],
+      "volumes": ["pilot-paperclip:/paperclip"],
+      "networks": ["pilot-internal"],
+      "depends_on": {"db": {"condition": "service_healthy"}},
+      "healthcheck": {
+        "test": ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"],
+        "interval": "15s", "timeout": "5s", "retries": 10, "start_period": "90s"
+      },
+      "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "2"}}
+    }
+  },
+  "configs": {"pilot-config": {"file": "./paperclip.config.json"}},
+  "volumes": {"pilot-postgres": {}, "pilot-paperclip": {}},
+  "networks": {"pilot-internal": {"internal": true}}
+}

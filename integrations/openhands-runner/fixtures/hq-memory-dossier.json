@@ -1,0 +1,44 @@
+{
+  "contractVersion": 2,
+  "executor": "openhands",
+  "executorVersion": "1.50.0",
+  "mission": {
+    "id": "334dce9b-e496-5266-90f4-5017b77d29ca",
+    "workspaceId": "synthetic-a",
+    "modeId": "hq",
+    "version": "2026-09-30T12:00:00.000Z",
+    "title": "Synthetic memory contract",
+    "objective": "Verify Unicode 🧪 exchange",
+    "scope": "Fixture only",
+    "acceptanceCriteria": "Receiver validates exact context",
+    "expectedOutput": "Périmètre autorisé :\nFixture only\n\nCritères d’acceptation :\nReceiver validates exact context\n\nLivrer les changements et les preuves de validation. Aucun déploiement automatique.",
+    "createdBy": "synthetic-owner"
+  },
+  "source": {
+    "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "commitVerification": "not_verified"
+  },
+  "budget": {
+    "maxCostCents": 100,
+    "maxTokens": 10000,
+    "maxIterations": 2,
+    "timeoutSeconds": 60
+  },
+  "approvalRequired": true,
+  "executionRequested": false,
+  "memory": {
+    "contractVersion": 1,
+    "sourceTool": "agentmemory_context_pack",
+    "workspaceId": "synthetic-a",
+    "projectId": "synthetic-project",
+    "namespace": "org:synthetic-project",
+    "centerEntityId": "anchor",
+    "retrievedAtIso": "2026-09-30T12:00:00.000Z",
+    "content": "{\"centerEntity\":{\"id\":\"anchor\",\"namespace\":\"org:synthetic-project\",\"type\":\"Project\",\"name\":\"Décision 🧪\",\"source\":\"reviewed\",\"properties\":{\"status\":\"verified\"}},\"entities\":[{\"id\":\"anchor\",\"namespace\":\"org:synthetic-project\",\"type\":\"Project\",\"name\":\"Décision 🧪\",\"source\":\"reviewed\",\"properties\":{\"status\":\"verified\"}}],\"relations\":[],\"provenance\":[{\"id\":\"anchor\",\"source\":\"reviewed\",\"originId\":null,\"confidence\":null}]}",
+    "contentChars": 419,
+    "redactionsApplied": 0,
+    "snapshotHash": "bcc9e8bf1cbacfb1419e50ae80c7f9080b4cafb6ea54dd91ba909bae2f4d0915"
+  },
+  "idempotencyKey": "hq-openhands-v1-37f849cb7ee46b4b7f48c9c1ac97910d8e67be252f1e55308028bc8ad4b5055d",
+  "payloadHash": "e9e718b3f7e769e85b939e13bc750d236694725fcd04b112c017be430c386eb1"
+}

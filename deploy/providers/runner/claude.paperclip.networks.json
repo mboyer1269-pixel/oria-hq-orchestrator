@@ -1,0 +1,16 @@
+{
+  "services": {
+    "paperclip": {
+      "networks": [
+        "pilot-internal",
+        "claude-control"
+      ]
+    }
+  },
+  "networks": {
+    "claude-control": {
+      "external": true,
+      "name": "oria-claude-control"
+    }
+  }
+}
