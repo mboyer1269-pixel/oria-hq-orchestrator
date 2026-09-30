@@ -1,17 +1,27 @@
 import asyncio
+from contextlib import contextmanager
 import unittest
 from datetime import datetime,timezone,timedelta
 from contextlib import contextmanager
 from unittest.mock import AsyncMock,Mock,patch
 from permission_worker import run_permission_job
+from provider_policy import EXPECTED
+
+
+@contextmanager
+def unheld(path):
+    """These tests qualify dispatch, not coordination; see test_launch_coordination."""
+    yield path
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_gateway_only_after_acquisition_shares_deadline_and_closes(self):
         for mode in ('success','lost_claim','run_failure','cleanup_failure'):
-            state='claimed';events=[];deadlines=[]
+            state='claimed';events=[];deadlines=[];calls={'create':0,'run':0}
             job=dict(launchId='fixture',missionId='fixture',workspaceId='fixture',runnerId='fixture',imageDigest='fixture',timeoutSeconds=10)
-            config={**job,'providerProfile':{'id':'fixture'}}
+            approved={**EXPECTED,'id':'fixture-profile','policySha256':'a'*64}
+            authorization={'profileId':approved['id'],'policySha256':approved['policySha256'],'policyRoot':'/policies','gatewayRoot':'/protected'}
+            config={**job,'providerProfile':approved}
             def transition(before,after,data):
                 nonlocal state
                 if mode=='lost_claim':return False
@@ -29,22 +39,48 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                     events.append('gateway_closed')
                     if mode=='cleanup_failure':raise RuntimeError('cleanup unknown')
             def create(**parameters):
+                calls['create']+=1
                 self.assertEqual(parameters['provider'],{'fixture':True});deadlines.append(parameters['deadline_monotonic'])
                 return {'containerId':'a'*64,'containerName':'fixture'}
             def run(**parameters):
+                calls['run']+=1
                 deadlines.append(parameters['deadline_monotonic'])
                 if mode=='run_failure':raise RuntimeError('run unknown')
                 return {'exitCode':0,'containerStopped':True,'deadlineExceeded':False}
             server=Mock(wait_closed=AsyncMock())
             with patch('permission_worker.load_provider_policy'),patch('permission_worker.provider_gateway',side_effect=gateway) as factory,patch(
                     'permission_worker.lifecycle_transition',return_value=transition),patch('permission_worker.lifecycle_reader',side_effect=reader):
-                result=await run_permission_job(command=['trusted'],job=job,job_root='/fixture',create=create,run=run,
-                    serve=AsyncMock(return_value=server),gateway_root='/protected',policy_root='/policies')
+                result=await run_permission_job(lease=unheld,command=['trusted'],job=job,job_root='/fixture',create=create,run=run,
+                    serve=AsyncMock(return_value=server),gateway_root='/protected',authorization=authorization,policy_root='/policies')
             if mode=='lost_claim':
                 self.assertEqual(result['state'],'not_acquired');factory.assert_not_called()
             else:
-                self.assertEqual(events[-1],'gateway_closed');self.assertEqual(len(set(deadlines)),1)
+                self.assertEqual(events[-1],'gateway_closed')
+                # Gateway, container creation and supervision keep one shared budget.
+                self.assertEqual(len(set(deadlines)),1)
                 self.assertEqual(result['state'],'execution_finished' if mode=='success' else 'reconciliation_required')
+                # An uncertain provider outcome is reported once, never retried.
+                self.assertEqual(calls,{'create':1,'run':1})
+                self.assertIsNot(result.get('automaticRetry'),True)
+
+    async def test_profile_the_operator_did_not_approve_is_refused_before_any_effect(self):
+        approved={**EXPECTED,'id':'fixture-profile','policySha256':'a'*64}
+        authorization={'profileId':approved['id'],'policySha256':approved['policySha256'],'policyRoot':'/policies','gatewayRoot':'/protected'}
+        job=dict(launchId='fixture',missionId='fixture',workspaceId='fixture',runnerId='fixture',imageDigest='fixture',timeoutSeconds=10)
+        for profile in ({**approved,'id':'other-profile'},{**approved,'policySha256':'b'*64},{'id':approved['id']},None):
+            create=Mock();run=Mock();serve=AsyncMock()
+            with patch('permission_worker.load_provider_policy') as policy,patch(
+                    'permission_worker.provider_gateway') as factory,patch(
+                    'permission_worker.lifecycle_transition') as transition,patch(
+                    'permission_worker.serve_control',new_callable=AsyncMock) as control,patch(
+                    'permission_worker.lifecycle_reader',return_value=lambda:dict(
+                        claim={**job,'state':'claimed'},config={**job,'providerProfile':profile})):
+                result=await run_permission_job(lease=unheld,command=['trusted'],job=job,job_root='/must-not-exist',
+                    review_socket='/must-not-exist/review.sock',create=create,run=run,serve=serve,
+                    gateway_root='/protected',authorization=authorization,policy_root='/policies')
+            self.assertEqual(result,{'state':'invalid_provider_policy','started':False})
+            policy.assert_not_called();factory.assert_not_called();transition.assert_not_called()
+            control.assert_not_called();create.assert_not_called();run.assert_not_called();serve.assert_not_called()
 
     async def test_provider_profile_refused_before_socket_transition_or_container(self):
         for profile in ({'id':'claude-subscription-v1'},None,{}):
@@ -53,11 +89,35 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                     claim={},config={'providerProfile':profile})),patch(
                     'permission_worker.lifecycle_transition') as transition,patch(
                     'permission_worker.serve_control',new_callable=AsyncMock) as control:
-                result=await run_permission_job(command=['trusted'],job={},job_root='/must-not-exist',
+                result=await run_permission_job(lease=unheld,command=['trusted'],job={},job_root='/must-not-exist',
                     review_socket='/must-not-exist/review.sock',create=create,run=run,serve=serve)
             self.assertEqual(result,{'state':'invalid_provider_policy','started':False})
             create.assert_not_called();run.assert_not_called();serve.assert_not_called()
             transition.assert_not_called();control.assert_not_called()
+
+    async def test_incoherent_provider_call_is_refused_before_any_effect(self):
+        approved={**EXPECTED,'id':'fixture-profile','policySha256':'a'*64}
+        authorization={'profileId':approved['id'],'policySha256':approved['policySha256'],'policyRoot':'/policies','gatewayRoot':'/protected'}
+        job=dict(launchId='fixture',missionId='fixture',workspaceId='fixture',runnerId='fixture',imageDigest='fixture',timeoutSeconds=10)
+        # Only a trusted host caller can produce these; none may fall back to a
+        # default gateway root or complete with a partially supplied authorization.
+        for extra in ({'gateway_root':'/protected'},
+                      {'authorization':authorization},
+                      {'gateway_root':'/elsewhere','authorization':authorization},
+                      {'gateway_root':'/protected','authorization':authorization,'policy_root':'/elsewhere'}):
+            create=Mock();run=Mock();serve=AsyncMock()
+            with patch('permission_worker.load_provider_policy') as policy,patch(
+                    'permission_worker.provider_gateway') as factory,patch(
+                    'permission_worker.lifecycle_transition') as transition,patch(
+                    'permission_worker.serve_control',new_callable=AsyncMock) as control,patch(
+                    'permission_worker.lifecycle_reader',return_value=lambda:dict(
+                        claim={**job,'state':'claimed'},config={**job,'providerProfile':approved})):
+                result=await run_permission_job(lease=unheld,command=['trusted'],job=job,job_root='/must-not-exist',
+                    review_socket='/must-not-exist/review.sock',create=create,run=run,serve=serve,
+                    **{'policy_root':'/policies',**extra})
+            self.assertEqual(result,{'state':'invalid_provider_policy','started':False})
+            policy.assert_not_called();factory.assert_not_called();transition.assert_not_called()
+            control.assert_not_called();create.assert_not_called();run.assert_not_called();serve.assert_not_called()
 
     async def test_listens_after_recording_start_and_closes_after_completion(self):
         events=[];state='claimed'
@@ -81,7 +141,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 startRequestedAt=datetime.now(timezone.utc).isoformat(),authorizationExpiresAt=(datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat())
         with patch('permission_worker.lifecycle_transition',return_value=transition),patch(
                 'permission_worker.lifecycle_reader',side_effect=reader):
-            result=await run_permission_job(command=['trusted'],job=job,job_root='/fixture',create=create,run=run,serve=serve)
+            result=await run_permission_job(lease=unheld,command=['trusted'],job=job,job_root='/fixture',create=create,run=run,serve=serve)
         self.assertEqual(result['state'],'execution_finished')
         self.assertFalse(result['independentValidationPassed'])
         server.close.assert_called_once();server.wait_closed.assert_awaited_once()
@@ -95,7 +155,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         serve=AsyncMock(side_effect=OSError('unavailable'))
         with patch('permission_worker.lifecycle_transition',return_value=lambda *args:True),patch(
                 'permission_worker.lifecycle_reader',side_effect=reader):
-            result=await run_permission_job(command=['trusted'],job=job,job_root='/fixture',
+            result=await run_permission_job(lease=unheld,command=['trusted'],job=job,job_root='/fixture',
                 create=Mock(return_value={'containerId':'a'*64,'containerName':'fixture'}),run=run,
                 serve=serve)
         self.assertEqual(result['state'],'reconciliation_required');run.assert_not_called()
@@ -119,7 +179,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 else:expired=True
                 return server
             with patch('permission_worker.lifecycle_transition',return_value=transition),patch('permission_worker.lifecycle_reader',side_effect=reader):
-                result=await run_permission_job(command=['trusted'],job=job,job_root='/fixture',
+                result=await run_permission_job(lease=unheld,command=['trusted'],job=job,job_root='/fixture',
                     create=Mock(return_value={'containerId':'a'*64,'containerName':'fixture'}),run=run,serve=serve)
             self.assertEqual(result['state'],'reconciliation_required');run.assert_not_called();server.close.assert_called_once()
 
@@ -128,7 +188,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         for changed in ({'imageDigest':'other'},{'timeoutSeconds':100}):
             create=Mock()
             with patch('permission_worker.lifecycle_reader',return_value=lambda:dict(claim={**canonical,'state':'claimed'},config=canonical)):
-                result=await run_permission_job(command=['trusted'],job={**canonical,**changed},job_root='/fixture',create=create)
+                result=await run_permission_job(lease=unheld,command=['trusted'],job={**canonical,**changed},job_root='/fixture',create=create)
             self.assertEqual(result['state'],'not_acquired');create.assert_not_called()
 
 if __name__=='__main__':unittest.main()

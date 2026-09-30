@@ -58,6 +58,51 @@ def inspect_gateway(*, root, launch_id):
     return result
 
 
+def write_journal(folder,journal):
+    """Atomic durable journal write; the only writer of this file."""
+    target=folder/'lifecycle.json'
+    temporary=folder/'lifecycle.tmp'
+    with temporary.open('w',encoding='utf-8') as stream:
+        json.dump(journal,stream);stream.flush();os.fsync(stream.fileno())
+    os.replace(temporary,target)
+    descriptor=os.open(folder,os.O_RDONLY|os.O_DIRECTORY)
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+
+
+TERMINAL_LAUNCH_STATES=('execution_finished','cancelled','succeeded','failed')
+
+
+def release_gateway(*, root, launch_id, canonical_state, observed=None):
+    """Remove only resources this launch's labels and journal already identify.
+
+    The canonical launch must already be terminal, so no mission can still be
+    entitled to this gateway; the caller is responsible for having observed that
+    its agent container cannot act either. Never touches an unverified or
+    partially observed resource, and always retains the journal as evidence.
+    """
+    if canonical_state not in TERMINAL_LAUNCH_STATES:
+        raise ValueError('Gateway release requires a terminal canonical launch')
+    observed=observed if observed is not None else inspect_gateway(root=root,launch_id=launch_id)
+    if observed.get('inspectionIncomplete'):raise RuntimeError('Gateway inspection incomplete')
+    if 'identity_mismatch' in (observed['containerState'],observed['networkState']):
+        raise RuntimeError('Gateway identity mismatch; never remove an unverified resource')
+    folder=Path(root)/launch_id
+    journal=json.loads(protected_bytes(folder/'lifecycle.json',65536))
+    removed={'container':None,'network':None};errors=[]
+    if observed.get('containerId'):
+        try:docker('rm','-f',observed['containerId'],timeout=20);removed['container']=observed['containerId']
+        except Exception:errors.append('container_cleanup_unknown')
+    if observed.get('networkId'):
+        try:docker('network','rm',observed['networkId']);removed['network']=observed['networkId']
+        except Exception:errors.append('network_cleanup_unknown')
+    journal['releaseErrors']=errors
+    journal['state']='reconciliation_required' if errors else 'released'
+    write_journal(folder,journal)
+    if errors:raise RuntimeError('Gateway release requires reconciliation')
+    return {'launchId':launch_id,'removed':removed,'journalState':journal['state']}
+
+
 def wait_ready(path,timeout=10):
     deadline=time.monotonic()+timeout
     while time.monotonic()<deadline:
@@ -123,14 +168,7 @@ def provider_gateway(*,config,launch_id,root,policy_root=ROOT,deadline_monotonic
     if expires_ms is not None:journal['sharedDeadlineUnixMs']=expires_ms
     def save(state):
         journal['state']=state
-        target=folder/'lifecycle.json'
-        temporary=folder/'lifecycle.tmp'
-        with temporary.open('w',encoding='utf-8') as stream:
-            json.dump(journal,stream);stream.flush();os.fsync(stream.fileno())
-        os.replace(temporary,target)
-        descriptor=os.open(folder,os.O_RDONLY|os.O_DIRECTORY)
-        try:os.fsync(descriptor)
-        finally:os.close(descriptor)
+        write_journal(folder,journal)
     uncertain=False
     def remaining_timeout(limit):
         if deadline_monotonic is None:return limit

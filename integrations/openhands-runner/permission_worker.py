@@ -18,13 +18,37 @@ from permission_transport import serve_permissions
 from supervisor import supervise
 from pending_permissions import PendingPermissions
 from permission_control import serve_control
-from provider_policy import ROOT,provider_preflight,load_provider_policy
+from provider_policy import ROOT,provider_preflight,load_provider_policy,authorized_profile
 from provider_gateway import provider_gateway
+from launch_lease import LaunchBusy,hold_launch,lease_path
 
 
 async def run_permission_job(*, command, job, job_root, create=create_job,
                              run=supervise, serve=serve_permissions, review_socket=None,
-                             gateway_root=None,policy_root=ROOT):
+                             gateway_root=None,authorization=None,policy_root=ROOT,
+                             lease=hold_launch):
+    """Hold this launch for the whole dispatch, so no other host path can decide.
+
+    The lease is taken before the first canonical read and released only after the
+    supervisor has finished, which covers every Docker effect this launch can
+    still produce. A reconciliation cannot therefore confirm a closure while a
+    start remains possible, and a closed launch cannot be started late: the next
+    holder rereads canonical authority and finds a state that is no longer
+    `claimed`.
+    """
+    path=lease_path(job_root=job_root,
+                    control_directory=None if review_socket is None else Path(review_socket).parent)
+    try:
+        with lease(path):
+            return await _dispatch_under_lease(command=command,job=job,job_root=job_root,create=create,
+                run=run,serve=serve,review_socket=review_socket,gateway_root=gateway_root,
+                authorization=authorization,policy_root=policy_root)
+    except LaunchBusy:
+        return {'state':'launch_busy','started':False,'automaticRetry':False}
+
+
+async def _dispatch_under_lease(*, command, job, job_root, create, run, serve, review_socket,
+                                gateway_root, authorization, policy_root):
     loop=asyncio.get_running_loop()
     job=dict(job)
     command=tuple(command)
@@ -34,8 +58,19 @@ async def run_permission_job(*, command, job, job_root, create=create_job,
     # Never silently execute it using the legacy offline container settings.
     use_provider='providerProfile' in config
     if use_provider:
-        if gateway_root is None:return provider_preflight(config)
-        try:load_provider_policy(config,policy_root)
+        # Neither parameter: the unchanged offline refusal, before any effect.
+        if gateway_root is None and authorization is None:return provider_preflight(config)
+        # Provider execution requires the operator authorization and the gateway
+        # root it names. An incomplete or disagreeing trusted call is refused
+        # here, before any socket, Docker effect or canonical transition.
+        try:
+            if gateway_root is None or authorization is None:
+                raise ValueError('Provider execution requires both authorization and its gateway root')
+            authorized_profile(config,authorization)
+            if (Path(gateway_root)!=Path(authorization['gatewayRoot'])
+                    or Path(policy_root)!=Path(authorization['policyRoot'])):
+                raise ValueError('Effective host roots are not the authorized ones')
+            load_provider_policy(config,policy_root)
         except (ValueError,TypeError,KeyError,OSError):return {'state':'invalid_provider_policy','started':False}
     canonical={key:claim[key] for key in ('launchId','missionId','workspaceId','runnerId')}
     canonical.update(imageDigest=config['imageDigest'],timeoutSeconds=config['timeoutSeconds'])

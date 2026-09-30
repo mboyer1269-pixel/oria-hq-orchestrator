@@ -2,7 +2,7 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path,PurePosixPath
 import re
 import stat
 
@@ -10,6 +10,7 @@ ROOT=Path('/etc/oria-hq/provider-policies')
 PROFILE_FIELDS={'id','policySha256','provider','authentication','network','accountConnectors'}
 EXPECTED={'provider':'claude','authentication':'subscription','network':'restricted-proxy','accountConnectors':'disabled'}
 FILES={'squid.conf','entrypoint.sh','relay.mjs'}
+AUTHORIZATION={'profileId','policySha256','policyRoot','gatewayRoot'}
 
 
 def unique(pairs):
@@ -80,10 +81,54 @@ def load_provider_policy(config,root=ROOT):
     return manifest
 
 
-def provider_preflight(config):
+def validate_authorization(authorization):
+    """Operator-declared approval of one profile. Never read from HQ or a dossier."""
+    if not isinstance(authorization,dict) or set(authorization)!=AUTHORIZATION:
+        raise ValueError('Invalid provider authorization')
+    if not isinstance(authorization['profileId'],str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,79}',authorization['profileId']):
+        raise ValueError('Invalid authorized profile identity')
+    if not isinstance(authorization['policySha256'],str) or not re.fullmatch(r'[a-f0-9]{64}',authorization['policySha256']):
+        raise ValueError('Invalid authorized policy digest')
+    for field in ('policyRoot','gatewayRoot'):
+        root=authorization[field]
+        if (not isinstance(root,str) or not 1<len(root)<=4096 or chr(0) in root or not root.startswith('/')
+                or str(PurePosixPath(root))!=root or '..' in PurePosixPath(root).parts):
+            raise ValueError('Absolute host path required for '+field)
+    if authorization['policyRoot']==authorization['gatewayRoot']:
+        raise ValueError('Separate policy registry and gateway roots required')
+    return authorization
+
+
+def separate_gateway_root(gateway,others):
+    """One rule for every caller: the gateway shares no subtree with these paths."""
+    for other in others:
+        if gateway==other or gateway in other.parents or other in gateway.parents:
+            raise ValueError('Separate protected gateway root required')
+    return gateway
+
+
+def authorized_profile(config,authorization):
+    """Refuse any canonical profile the operator did not approve by identity and digest."""
+    validate_authorization(authorization)
+    profile=config.get('providerProfile')
+    validate_profile(profile)
+    if (profile['id'],profile['policySha256'])!=(authorization['profileId'],authorization['policySha256']):
+        raise ValueError('Canonical profile is not the authorized profile')
+    return profile
+
+
+def provider_preflight(config,authorization=None):
     if 'providerProfile' not in config:return None
-    try:load_provider_policy(config)
+    try:
+        if authorization is None:load_provider_policy(config)
+        else:
+            authorized_profile(config,authorization)
+            # The approved registry is named by the authorization, never guessed.
+            load_provider_policy(config,authorization['policyRoot'])
     except (ValueError,TypeError,KeyError,OSError):
         return {'state':'invalid_provider_policy','started':False}
     # Policy integrity does not prove credentials, relay lifecycle or tool review.
-    return {'state':'unsupported_provider_profile','started':False}
+    if authorization is None:return {'state':'unsupported_provider_profile','started':False}
+    # The operator approved this exact policy here. Nothing is started yet: the
+    # worker repeats both checks against the canonical reread before any effect.
+    return None

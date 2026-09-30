@@ -13,6 +13,7 @@ import os
 import asyncio
 import socket
 import shutil
+from contextlib import suppress
 from concurrent.futures import ThreadPoolExecutor
 from supervisor import supervise
 from permission_worker import run_permission_job
@@ -24,10 +25,40 @@ from recovery_report import recovery_report,publish_report
 
 PG = "sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24"
 REST = "postgrest/postgrest@sha256:c53043d2c9bdb29c28e7e6d02175320af11495cdea5439f44009c06efe6625fa"
-ROOT = Path('/opt/oria-openhands-qualification')
+# Harness-only: run from a disposable qualification root instead of installing
+# these sources into the active one. Not part of the host release file set.
+ROOT = Path(os.environ.get('QUALIFICATION_ROOT') or '/opt/oria-openhands-qualification')
+
+
+class ScenarioComplete(Exception):
+    """Harness-only control flow after a resilience scenario finishes its checks."""
+
 
 def docker(*args, input=None, check=True):
     return subprocess.run(['docker', *args], input=input, text=True, capture_output=True, check=check, timeout=90)
+
+def named_ids(name):
+    """Deterministic-name observation: which containers exist for this launch."""
+    return docker('ps','-a','--no-trunc','--filter','name=^/'+name+'$','--format','{{.ID}}',check=False).stdout.split()
+
+def launch_identities(mission_name,proxy_name):
+    """Exact identities, not counts: a replaced container must remain visible."""
+    return {'mission':named_ids(mission_name),'gateway':named_ids(proxy_name)}
+
+def verify_no_second_effect(*,label,before,after,exit_code,expected_exit,reported_jobs,stderr=''):
+    """Refuse a failed re-invocation, a replaced identity, an extra container or new work."""
+    problems=[]
+    if exit_code!=expected_exit:problems.append('exit '+repr(exit_code)+' instead of '+repr(expected_exit))
+    if reported_jobs:problems.append('consumer reported '+repr(reported_jobs)+' job(s)')
+    for key in ('mission','gateway'):
+        if before[key]!=after[key]:problems.append(key+' identity changed')
+        elif len(after[key])>1:problems.append(key+' has '+str(len(after[key]))+' containers')
+    if problems:
+        # Keep the diagnostic tail: this disposable fixture holds no credentials.
+        tail=chr(10).join((stderr or '').splitlines()[-5:])
+        raise AssertionError(label+': '+'; '.join(problems)+((chr(10)+'stderr tail:'+chr(10)+tail) if tail else ''))
+    return {'missionContainerIds':before['mission'],'gatewayContainerIds':before['gateway'],
+            'identitiesUnchanged':True,'reinvocationExit':exit_code,'consumerReportedJobs':reported_jobs}
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -35,6 +66,12 @@ def main():
     parser.add_argument('--lifecycle',action='store_true')
     parser.add_argument('--provider-binding',action='store_true',help='Qualify synthetic policy identity persistence without provider execution')
     parser.add_argument('--synthetic-provider',action='store_true',help='Actual worker/gateway/storage with synthetic ACP, no provider account')
+    parser.add_argument('--operator-provider',action='store_true',help='Provider path through the actual consumer, preparation and operator entry')
+    parser.add_argument('--interrupted-start',action='store_true',help='Harness-only fault: kill the operator as soon as the container exists')
+    parser.add_argument('--lost-completed-response',action='store_true',help='Harness-only fault: discard the response of a completed execution')
+    parser.add_argument('--interrupted-run',action='store_true',help='Harness-only fault: kill the operator while the container runs')
+    parser.add_argument('--replaced-container',action='store_true',help='Harness-only fault: substitute the container before reconciling')
+    parser.add_argument('--reconcile',action='store_true',help='Continue into the real operator reconciliation of the faulted launch')
     parser.add_argument('--recovery-report',action='store_true',help='Publish host report for the actual HQ reader in a read-only mount')
     parser.add_argument('--docker-job',action='store_true')
     parser.add_argument('--valid-dossier',action='store_true')
@@ -51,9 +88,16 @@ def main():
     parser.add_argument('--hq-image',help='Pinned coherent HQ source image; disables individual source overlays')
     args=parser.parse_args()
     if args.recovery_report and not (args.synthetic_provider and args.hq_image):parser.error('--recovery-report requires synthetic provider and coherent HQ image')
+    if sum((args.interrupted_start,args.interrupted_run,args.lost_completed_response))>1:parser.error('Run one resilience scenario per invocation')
+    if args.replaced_container:args.interrupted_run=True;args.reconcile=True
+    if args.interrupted_run and not args.reconcile:parser.error('--interrupted-run exists to qualify recovery; add --reconcile')
+    if args.reconcile and not (args.interrupted_start or args.interrupted_run or args.lost_completed_response):parser.error('--reconcile follows a resilience scenario')
+    if args.interrupted_start or args.interrupted_run or args.lost_completed_response:args.operator_provider=True
+    if args.operator_provider:args.synthetic_provider=True;args.host_consumer=True
     if args.synthetic_provider:
-        if any((args.provider_binding,args.host_entry,args.host_consumer,args.consumer_service,args.prepare_host,args.project_source,args.probe_permission,args.review_service,args.review_control,args.review_host)):
-            parser.error('Synthetic provider mode cannot be combined with other operator modes')
+        forbidden=[args.provider_binding,args.consumer_service,args.probe_permission,args.review_service,args.review_control,args.review_host]
+        if not args.operator_provider:forbidden+=[args.host_entry,args.host_consumer,args.prepare_host,args.project_source]
+        if any(forbidden):parser.error('Synthetic provider mode cannot be combined with these operator modes')
         args.permission_worker=True
     if args.provider_binding:
         if any((args.docker_job,args.permission_worker,args.host_entry,args.host_consumer,args.consumer_service,args.prepare_host,args.project_source,args.probe_permission,args.review_service,args.review_control,args.review_host)):
@@ -91,6 +135,11 @@ def main():
         control_directories.append(reports);os.chmod(reports.name,0o755)
     provider_profile=None
     policy_root=None
+    gateways=None
+    authorization=None
+    networks=[]
+    expected_container=[None]
+    closure_expected=[None]
     if args.synthetic_provider:
         policy_temp=tempfile.TemporaryDirectory(prefix='hq-provider-policies-',dir='/root')
         control_directories.append(policy_temp);policy_root=Path(policy_temp.name)
@@ -102,6 +151,14 @@ def main():
         raw=json.dumps(policy,sort_keys=True,separators=(',',':')).encode()
         (folder/'policy.json').write_bytes(raw)
         provider_profile={**EXPECTED,'id':'synthetic-relay','policySha256':hashlib.sha256(raw).hexdigest()}
+        gateways=ROOT/'gateways'
+        if args.operator_provider:
+            # Protected disposable gateway root named by the authorization that the
+            # operator configuration carries. No exemption from host validation.
+            gateway_temp=tempfile.TemporaryDirectory(prefix='hq-gateways-',dir='/root')
+            control_directories.append(gateway_temp);gateways=Path(gateway_temp.name);gateways.chmod(0o700)
+            authorization={'profileId':provider_profile['id'],'policySha256':provider_profile['policySha256'],
+                           'policyRoot':str(policy_root),'gatewayRoot':str(gateways)}
     volume='oria-postgrest-qualification-'+uuid.uuid4().hex
     docker('volume','create','--label','oria.purpose=postgrest-qualification',volume)
     try:
@@ -179,6 +236,9 @@ def main():
                 '-e','QUALIFICATION_PROVIDER_BINDING='+('1' if args.provider_binding else '0'),
                 '-e','QUALIFICATION_RECOVERY_REPORT='+('1' if args.recovery_report else '0'),
                 '-e','QUALIFICATION_SYNTHETIC_PROVIDER='+('1' if args.synthetic_provider else '0'),
+                '-e','QUALIFICATION_INTERRUPTED_START='+('1' if args.interrupted_start else '0'),
+                '-e','QUALIFICATION_CLOSURE_REASON='+(closure_expected[0] or ''),
+                '-e','QUALIFICATION_EXPECTED_CONTAINER='+(expected_container[0] or ''),
                 '-e','QUALIFICATION_PROVIDER_PROFILE='+json.dumps(provider_profile),
                 '-e','QUALIFICATION_REVIEW_SERVICE='+('1' if args.review_service else '0'),
                 '-e','QUALIFICATION_REVIEW_CONTROL='+('1' if args.review_control else '0'),
@@ -201,7 +261,7 @@ def main():
                 command=['docker','exec','--user','0:0','-i','-e','NEXT_PUBLIC_SUPABASE_URL='+job['url'],
                          '-e','SUPABASE_SERVICE_ROLE_KEY=synthetic-local-qualification','-e','NODE_ENV=test',
                          node,'node','/workspace/hq/src/scripts/openhands-lifecycle.mjs','/tmp/lifecycle-job.json']
-                with tempfile.TemporaryDirectory(prefix='hq-real-dispatch-',dir='/root' if args.host_entry else None) as temporary:
+                with suppress(ScenarioComplete),tempfile.TemporaryDirectory(prefix='hq-real-dispatch-',dir='/root' if args.host_entry else None) as temporary:
                     base=Path(temporary);base.chmod(0o755)
                     root=base/job['launchId'] if args.host_entry else base
                     if args.prepare_host:
@@ -214,24 +274,341 @@ def main():
                                 'projectId':job['dossier']['memory']['projectId'],'runnerId':job['config']['runnerId'],'sourceRoot':source.name}]}))
                             registry.chmod(0o600)
                             preparation=base/'preparation.json'
-                            preparation.write_text(json.dumps(dict(lifecycleCommand=command,registryFile=str(registry),jobsRoot=str(jobs),controlRoot=str(controls))))
+                            preparation_config=dict(lifecycleCommand=command,registryFile=str(registry),jobsRoot=str(jobs),controlRoot=str(controls))
+                            if authorization:preparation_config['providerExecution']=authorization
+                            preparation.write_text(json.dumps(preparation_config))
                             preparation.chmod(0o600)
                             if args.host_consumer:
                                 profile=Path(host_config.name)/'profile.json'
                                 profile.write_text(json.dumps(dict(context=job['context'],config=job['config'])));profile.chmod(0o600)
                                 consumer=base/'consumer.json'
-                                consumer.write_text(json.dumps(dict(bridgeCommand=command[:-2],bridgeScriptsRoot='/workspace/hq/src/scripts',
+                                consumer_config=dict(bridgeCommand=command[:-2],bridgeScriptsRoot='/workspace/hq/src/scripts',
                                     bridgeConfigRoot='/hq-host-config',hostConfigRoot=host_config.name,profileFile=str(profile),
-                                    registryFile=str(registry),jobsRoot=str(jobs),controlRoot=str(controls))));consumer.chmod(0o600)
+                                    registryFile=str(registry),jobsRoot=str(jobs),controlRoot=str(controls))
+                                if authorization:consumer_config['providerExecution']=authorization
+                                consumer.write_text(json.dumps(consumer_config));consumer.chmod(0o600)
+                                mission_name='hq-openhands-'+job['launchId']
+                                proxy_name='hq-provider-'+job['launchId']
+                                consume_argv=[sys.executable,str(Path(__file__).with_name('consume_pending.py')),'--config',str(consumer)]
+                                def observe(extra=None):
+                                    seen={'missionContainers':len(named_ids(mission_name)),
+                                          'gatewayContainers':len(named_ids(proxy_name)),
+                                          'canonicalState':lifecycle_reader(command)()['state'],
+                                          'jobDirectory':(jobs/job['launchId']).exists(),
+                                          'perLaunchBridgeConfig':(Path(host_config.name)/job['launchId']).exists(),
+                                          'gatewayDirectory':bool(gateways) and (gateways/job['launchId']).exists()}
+                                    return {**seen,**(extra or {})}
+                                def reconcile_now(label,*,expect_terminal):
+                                    """Run the real operator reconciliation command, nothing simulated."""
+                                    argv=['python3',str(ROOT/'openhands-runner/reconcile_launch.py'),
+                                          '--config',str(jobs/job['launchId']/'operator.json'),
+                                          '--gateway-root',str(gateways)]
+                                    run=subprocess.run(argv,capture_output=True,text=True,timeout=120)
+                                    report=json.loads(run.stdout)
+                                    stopped=False
+                                    if report.get('steps',[{}])[0].get('reason')=='container_active':
+                                        # Explicit operator action, printed as such; never automatic.
+                                        docker('stop','--timeout','10',mission_name)
+                                        stopped=True
+                                        run=subprocess.run(argv,capture_output=True,text=True,timeout=120)
+                                        report=json.loads(run.stdout)
+                                    assert report['launchId']==job['launchId'],report
+                                    assert report['jobFilesRemoved'] is False,report
+                                    assert report['automaticRetry'] is False,report
+                                    assert report['independentValidationPassed'] is False,report
+                                    assert report['canonicalTerminal'] is expect_terminal,report
+                                    assert run.returncode==(0 if expect_terminal else 3),(run.returncode,run.stdout,run.stderr)
+                                    return {**report,'deliberateStop':stopped}
+                                if args.operator_provider:
+                                    # Scenario: altered protected policy. The tampering is a harness
+                                    # fault on its own disposable copy; production is untouched.
+                                    artifact=policy_root/provider_profile['id']/'relay.mjs'
+                                    intact=artifact.read_bytes()
+                                    artifact.write_bytes(intact+b'\n// qualification tampering\n')
+                                    refused=subprocess.run(consume_argv,capture_output=True,text=True,timeout=120)
+                                    artifact.write_bytes(intact)
+                                    assert refused.returncode==3,(refused.returncode,refused.stdout,refused.stderr)
+                                    refusal=json.loads(refused.stdout)
+                                    assert refusal['launchId']==job['launchId'],refusal
+                                    assert refusal['outcome']=={'state':'invalid_provider_policy','started':False},refusal
+                                    before=observe({'consumerExit':refused.returncode})
+                                    assert before=={'missionContainers':0,'gatewayContainers':0,'canonicalState':'claimed',
+                                        'jobDirectory':False,'perLaunchBridgeConfig':False,'gatewayDirectory':False,
+                                        'consumerExit':3},before
+                                    print(json.dumps({'alteredPolicyRefusedBeforeEffect':True,'observed':before,
+                                                      'launchStillClaimedAndResumable':True}))
+                                if args.interrupted_start:
+                                    # Scenario: interruption at startup. Only this harness kills the
+                                    # operator process, as soon as the container exists; no production
+                                    # service is touched. This proves refusal to relaunch after an
+                                    # interrupted start, NOT recovery of a finished result.
+                                    running=subprocess.Popen(consume_argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                                    for _ in range(900):
+                                        if named_ids(mission_name):break
+                                        if running.poll() is not None:
+                                            raise RuntimeError('Consumer finished before its container existed: '+running.communicate()[0])
+                                        time.sleep(.1)
+                                    else:raise RuntimeError('Mission container never appeared')
+                                    running.kill();running.communicate(timeout=30)
+                                    identities=launch_identities(mission_name,proxy_name)
+                                    for cid in identities['mission']+identities['gateway']:
+                                        if cid not in ids:ids.append(cid)
+                                    networks.append(proxy_name)
+                                    interrupted=observe({'consumerExit':running.returncode,'responseReceived':False,
+                                                         'missionContainerIds':identities['mission'],
+                                                         'gatewayContainerIds':identities['gateway']})
+                                    assert len(identities['mission'])==1,interrupted
+                                    assert interrupted['canonicalState'] in ('creation_requested','container_created','start_requested','running'),interrupted
+                                    operator=jobs/job['launchId']/'operator.json'
+                                    # Establish the already-produced effect before any resume, with the
+                                    # existing read-only reader. It never authorizes a restart.
+                                    inspected=subprocess.run(['python3',str(ROOT/'openhands-runner/run_host_job.py'),
+                                        '--config',str(operator),'--inspect','--gateway-root',str(gateways)],
+                                        capture_output=True,text=True,timeout=60)
+                                    assert inspected.returncode==0,(inspected.returncode,inspected.stdout,inspected.stderr)
+                                    evidence=json.loads(inspected.stdout)
+                                    assert evidence['launchId']==job['launchId'],evidence
+                                    assert evidence['resumeAuthorized'] is False and evidence['automaticRetry'] is False,evidence
+                                    assert evidence['gateway']['reconciliationRequired'] is True,evidence
+                                    assert evidence['gateway']['containerId']==identities['gateway'][0],(evidence,identities)
+                                    # Identical requests again, at the entry and at the consumer.
+                                    replayed=subprocess.run(['python3',str(ROOT/'openhands-runner/run_host_job.py'),
+                                        '--config',str(operator)],capture_output=True,text=True,timeout=90)
+                                    assert replayed.returncode==2,(replayed.returncode,replayed.stdout,replayed.stderr)
+                                    assert json.loads(replayed.stdout)=={'state':'reconciliation_required','automaticRetry':False}
+                                    again=subprocess.run(consume_argv,capture_output=True,text=True,timeout=120)
+                                    verdict=verify_no_second_effect(label='interrupted start re-invocation',
+                                        before=identities,after=launch_identities(mission_name,proxy_name),
+                                        exit_code=again.returncode,expected_exit=0,
+                                        reported_jobs=len(again.stdout.split()),stderr=again.stderr)
+                                    after=observe({'entryExit':replayed.returncode,'consumerExit':again.returncode,
+                                                   'consumerReportedJobs':verdict['consumerReportedJobs'],
+                                                   'missionContainerIds':verdict['missionContainerIds'],
+                                                   'gatewayContainerIds':verdict['gatewayContainerIds']})
+                                    assert after['canonicalState']==interrupted['canonicalState'],after
+                                    expected_container[0]=identities['mission'][0]
+                                    print(json.dumps({'interruptedStartRefusesRelaunch':True,'interrupted':interrupted,
+                                        'afterIdenticalReplay':after,'reconciliationEvidence':evidence,'verdict':verdict,
+                                        'secondContainerCreated':False,'identityReplaced':False,
+                                        'explicitReconciliationDemanded':True,'finishedResultRecovered':False}))
+                                    if args.reconcile:
+                                        closed=reconcile_now('interrupted',expect_terminal=True)
+                                        assert closed['canonicalState']=='cancelled',closed
+                                        assert closed['closure']['reason']=='interrupted_before_start',closed
+                                        assert closed['closure']['containerState'] in ('created','absent'),closed
+                                        assert 'process' not in closed,closed
+                                        assert closed['gatewayRelease']['journalState']=='released',closed
+                                        after_close=launch_identities(mission_name,proxy_name)
+                                        assert after_close['mission']==identities['mission'],after_close
+                                        assert after_close['gateway']==[],after_close
+                                        preserved={name:(jobs/job['launchId']/name).exists()
+                                                   for name in ('checkout','results','dossier.json','operator.json')}
+                                        assert all(preserved.values()),preserved
+                                        journal=json.loads((gateways/job['launchId']/'lifecycle.json').read_text())
+                                        assert journal['state']=='released' and journal['releaseErrors']==[],journal
+                                        repeat=reconcile_now('already closed',expect_terminal=True)
+                                        assert repeat['steps'][0]['state']=='already_final',repeat
+                                        assert launch_identities(mission_name,proxy_name)==after_close
+                                        expected_container[0]=identities['mission'][0];closure_expected[0]=closed['closure']['reason']
+                                        print(json.dumps({'interruptedLaunchClosedOnObservedState':True,'closure':closed['closure'],
+                                            'deliberateStop':closed['deliberateStop'],'gatewayRelease':closed['gatewayRelease'],
+                                            'workPreserved':preserved,'repeatIsNoOperation':True,
+                                            'secondContainerCreated':False,'resultInvented':False}))
+                                    raise ScenarioComplete
+                                if args.interrupted_run:
+                                    # Scenario: the operator dies while the agent container is running.
+                                    # Only this harness kills it; the container keeps its own course.
+                                    running=subprocess.Popen(consume_argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                                    for _ in range(900):
+                                        ids_now=named_ids(mission_name)
+                                        if ids_now and docker('inspect','--format','{{.State.Status}}',ids_now[0],check=False).stdout.strip()=='running':break
+                                        if running.poll() is not None:
+                                            raise RuntimeError('Consumer finished before its container ran: '+running.communicate()[0])
+                                        time.sleep(.1)
+                                    else:raise RuntimeError('Mission container never reached running')
+                                    running.kill();running.communicate(timeout=30)
+                                    identities=launch_identities(mission_name,proxy_name)
+                                    for cid in identities['mission']+identities['gateway']:
+                                        if cid not in ids:ids.append(cid)
+                                    networks.append(proxy_name)
+                                    interrupted=observe({'consumerExit':running.returncode,'responseReceived':False,
+                                                         'missionContainerIds':identities['mission'],
+                                                         'gatewayContainerIds':identities['gateway']})
+                                    assert len(identities['mission'])==1,interrupted
+                                    assert interrupted['canonicalState'] in ('start_requested','running'),interrupted
+                                    if args.replaced_container:
+                                        # Demonstrate the existing serialisation instead of asserting it.
+                                        # Creating a container is gated by the claimed -> creation_requested
+                                        # CAS, so no second creation is reachable past that stage.
+                                        gate='refused'
+                                        try:
+                                            lifecycle_transition(command)('claimed','creation_requested',{})
+                                            gate='accepted'
+                                        except RuntimeError:pass
+                                        assert gate=='refused','A second creation was authorised past claimed'
+                                        name_conflict=docker('create','--name',mission_name,'--network','none',
+                                            '--entrypoint','/bin/true',job['config']['imageDigest'],check=False)
+                                        assert name_conflict.returncode!=0,'Deterministic name accepted a duplicate'
+                                        # Replace the container: same name, labels and pinned image, new id.
+                                        docker('rm','-f',identities['mission'][0])
+                                        decoy=docker('create','--name',mission_name,
+                                            '--label','oria.purpose=openhands-supervised-job',
+                                            '--label','oria.launch-id='+job['launchId'],
+                                            '--network','none','--entrypoint','/bin/true',
+                                            job['config']['imageDigest']).stdout.strip()
+                                        ids.append(decoy)
+                                        assert decoy!=identities['mission'][0],decoy
+                                        refused=reconcile_now('replaced container',expect_terminal=False)
+                                        assert refused['canonicalState']=='start_requested',refused
+                                        assert refused['steps'][0]['reason']=='container_identity_mismatch',refused
+                                        assert refused['steps'][0]['identity']=='mismatch',refused
+                                        assert 'closure' not in refused,refused
+                                        assert refused['gatewayRelease']['attempted'] is False,refused
+                                        kept=launch_identities(mission_name,proxy_name)
+                                        assert kept['mission']==[decoy],kept
+                                        assert kept['gateway']==identities['gateway'],kept
+                                        preserved={name:(jobs/job['launchId']/name).exists()
+                                                   for name in ('checkout','results','dossier.json','operator.json')}
+                                        assert all(preserved.values()),preserved
+                                        # Remove the replacement: now nothing claims to be this container.
+                                        docker('rm','-f',decoy)
+                                        closed=reconcile_now('replaced then absent',expect_terminal=True)
+                                        assert closed['canonicalState']=='cancelled',closed
+                                        assert closed['closure']['reason']=='result_unrecoverable',closed
+                                        assert closed['closure']['containerState']=='absent',closed
+                                        assert 'process' not in closed,closed
+                                        assert closed['postObservation']['containerState']=='absent',closed
+                                        assert closed['gatewayRelease']['journalState']=='released',closed
+                                        expected_container[0]=identities['mission'][0];closure_expected[0]=closed['closure']['reason']
+                                        print(json.dumps({'replacedContainerRefusedBeforeClosure':True,
+                                            'secondCreationRefusedByCanonicalCas':True,
+                                            'duplicateDeterministicNameRefusedByDocker':True,
+                                            'canonicalContainerId':identities['mission'][0],'observedDecoyId':decoy,
+                                            'refusal':{'reason':refused['steps'][0]['reason'],
+                                                       'identity':refused['steps'][0]['identity'],
+                                                       'gatewayRelease':refused['gatewayRelease']},
+                                            'workPreservedDuringRefusal':preserved,
+                                            'closureAfterRemoval':closed['closure'],
+                                            'resultInvented':False,'independentValidationPassed':False}))
+                                        raise ScenarioComplete
+                                    # The unsupervised container finishes on its own; nothing restarts it.
+                                    for _ in range(1200):
+                                        status=docker('inspect','--format','{{.State.Status}}',identities['mission'][0],check=False).stdout.strip()
+                                        if status in ('exited','dead'):break
+                                        time.sleep(.25)
+                                    else:raise RuntimeError('Mission container never stopped')
+                                    observed_exit=int(docker('inspect','--format','{{.State.ExitCode}}',identities['mission'][0]).stdout.strip())
+                                    recovered=reconcile_now('interrupted run',expect_terminal=True)
+                                    assert recovered['canonicalState']=='execution_finished',recovered
+                                    assert recovered['steps'][0]['state']=='result_recovered',recovered
+                                    assert recovered['process']=={'exitCode':observed_exit,'containerStopped':True,
+                                                                  'deadlineExceeded':False},recovered
+                                    assert 'closure' not in recovered,recovered
+                                    assert recovered['steps'][0]['retainedEvidence']=={'started':'bound','outcome':'present'},recovered
+                                    assert recovered['gatewayRelease']['journalState']=='released',recovered
+                                    after_recover=launch_identities(mission_name,proxy_name)
+                                    assert after_recover['mission']==identities['mission'],after_recover
+                                    assert after_recover['gateway']==[],after_recover
+                                    saved=json.loads((jobs/job['launchId']/'results/outcome.json').read_text())
+                                    started_file=json.loads((jobs/job['launchId']/'results/started.json').read_text())
+                                    assert started_file['payloadHash']==job['dossier']['payloadHash'],started_file
+                                    assert saved['independentValidationPassed'] is False,saved
+                                    repeat=reconcile_now('already recovered',expect_terminal=True)
+                                    assert repeat['steps'][0]['state']=='already_final',repeat
+                                    assert launch_identities(mission_name,proxy_name)==after_recover
+                                    expected_container[0]=identities['mission'][0]
+                                    print(json.dumps({'interruptedRunResultRecovered':True,'interrupted':interrupted,
+                                        'observedExitCode':observed_exit,'process':recovered['process'],
+                                        'retainedEvidence':recovered['steps'][0]['retainedEvidence'],
+                                        'gatewayRelease':recovered['gatewayRelease'],'repeatIsNoOperation':True,
+                                        'secondContainerCreated':False,'reExecuted':False,
+                                        'independentValidationPassed':False}))
+                                    raise ScenarioComplete
+                                if args.lost_completed_response:
+                                    # Scenario: the execution completes, then only the RECEPTION of its
+                                    # response is removed in this harness (stdout discarded). The effect
+                                    # must be recovered from durable state and retained evidence.
+                                    completed=subprocess.run(consume_argv,stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE,text=True,timeout=180)
+                                    assert completed.returncode==0,(completed.returncode,completed.stderr)
+                                    identities=launch_identities(mission_name,proxy_name)
+                                    for cid in identities['mission']+identities['gateway']:
+                                        if cid not in ids:ids.append(cid)
+                                    assert len(identities['mission'])==1,identities
+                                    operator=jobs/job['launchId']/'operator.json'
+                                    recovered=subprocess.run(['python3',str(ROOT/'openhands-runner/run_host_job.py'),
+                                        '--config',str(operator),'--inspect','--gateway-root',str(gateways)],
+                                        capture_output=True,text=True,timeout=60)
+                                    assert recovered.returncode==0,(recovered.returncode,recovered.stdout,recovered.stderr)
+                                    evidence=json.loads(recovered.stdout)
+                                    assert evidence['launchId']==job['launchId'],evidence
+                                    assert evidence['canonicalState']=='execution_finished',evidence
+                                    assert evidence['resumeAuthorized'] is False,evidence
+                                    assert evidence['independentValidationPassed'] is False,evidence
+                                    assert evidence['gateway']['containerState']=='absent',evidence
+                                    assert evidence['gateway']['networkState']=='absent',evidence
+                                    claim=lifecycle_reader(command)()
+                                    assert claim['containerId']==identities['mission'][0],(claim,identities)
+                                    results=(jobs/job['launchId']/'results/outcome.json').read_bytes()
+                                    started=(jobs/job['launchId']/'results/started.json').read_bytes()
+                                    # Identical requests again, at the entry and at the consumer.
+                                    replayed=subprocess.run(['python3',str(ROOT/'openhands-runner/run_host_job.py'),
+                                        '--config',str(operator)],capture_output=True,text=True,timeout=90)
+                                    assert replayed.returncode!=0,(replayed.returncode,replayed.stdout)
+                                    refusal=json.loads(replayed.stdout)
+                                    assert refusal['state'] in ('reconciliation_required','not_acquired'),refusal
+                                    assert refusal.get('started',False) is False,refusal
+                                    again=subprocess.run(consume_argv,capture_output=True,text=True,timeout=120)
+                                    verdict=verify_no_second_effect(label='lost completed response re-invocation',
+                                        before=identities,after=launch_identities(mission_name,proxy_name),
+                                        exit_code=again.returncode,expected_exit=0,
+                                        reported_jobs=len(again.stdout.split()),stderr=again.stderr)
+                                    post=lifecycle_reader(command)()
+                                    assert post['state']=='execution_finished',post
+                                    assert post['containerId']==claim['containerId'],(post,claim)
+                                    assert (jobs/job['launchId']/'results/outcome.json').read_bytes()==results
+                                    assert (jobs/job['launchId']/'results/started.json').read_bytes()==started
+                                    expected_container[0]=identities['mission'][0]
+                                    print(json.dumps({'lostCompletedResponse':True,'responsePayloadDiscarded':True,
+                                        'recoveredFromDurableStateAndRetainedEvidence':True,'entryRefusal':refusal,
+                                        'entryExit':replayed.returncode,'reconciliationEvidence':evidence,
+                                        'verdict':verdict,'resultsUnchanged':True,'newExecutionStarted':False,
+                                        'identityReplaced':False,'independentValidationPassed':False,
+                                        'businessSuccessClaimed':False}))
+                                    if args.reconcile:
+                                        final=reconcile_now('completed',expect_terminal=True)
+                                        assert final['canonicalState']=='execution_finished',final
+                                        assert final['steps'][0]['state']=='already_final',final
+                                        assert final['steps'][0]['retainedEvidence']=={'started':'bound','outcome':'present'},final
+                                        assert 'closure' not in final,final
+                                        assert final['process']['exitCode']==0,final
+                                        assert launch_identities(mission_name,proxy_name)==identities
+                                        assert (jobs/job['launchId']/'results/outcome.json').read_bytes()==results
+                                        print(json.dumps({'finishedResultReadBackWithoutExecuting':True,
+                                            'canonicalState':final['canonicalState'],'process':final['process'],
+                                            'retainedEvidence':final['steps'][0]['retainedEvidence'],
+                                            'gatewayRelease':final['gatewayRelease'],'newExecutionStarted':False}))
+                                    raise ScenarioComplete
                                 if args.consumer_service:
                                     from qualify_consumer_service import run_service
                                     def remember(report):
                                         if report.get('outcome',{}).get('containerId'):ids.append(report['outcome']['containerId'])
                                     report=run_service(consumer,on_report=remember)
                                 else:
-                                    consumed=subprocess.run([sys.executable,str(Path(__file__).with_name('consume_pending.py')),'--config',str(consumer)],capture_output=True,text=True,timeout=120)
-                                    assert consumed.returncode==3, 'Expected consumer to stop on missing provider authentication'
+                                    consumed=subprocess.run(consume_argv,capture_output=True,text=True,timeout=180)
+                                    expected=0 if args.operator_provider else 3
+                                    assert consumed.returncode==expected,(consumed.returncode,consumed.stdout,consumed.stderr)
                                     report=json.loads(consumed.stdout)
+                                    if args.operator_provider:
+                                        identities=launch_identities(mission_name,proxy_name)
+                                        assert len(identities['mission'])==1,identities
+                                        expected_container[0]=identities['mission'][0]
+                                        nominal=observe({'consumerExit':consumed.returncode,
+                                                         'missionContainerIds':identities['mission'],
+                                                         'gatewayContainerIds':identities['gateway']})
+                                        assert nominal['canonicalState']=='execution_finished',nominal
+                                        assert report['outcome']['containerId']==identities['mission'][0],(report,identities)
+                                        print(json.dumps({'nominalOperatorProviderLaunch':True,'observed':nominal}))
                                 assert report['launchId']==job['launchId']
                                 outcome=report['outcome']
                                 if outcome.get('containerId') and outcome['containerId'] not in ids:ids.append(outcome['containerId'])
@@ -241,9 +618,9 @@ def main():
                                 prep_process=subprocess.run([sys.executable,str(Path(__file__).with_name('project_sources.py')),'--config',str(preparation)],capture_output=True,text=True,timeout=60)
                                 assert prep_process.returncode==0, 'Preparation CLI failed'
                                 prepared=json.loads(prep_process.stdout)
-                        else:prepared=prepare_host_job(command=command,source=source.name,jobs_root=jobs,control_root=controls)
+                        else:prepared=prepare_host_job(command=command,source=source.name,jobs_root=jobs,control_root=controls,provider_execution=authorization)
                         operator=Path(prepared['operatorConfig']);root=operator.parent
-                        try:prepare_host_job(command=command,source=source.name,jobs_root=jobs,control_root=controls)
+                        try:prepare_host_job(command=command,source=source.name,jobs_root=jobs,control_root=controls,provider_execution=authorization)
                         except FileExistsError:pass
                         except RuntimeError:
                             if not args.host_consumer:raise
@@ -305,7 +682,11 @@ def main():
                             'workspaceId':job['workspaceId'],'runnerId':job['config']['runnerId'],
                             'imageDigest':job['config']['imageDigest'],'timeoutSeconds':job['config']['timeoutSeconds']},job_root=root,
                             run=run_with_probe if args.probe_permission else supervise,
-                            **({'gateway_root':ROOT/'gateways','policy_root':policy_root} if args.synthetic_provider else {})))
+                            **({'gateway_root':gateways,'policy_root':policy_root,
+                                'authorization':{'profileId':provider_profile['id'],
+                                    'policySha256':provider_profile['policySha256'],
+                                    'policyRoot':str(policy_root),'gatewayRoot':str(gateways)}}
+                               if args.synthetic_provider else {})))
                     else:
                         outcome=dispatch(transition=lifecycle_transition(command),read_claim=lifecycle_reader(command),launch_id=job['launchId'],
                             image_digest=job['config']['imageDigest'],workspace_id=job['workspaceId'],
@@ -325,9 +706,9 @@ def main():
                             assert saved['independentValidationPassed'] is False
                             transport=json.loads((root/'results/provider-fixture.json').read_text())
                             assert transport['providerTlsVerified'] and transport['foreignHostDenied']
-                            journal=json.loads((ROOT/'gateways'/job['launchId']/'lifecycle.json').read_text())
+                            journal=json.loads((gateways/job['launchId']/'lifecycle.json').read_text())
                             assert journal['state']=='closed'
-                            recovery=recovery_report(command=command,gateway_root=ROOT/'gateways')
+                            recovery=recovery_report(command=command,gateway_root=gateways)
                             assert recovery['status']=='observed' and recovery['canonicalState']=='execution_finished'
                             assert recovery['gateway']['containerState']=='absent' and recovery['gateway']['networkState']=='absent'
                             assert recovery['resumeAuthorized'] is False
@@ -376,6 +757,7 @@ def main():
                 try:process.wait(timeout=5)
                 except subprocess.TimeoutExpired:process.kill();process.wait()
         cleanup=[docker('rm','-f',cid,check=False).returncode for cid in reversed(ids)]
+        for network in networks:docker('network','rm',network,check=False)
         for directory in control_directories:directory.cleanup()
         docker('volume','rm',volume)
         source.cleanup()

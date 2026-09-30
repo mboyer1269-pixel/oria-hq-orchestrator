@@ -6,6 +6,17 @@ The bridge command explicitly uses `docker exec --user 0:0` for the private disc
 
 The command runs on the Linux host as root. Its configuration and ancestors must be protected root-owned paths. `consumer.example.json` illustrates paths only; it is not a provisioned deployment. The bridge container must mount hostConfigRoot read-only at bridgeConfigRoot, carry the current HQ scripts/dependencies, and inherit its separately protected Supabase environment. Agents must never receive this mount or the bridge credentials. The example has no secrets. The profile uses the schema documented by HQ's OPENHANDS_HOST_DISCOVERY.md; it is a direct child of hostConfigRoot. The project source registry is separately protected.
 
+The consumer configuration accepts one optional key, `providerExecution`, with the
+same four fields and the same host-path rules as the operator entry (see
+`HOST-ENTRY.md`). `consumer.example.json` deliberately omits it: without it the
+consumer refuses every profile-bearing launch before allocating anything, which is
+the installed behavior. With it, a launch whose canonical `providerProfile` matches
+the approved identity and digest and whose protected policy still verifies is
+carried into preparation and into the worker, which repeats both checks after its
+own canonical reread. Any other profile is refused before a per-launch directory
+exists. The authorization is written only into the root-only operator configuration;
+it never reaches the mission lifecycle file or the dossier.
+
 For each discovered launch, the consumer exclusively creates a persistent configuration directory named by its canonical UUID. It writes a root-only lifecycle configuration and uses the existing source selector, canonical preparation, operator entry, permission worker and dispatch CAS. The discovered payload hash must still match on preparation. No source path or executable comes from a mission. A partial attempt is retained, never deleted or replayed automatically. A filesystem lock permits one consumer per hostConfigRoot; canonical CAS remains the cross-worker execution boundary.
 
 One job runs at a time. The consumer halts on an unavailable discovery, uncertain attempt or failed process instead of launching the rest of a potentially broken batch. Exit0 means the requested scan completed or a graceful stop was handled, not independent mission validation. Exit3 means a job did not finish with process exit0; exit2 means consumer/configuration/reconciliation failure. Stdout reports bounded identity/outcome data; no configuration arguments or credentials are printed. Inspect canonical HQ state and retained files before recovery; restarting the process is not permission to delete attempt directories.

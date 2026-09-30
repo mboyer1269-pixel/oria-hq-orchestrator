@@ -5,7 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from provider_policy import EXPECTED,FILES,load_provider_policy,provider_preflight,validate_manifest
+from provider_policy import (EXPECTED,FILES,authorized_profile,load_provider_policy,provider_preflight,
+                             validate_authorization,validate_manifest)
 
 
 class ProviderPolicyTests(unittest.TestCase):
@@ -43,6 +44,41 @@ class ProviderPolicyTests(unittest.TestCase):
         with patch('provider_policy.load_provider_policy',side_effect=ValueError('mismatch')):
             self.assertEqual(provider_preflight(self.config),{'state':'invalid_provider_policy','started':False})
         self.assertIsNone(provider_preflight({'imageDigest':self.image}))
+
+    def test_operator_authorization_shape_is_strict(self):
+        approved={'profileId':self.profile['id'],'policySha256':self.profile['policySha256'],
+                  'policyRoot':'/etc/oria-hq/provider-policies','gatewayRoot':'/srv/oria-hq-gateways'}
+        self.assertEqual(validate_authorization(approved),approved)
+        for broken in ({**approved,'gatewayRoot':'relative'},{**approved,'gatewayRoot':'/srv/../escape'},
+                       {**approved,'gatewayRoot':'/srv/gateways/'},{**approved,'gatewayRoot':''},
+                       {**approved,'policyRoot':'relative'},{**approved,'policyRoot':'/etc/../escape'},
+                       {**approved,'policyRoot':approved['gatewayRoot']},
+                       {**approved,'profileId':'../other'},{**approved,'policySha256':'A'*64},
+                       {**approved,'token':'synthetic'},{'profileId':approved['profileId']},None):
+            with self.assertRaises(ValueError):validate_authorization(broken)
+
+    def test_authorization_must_name_the_canonical_profile(self):
+        approved={'profileId':self.profile['id'],'policySha256':self.profile['policySha256'],
+                  'policyRoot':'/etc/oria-hq/provider-policies','gatewayRoot':'/srv/oria-hq-gateways'}
+        self.assertEqual(authorized_profile(self.config,approved),self.profile)
+        for changed in ({'id':'other-policy'},{'policySha256':'b'*64}):
+            with self.assertRaises(ValueError):authorized_profile({**self.config,'providerProfile':{**self.profile,**changed}},approved)
+        with self.assertRaises(ValueError):authorized_profile({'imageDigest':self.image},approved)
+
+    def test_approved_policy_clears_preflight_while_unapproved_never_does(self):
+        approved={'profileId':self.profile['id'],'policySha256':self.profile['policySha256'],
+                  'policyRoot':'/etc/oria-hq/provider-policies','gatewayRoot':'/srv/oria-hq-gateways'}
+        with patch('provider_policy.load_provider_policy',return_value=self.manifest) as load:
+            self.assertIsNone(provider_preflight(self.config,approved))
+            # The approved registry is read, not the compiled-in default.
+            load.assert_called_once_with(self.config,approved['policyRoot'])
+            # A profile the operator did not approve is refused, not downgraded to
+            # the earlier verifier-only refusal, and never allocates a job.
+            self.assertEqual(provider_preflight(self.config,{**approved,'policySha256':'b'*64}),
+                             {'state':'invalid_provider_policy','started':False})
+        with patch('provider_policy.load_provider_policy',side_effect=ValueError('mismatch')):
+            self.assertEqual(provider_preflight(self.config,approved),{'state':'invalid_provider_policy','started':False})
+        self.assertIsNone(provider_preflight({'imageDigest':self.image},approved))
 
     @unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux protected filesystem')
     def test_real_protected_artifacts_tampering_permissions_and_symlink(self):

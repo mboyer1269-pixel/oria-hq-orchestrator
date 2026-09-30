@@ -4,7 +4,7 @@
 
 This is an explicit one-job Linux operator command, not an HTTP endpoint or queue daemon. It calls the existing `run_permission_job`; there is no second execution state machine.
 
-The root-owned configuration has exactly three fields:
+The root-owned configuration has exactly three required fields:
 
 ```json
 {
@@ -13,6 +13,42 @@ The root-owned configuration has exactly three fields:
   "reviewSocket": "/run/oria-hq-control/<launch-id>/review.sock"
 }
 ```
+
+One optional fourth field, `providerExecution`, is the only way this entry can
+reach the worker's provider gateway path. Omitting it keeps the offline baseline
+unchanged: no gateway root is passed and a profile-bearing mission is refused
+exactly as before. When present it has exactly these four keys and no other:
+
+```json
+{
+  "providerExecution": {
+    "profileId": "claude-subscription-v1",
+    "policySha256": "<sha256 of the approved <policyRoot>/<profileId>/policy.json>",
+    "policyRoot": "/etc/oria-hq/provider-policies",
+    "gatewayRoot": "/var/lib/oria-hq/provider-gateways"
+  }
+}
+```
+
+The authorization names the whole approved execution: which profile, which exact
+policy bytes, which protected registry those bytes are read from, and which
+gateway root. `policyRoot` and `gatewayRoot` must each be a real, root-owned,
+non group/world writable directory; they must differ from each other and share no
+subtree with `jobRoot` or the control directory. They are host paths: neither
+appears in the dossier, the browser payload or the canonical mission record.
+
+The operator entry passes the authorization together with both roots to
+`run_permission_job`, which rereads canonical authority and refuses unless the
+mission's own `providerProfile` has exactly the approved identity and digest and
+the effective roots are the authorized ones. Provider execution requires the
+authorization: a gateway root without it, an authorization without a gateway
+root, or a disagreeing root is refused as `invalid_provider_policy` before any
+socket, Docker effect or canonical transition. `--gateway-root` remains an
+inspection-only flag; no gateway path from argv can reach execution.
+
+This field enables the already-qualified gateway lifecycle for an explicitly
+approved policy. It does not authenticate the CLI, mount any account credential,
+qualify tool review or prove a real provider mission.
 
 Names above are placeholders, not installed services. The lifecycle process must already have its authorized HQ environment and protected canonical job configuration. Never put secrets or agent-supplied command arguments in this file. The command executable, configuration and parent directories must be real absolute, root-owned paths without group/world write. Resolve executable symlinks explicitly before provisioning. Only the root operator can run this entry.
 
@@ -72,3 +108,56 @@ Exit0 returns `state: prepared`, the protected `operatorConfig` path, launch ID 
 Qualification on 2026-09-30: `qualify_hq_postgrest.py --project-source` invokes the actual preparation CLI followed by the actual execution CLI. The authorized Git commit and dossier reach OpenHands; duplicate preparation/execution are refused and source HEAD is unchanged. Signed disposable Memex supplies two reads; six ledger events survive PostgreSQL restart. The Claude adapter stops with authentication required (process exit1, 8.215s); no model is called. This duration is not successful mission latency. No public ports or production database are used; owner authentication and RLS are not qualified by this fixture. All five source-registry tests pass on Linux, including rejection of writable configuration before lifecycle effects. The prior full local runner run passed 78 tests with four platform skips; the subsequently added Linux test is separately validated on VPS.
 
 This closes the callable-only preparation gap. A provisioned persistent host bridge, actual browser-to-host dispatch, provider profile/consent, and an independently reviewed coding mission remain unfinished.
+
+## Reconciling an interrupted launch
+
+`python3 reconcile_launch.py --config <operator.json> [--gateway-root <root>]`
+
+Root operator command for a launch whose host process died. It never dispatches
+and never relaunches. It reads canonical authority and the observed Docker state,
+then applies at most one canonical transition per observation, bounded to two
+passes:
+
+| Canonical state | Observed container | Recorded |
+|---|---|---|
+| `execution_finished`, `cancelled`, `succeeded`, `failed` | any | nothing; the retained evidence is read back |
+| `claimed` | any | nothing; no effect exists yet |
+| `creation_requested` | absent | `cancelled`, `interrupted_before_start` |
+| `creation_requested` | created | `container_created`, then closed on the next pass |
+| `container_created` | absent, created, dead | `cancelled`, `interrupted_before_start` |
+| `start_requested`, `running` | exited | `execution_finished` with the observed exit code |
+| `start_requested`, `running` | absent, dead | `cancelled`, `result_unrecoverable` |
+| any stage | running, paused, restarting, removing | nothing; reason and next action returned |
+| any stage | identity mismatch or unreadable | nothing; reason and next action returned |
+
+A container is only this launch's if its name, `oria.launch-id` and
+`oria.purpose` labels and pinned image all match **and its id equals the one the
+claim records**. A replacement container carrying the same name, labels and image
+is a different container: its state never justifies closing or releasing
+anything, and the launch stays open with `container_identity_mismatch`. Past
+`creation_requested` a claim always holds an identity, so a container the claim
+never bound is refused as well. Retained `results/started.json` must carry this
+launch's payload hash and commit; foreign or unreadable evidence blocks every
+transition.
+
+Every binding check — operator configuration against the canonical launch, and
+observation against the canonical identity — precedes any transition or removal,
+so a configuration naming another launch produces no effect at all.
+
+The canonical compare-and-swap orders the records; it does not freeze Docker. The
+command therefore re-observes after writing and reports
+`observation_changed_after_recording` if the container changed under it, instead
+of presenting the record as a clean outcome. `deadlineExceeded` is computed from the recorded start
+time and the container's own finish time — never guessed, so a missing timestamp
+returns `deadline_unknown` instead of a recorded result.
+
+Exit 0 means the canonical launch is now terminal, exit 3 that it is not and why,
+exit 2 that reconciliation itself is unconfirmed. No job file, checkout, result or
+dossier is ever deleted. With `--gateway-root` the per-launch provider gateway is
+released only once the launch is terminal, the agent container is observed in an
+explicitly releasable state (`absent`, `created`, `exited`, `dead`) and its
+identity matches the claim. Every other observation, including `unknown` and any
+identity mismatch, keeps the resources and states why. The gateway journal is
+retained and marked `released`.
+
+This closes a launch or recovers a result. It is never a validation of the work.

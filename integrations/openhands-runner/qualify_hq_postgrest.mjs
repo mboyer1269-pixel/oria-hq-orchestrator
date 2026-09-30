@@ -11,6 +11,9 @@ const liveMemex=process.env.QUALIFICATION_LIVE_MEMEX==='1';
 const lifecycle=process.env.QUALIFICATION_LIFECYCLE==='1';
 const providerBinding=process.env.QUALIFICATION_PROVIDER_BINDING==='1';
 const syntheticProvider=process.env.QUALIFICATION_SYNTHETIC_PROVIDER==='1';
+const interruptedStart=process.env.QUALIFICATION_INTERRUPTED_START==='1';
+const closureReason=process.env.QUALIFICATION_CLOSURE_REASON||'';
+const expectedContainer=process.env.QUALIFICATION_EXPECTED_CONTAINER||'';
 const dockerJob=process.env.QUALIFICATION_DOCKER_JOB==='1';
 const validDossier=process.env.QUALIFICATION_VALID_DOSSIER==='1';
 const reviewService=process.env.QUALIFICATION_REVIEW_SERVICE==='1';
@@ -260,9 +263,33 @@ try {
    assert.ok(!JSON.stringify(toolRows.data).includes('synthetic-argument-never-store'));
   }else{
    const restored=await store.load(ctx.workspaceId,missionId);
-   assert.equal(restored.input._openhandsLaunch.state,'execution_finished');
-   if(dockerJob){assert.match(restored.input._openhandsLaunch.containerId,/^[a-f0-9]{64}$/);assert.equal(restored.input._openhandsLaunch.process.exitCode,syntheticProvider?0:1);}
-   else assert.equal(restored.input._openhandsLaunch.containerId,'d'.repeat(64));
+   if(closureReason){
+    // The explicit closure and its observed evidence must survive the restart.
+    assert.equal(restored.input._openhandsLaunch.state,'cancelled');
+    assert.equal(restored.input._openhandsLaunch.process,undefined);
+    const closure=restored.input._openhandsLaunch.reconciliation;
+    assert.equal(closure.reason,closureReason);
+    assert.ok(['absent','created','dead'].includes(closure.containerState),closure.containerState);
+    assert.match(closure.observedAt,/^\d{4}-\d{2}-\d{2}T/);
+    console.log(JSON.stringify({closedLaunchSurvivedDatabaseRestart:true,canonicalState:'cancelled',closure}));
+   }else if(interruptedStart){
+    // The interrupted launch keeps its uncertain canonical state across the
+    // restart; that persisted state is what reconciliation later reads.
+    assert.ok(['creation_requested','container_created','start_requested','running'].includes(restored.input._openhandsLaunch.state),restored.input._openhandsLaunch.state);
+    assert.match(restored.input._openhandsLaunch.containerId,/^[a-f0-9]{64}$/);
+    assert.equal(restored.input._openhandsLaunch.process,undefined);
+    console.log(JSON.stringify({interruptedLaunchSurvivedDatabaseRestart:true,canonicalState:restored.input._openhandsLaunch.state}));
+   }else{
+    assert.equal(restored.input._openhandsLaunch.state,'execution_finished');
+    if(dockerJob){assert.match(restored.input._openhandsLaunch.containerId,/^[a-f0-9]{64}$/);assert.equal(restored.input._openhandsLaunch.process.exitCode,syntheticProvider?0:1);}
+    else assert.equal(restored.input._openhandsLaunch.containerId,'d'.repeat(64));
+   }
+   if(expectedContainer){
+    // The host observed this exact container before the restart. Any replaced or
+    // additional canonical identity fails here instead of being asserted away.
+    assert.equal(restored.input._openhandsLaunch.containerId,expectedContainer);
+    console.log(JSON.stringify({canonicalContainerIdentityAfterRestart:expectedContainer.slice(0,12),identityReplaced:false}));
+   }
    assert.equal(restored.status,'draft');
    if(providerBinding||syntheticProvider){
     const rows=await db.from('action_ledger').select('payload').eq('workspace_id',ctx.workspaceId).eq('mission_id',missionId).eq('action_type','mission.openhands_launch_authorization');

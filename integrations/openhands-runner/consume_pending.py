@@ -11,7 +11,7 @@ import threading
 from uuid import UUID
 from run_host_job import protected_path, unique_object, execute_configuration
 from project_sources import prepare_configured_project
-from provider_policy import provider_preflight
+from provider_policy import provider_preflight,separate_gateway_root,validate_authorization
 
 
 def read_json(path):
@@ -23,7 +23,9 @@ def read_json(path):
 def load_config(filename):
     if os.name!='posix' or os.geteuid()!=0:raise ValueError('Linux root required')
     config=read_json(filename)
-    if not isinstance(config,dict) or set(config)!={'bridgeCommand','bridgeScriptsRoot','bridgeConfigRoot','hostConfigRoot','profileFile','registryFile','jobsRoot','controlRoot'}:
+    base={'bridgeCommand','bridgeScriptsRoot','bridgeConfigRoot','hostConfigRoot','profileFile','registryFile','jobsRoot','controlRoot'}
+    # Absent key keeps the installed offline consumer contract byte for byte.
+    if not isinstance(config,dict) or set(config) not in (base,base|{'providerExecution'}):
         raise ValueError('Invalid consumer configuration')
     command=config['bridgeCommand']
     if not isinstance(command,list) or not 1<=len(command)<=32 or any(not isinstance(a,str) or not a or len(a)>4096 or '\0' in a for a in command):raise ValueError('Invalid host command')
@@ -32,6 +34,13 @@ def load_config(filename):
         value=config[key]
         if not isinstance(value,str) or not value.startswith('/') or str(PurePosixPath(value))!=value or '..' in PurePosixPath(value).parts or '\0' in value:raise ValueError('Absolute bridge path required')
     for key in ('hostConfigRoot','jobsRoot','controlRoot'):config[key]=protected_path(config[key],directory=True)
+    provider=config.get('providerExecution')
+    if provider is not None:
+        validate_authorization(provider)
+        runtime=(config['hostConfigRoot'],config['jobsRoot'],config['controlRoot'])
+        gateway=protected_path(provider['gatewayRoot'],directory=True)
+        separate_gateway_root(protected_path(provider['policyRoot'],directory=True),(*runtime,gateway))
+        separate_gateway_root(gateway,runtime)
     config['registryFile']=protected_path(config['registryFile'])
     profile_path=protected_path(config['profileFile'])
     if profile_path.parent!=config['hostConfigRoot']:raise ValueError('Profile must be in mounted host configuration root')
@@ -67,8 +76,10 @@ def discover(config,cursor=None):
 
 def consume(config,job):
     # Refuse unsupported provider execution before allocating a job or checkout.
-    # The worker independently checks the canonical configuration as well.
-    provider_status=provider_preflight(config['profile']['config'])
+    # An explicitly authorized profile whose protected policy still matches passes
+    # here; preparation and the worker independently recheck canonical authority.
+    provider=config.get('providerExecution')
+    provider_status=provider_preflight(config['profile']['config'],provider)
     if provider_status is not None:return provider_status
     # Exclusive per-launch directory persists any partial attempt. Never reclaim
     # it automatically after interruption; canonical CAS also guards execution.
@@ -82,7 +93,7 @@ def consume(config,job):
     mapped=str(PurePosixPath(config['bridgeConfigRoot'])/job['launchId']/'lifecycle.json')
     command=[*config['bridgeCommand'],str(PurePosixPath(config['bridgeScriptsRoot'])/'openhands-lifecycle.mjs'),mapped]
     prepared=prepare_configured_project(command=command,registry_file=config['registryFile'],jobs_root=config['jobsRoot'],control_root=config['controlRoot'],
-                                        expected_payload_hash=job['payloadHash'])
+                                        expected_payload_hash=job['payloadHash'],provider_execution=provider)
     return asyncio.run(execute_configuration(prepared['operatorConfig']))
 
 

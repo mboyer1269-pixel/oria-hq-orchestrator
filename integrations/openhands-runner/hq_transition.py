@@ -54,6 +54,8 @@ def lifecycle_transition(command):
         if 'sessionId' in data:request['sessionId']=data['sessionId']
         if 'process' in data:
             request['process']={key:data['process'][key] for key in ('exitCode','containerStopped','deadlineExceeded')}
+        if 'observed' in data:
+            request['observed']={key:data['observed'][key] for key in ('containerState','observedAt','reason')}
         result=subprocess.run(command,input=json.dumps(request),text=True,capture_output=True,
                               timeout=30,check=False)
         if result.returncode!=0:

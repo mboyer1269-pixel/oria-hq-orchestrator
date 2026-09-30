@@ -12,7 +12,10 @@ import stat
 import sys
 from hq_transition import lifecycle_reader
 from permission_worker import run_permission_job
+from provider_policy import separate_gateway_root,validate_authorization
 from recovery_report import recovery_report,publish_report
+
+BASE={'lifecycleCommand','jobRoot','reviewSocket'}
 
 
 def protected_path(raw, *, directory=False):
@@ -44,7 +47,7 @@ def load_configuration(filename,*,read_only=False):
     if path.stat().st_size>16384:raise ValueError('Oversized host configuration')
     config=json.loads(path.read_text(encoding='utf-8'),object_pairs_hook=unique_object,
                       parse_constant=lambda _:(_ for _ in ()).throw(ValueError('Nonfinite value')))
-    if not isinstance(config,dict) or set(config)!={'lifecycleCommand','jobRoot','reviewSocket'}:
+    if not isinstance(config,dict) or set(config) not in (BASE,BASE|{'providerExecution'}):
         raise ValueError('Invalid host configuration fields')
     command=config['lifecycleCommand']
     if not isinstance(command,list) or not 1<=len(command)<=32 or any(
@@ -57,11 +60,22 @@ def load_configuration(filename,*,read_only=False):
         raise ValueError('Private control socket outside job required')
     protected_path(str(review.parent),directory=True)
     if os.path.lexists(review) and not read_only:raise ValueError('Existing control socket requires reconciliation')
-    return tuple(command),root,review
+    # Absent key preserves the offline baseline: no gateway root exists to pass on.
+    provider=config.get('providerExecution')
+    if provider is not None:
+        validate_authorization(provider)
+        # Neither the approved policy registry nor the per-launch gateway may share
+        # a subtree with the agent job or the owner review directory; the agent job
+        # itself stays network none.
+        policies=protected_path(provider['policyRoot'],directory=True)
+        gateway=protected_path(provider['gatewayRoot'],directory=True)
+        separate_gateway_root(policies,(root,review.parent,gateway))
+        separate_gateway_root(gateway,(root,review.parent))
+    return tuple(command),root,review,provider
 
 
 async def execute_configuration(filename):
-    command,root,review=load_configuration(filename)
+    command,root,review,provider=load_configuration(filename)
     observed=await asyncio.to_thread(lifecycle_reader(command,include_config=True))
     claim=observed['claim'];config=observed['config']
     if claim['state']!='claimed':return {'state':'not_acquired','started':False}
@@ -71,7 +85,11 @@ async def execute_configuration(filename):
     job.update(imageDigest=config['imageDigest'],timeoutSeconds=config['timeoutSeconds'])
     # The worker rereads canonical authority before any Docker effect. A stale
     # initial observation never grants permission on its own.
-    return await run_permission_job(command=command,job=job,job_root=root,review_socket=review)
+    # Provider execution is reachable only through this root-owned configuration.
+    # The worker rechecks the approved identity and digest after canonical reread.
+    return await run_permission_job(command=command,job=job,job_root=root,review_socket=review,
+        **({'gateway_root':provider['gatewayRoot'],'policy_root':provider['policyRoot'],
+            'authorization':provider} if provider is not None else {}))
 
 
 def main():
@@ -85,7 +103,7 @@ def main():
     if args.report_directory and not args.inspect:parser.error('--report-directory requires --inspect')
     try:
         if args.inspect:
-            command,root,review=load_configuration(args.config,read_only=True)
+            command,root,review,_=load_configuration(args.config,read_only=True)
             gateway_root=protected_path(args.gateway_root,directory=True)
             report=recovery_report(command=command,gateway_root=gateway_root)
             if root.name!=report['launchId'] or review.parent.name!=report['launchId']:

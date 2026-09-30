@@ -42,7 +42,7 @@ def select_source(entries,observed):
     return matched[0]['sourceRoot']
 
 
-def prepare_configured_project(*,command,registry_file,jobs_root,control_root,expected_payload_hash=None):
+def prepare_configured_project(*,command,registry_file,jobs_root,control_root,expected_payload_hash=None,provider_execution=None):
     registry=protected_path(registry_file)
     if registry.stat().st_size>32768:raise ValueError('Oversized source registry')
     entries=parse_sources(registry.read_text(encoding='utf-8'))
@@ -53,7 +53,7 @@ def prepare_configured_project(*,command,registry_file,jobs_root,control_root,ex
     # Recheck canonical binding on the preparation read: an intervening change
     # must not switch projects while retaining the first source selection.
     return prepare_host_job(command=command,source=source,jobs_root=jobs_root,control_root=control_root,
-                            expected_payload_hash=observed['claim']['payloadHash'])
+                            expected_payload_hash=observed['claim']['payloadHash'],provider_execution=provider_execution)
 
 
 def prepare_configuration(filename):
@@ -62,7 +62,8 @@ def prepare_configuration(filename):
     path=protected_path(filename)
     if path.stat().st_size>16384:raise ValueError('Oversized preparation configuration')
     config=json.loads(path.read_text(encoding='utf-8'),object_pairs_hook=unique_object)
-    if not isinstance(config,dict) or set(config)!={'lifecycleCommand','registryFile','jobsRoot','controlRoot'}:
+    base={'lifecycleCommand','registryFile','jobsRoot','controlRoot'}
+    if not isinstance(config,dict) or set(config) not in (base,base|{'providerExecution'}):
         raise ValueError('Invalid preparation configuration fields')
     command=config['lifecycleCommand']
     if not isinstance(command,list) or not 1<=len(command)<=32 or any(
@@ -74,7 +75,8 @@ def prepare_configuration(filename):
     jobs=protected_path(config['jobsRoot'],directory=True)
     controls=protected_path(config['controlRoot'],directory=True)
     return prepare_configured_project(command=tuple(command),registry_file=registry,
-                                      jobs_root=jobs,control_root=controls)
+                                      jobs_root=jobs,control_root=controls,
+                                      provider_execution=config.get('providerExecution'))
 
 
 def main():

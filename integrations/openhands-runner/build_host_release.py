@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 import tarfile
 
-FILES=('consume_pending.py','container_job.py','dispatch.py','dossier.py','hq_transition.py',
+FILES=('launch_lease.py','consume_pending.py','container_job.py','dispatch.py','dossier.py','hq_transition.py',
        'pending_permissions.py','permission_control.py','permission_host.py','permission_transport.py',
-       'permission_worker.py','prepare_host_job.py','project_sources.py','provider_policy.py','provider_gateway.py','recovery_report.py','run_host_job.py',
+       'permission_worker.py','prepare_host_job.py','project_sources.py','provider_policy.py','provider_gateway.py','reconcile_launch.py','recovery_report.py','run_host_job.py',
        'session_permissions.py','supervisor.py','workspace.py','oria-hq-consumer.service',
        'consumer.example.json','HOST-CONSUMER.md','HOST-ENTRY.md')
 

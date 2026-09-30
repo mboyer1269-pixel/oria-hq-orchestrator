@@ -10,9 +10,23 @@ The connected synthetic worker/storage/Memex qualification is recorded in
 `PROVIDER-STORAGE-QUALIFICATION.md`. Thus the older statements below that the
 gateway lifecycle and mission wiring do not exist are historical, not current.
 
-The operational entry point remains deliberately different: `run_host_job.py`
-accepts `--gateway-root` only for read-only inspection, not execution. A passing
-qualification harness does not activate the installed consumer.
+Updated 2026-09-30: the operator entry is no longer structurally unable to reach
+that path. `run_host_job.py` and `consume_pending.py` accept an optional
+`providerExecution` object (`profileId`, `policySha256`, `gatewayRoot`) that names
+one approved profile; absent, behavior is unchanged and profile-bearing jobs stay
+refused. `--gateway-root` is still inspection-only, so no gateway path from argv
+can reach execution. This removes a configuration gap, not the credential gap: no
+account is mounted, no CLI is authenticated and no real provider mission is proven.
+A passing qualification harness still does not activate the installed consumer,
+and this code is not installed on the VPS.
+
+Second update 2026-09-30: provider execution now requires the authorization in
+the worker itself, the authorization names its own protected policy registry and
+gateway root, and both effective roots must be the authorized ones. Preparation
+validates those host roots before creating any launch directory. The connected
+proof through the real consumer, preparation and operator entry is recorded in
+`../../docs/CLAUDE-PREUVE-OPERATEUR-RESULTAT.md`. Items 1 to 6 below are
+unchanged: no account grant, credential mount or model request happened.
 
 Remaining critical path, in order:
 

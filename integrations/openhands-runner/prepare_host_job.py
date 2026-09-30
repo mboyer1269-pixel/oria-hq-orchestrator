@@ -5,10 +5,11 @@ from pathlib import Path
 from hq_transition import lifecycle_reader
 from dossier import prepare
 from workspace import prepare_workspace
+from provider_policy import authorized_profile,separate_gateway_root,validate_authorization
 from run_host_job import protected_path
 
 
-def prepare_host_job(*,command,source,jobs_root,control_root,expected_payload_hash=None):
+def prepare_host_job(*,command,source,jobs_root,control_root,expected_payload_hash=None,provider_execution=None):
     if os.name!='posix' or os.geteuid()!=0:raise ValueError('Linux root operator required')
     source=protected_path(source,directory=True)
     jobs=protected_path(jobs_root,directory=True)
@@ -20,8 +21,21 @@ def prepare_host_job(*,command,source,jobs_root,control_root,expected_payload_ha
     command=tuple(command)
     if not command:raise ValueError('Trusted command required')
     protected_path(command[0])
+    if provider_execution is not None:
+        validate_authorization(provider_execution)
+        # Same host prerequisites the operator entry will require later, checked
+        # before any creation: a refused authorization leaves no partial launch.
+        policies=protected_path(provider_execution['policyRoot'],directory=True)
+        gateway=protected_path(provider_execution['gatewayRoot'],directory=True)
+        separate_gateway_root(policies,(jobs,controls,source,gateway))
+        separate_gateway_root(gateway,(jobs,controls,source))
     observed=lifecycle_reader(command,prepare=True)()
     claim=observed['claim'];config=observed['config'];dossier=observed['dossier']
+    # An unapproved, altered or unauthorized profile is refused before any
+    # directory, checkout or configuration file exists for this launch.
+    if 'providerProfile' in config:
+        if provider_execution is None:raise ValueError('Provider profile requires explicit operator authorization')
+        authorized_profile(config,provider_execution)
     if expected_payload_hash is not None and claim['payloadHash']!=expected_payload_hash:
         raise ValueError('Canonical project changed during source selection')
     from uuid import UUID
@@ -50,6 +64,8 @@ def prepare_host_job(*,command,source,jobs_root,control_root,expected_payload_ha
         with os.fdopen(fd,'w',encoding='utf-8') as stream:
             json.dump(value,stream,ensure_ascii=False,allow_nan=False);stream.flush();os.fchmod(stream.fileno(),mode);os.fsync(stream.fileno())
     write(root/'dossier.json',dossier,0o444)
-    write(root/'operator.json',dict(lifecycleCommand=list(command),jobRoot=str(root),reviewSocket=str(review/'review.sock')),0o600)
+    operator=dict(lifecycleCommand=list(command),jobRoot=str(root),reviewSocket=str(review/'review.sock'))
+    if provider_execution is not None:operator['providerExecution']=dict(provider_execution)
+    write(root/'operator.json',operator,0o600)
     return {'state':'prepared','operatorConfig':str(root/'operator.json'),'launchId':launch,
             'commitSha':verified['commitSha'],'executionRequested':False}
