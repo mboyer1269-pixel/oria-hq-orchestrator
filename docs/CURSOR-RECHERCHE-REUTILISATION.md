@@ -112,7 +112,7 @@ Sources SDK : [persistance](https://docs.openhands.dev/sdk/guides/convo-persiste
 
 Recommandation : garder.
 
-HQ reste l'autorité. Le runner `integrations/openhands-runner` reste l'exécutant, épinglé à la preuve 1.50.0 jusqu'à une relecture du conteneur. Hermes n'est branché comme interlocuteur qu'après avoir identifié le binaire VPS. Open WebUI, LibreChat et Agent Canvas ne deviennent ni le visage ni un second orchestrateur. Memex local et AgentMemory ne sont pas promus en runtime de production.
+HQ reste l'autorité. Le runner `integrations/openhands-runner` reste l'exécutant, épinglé à la preuve 1.50.0 jusqu'à une relecture du conteneur. Cette qualification de SDK n'est pas une mission réelle validée. Hermes n'est branché comme interlocuteur qu'après avoir identifié le binaire VPS. Open WebUI, LibreChat et Agent Canvas ne deviennent ni le visage ni un second orchestrateur : ce rejet vise l'intégration complète, pas la réutilisation ultérieure d'une idée ou d'un composant isolé. Memex local et AgentMemory ne sont pas promus en runtime de production.
 
 Coût : nul en nouveau service. Le coût réel est une lecture de version, pas une installation.
 
@@ -120,7 +120,7 @@ Limite : tant que le binaire 0.15.2 n'est pas rattaché à Nous `hermes-agent`, 
 
 ### 2. Réutiliser Open WebUI tel quel, marque conservée
 
-Recommandation : rejeter comme visage ORIA. Ne pas étendre le conteneur existant.
+Recommandation : rejeter comme intégration complète et comme visage ORIA. Ne pas étendre le conteneur existant. Cela n'interdit pas de réutiliser plus tard une idée ou un composant isolé, sans retirer la marque et sans lui donner l'autorité des missions.
 
 Le port 3000 est déjà pris (`VPS-ETAT-VERIFIE.md`). La page Hermes dit qu'Open WebUI renvoie l'historique complet. Les outils tourneraient sur l'hôte Hermes, pas dans le dossier HQ. Retirer la marque au-delà de l'exception des 50 utilisateurs, ou sans écrit, rompt la licence `v0.11.4`.
 
@@ -128,7 +128,7 @@ Coût si on le gardait comme console d'admin : suivre les releases Open WebUI et
 
 ### 3. Adopter LibreChat comme visage
 
-Recommandation : rejeter.
+Recommandation : rejeter comme intégration complète. Une idée ou un composant isolé peut être réutilisé plus tard si la licence le permet et si HQ garde l'autorité.
 
 LibreChat est MIT et sait reprendre un flux, parler MCP et mémoriser des paires clé/valeur. En faire le visage ajoute MongoDB, une mémoire parallèle, et un produit dont les releases récentes sont marquées prerelease. Rien de consulté n'en fait l'autorité des missions HQ. Deux historiques de conversation apparaîtraient.
 
@@ -138,7 +138,7 @@ Coût : une pile de plus à qualifier, mettre à jour et sécuriser, sans retire
 
 Recommandation : rejeter l'application. Garder le SDK.
 
-Canvas v1.24.0 est un centre de contrôle beta : conversations, automations, backends, secrets. L'adopter créerait une seconde identité de travail à côté du dossier HQ. Le mobile documenté est un navigateur sur Tailscale ou ngrok. Le SDK 1.50.0 déjà qualifié reste le seul exécutant à réutiliser, sans installer 1.50.1 dans ce lot.
+Canvas v1.24.0 est un centre de contrôle beta : conversations, automations, backends, secrets. L'adopter créerait une seconde identité de travail à côté du dossier HQ. Le mobile documenté est un navigateur sur Tailscale ou ngrok. Le SDK 1.50.0 déjà qualifié reste le seul exécutant à réutiliser, sans installer 1.50.1 dans ce lot. Qualifié signifie exercices synthétiques réussis, pas une mission réelle validée.
 
 Coût de Canvas en plus de HQ : deux interfaces, un Automation Server, et des réglages qui ne sont pas la politique de permission HQ. Le bridge qualifié approuve encore tout seul.
 
@@ -146,11 +146,11 @@ Coût de Canvas en plus de HQ : deux interfaces, un Automation Server, et des r�
 
 Garder l'option 1.
 
-Réutiliser le SDK OpenHands déjà qualifié dans `integrations/openhands-runner` et `integrations/openhands-qualification`. Ne pas le mettre à jour vers 1.50.1 tant que le conteneur n'a pas été relu et les permissions requalifiées.
+Réutiliser le SDK OpenHands déjà qualifié dans `integrations/openhands-runner` et `integrations/openhands-qualification`. Cette qualification n'est pas une mission réelle validée : aucun modèle ni revue indépendante d'un diff utile n'y est prouvé. Ne pas le mettre à jour vers 1.50.1 tant que le conteneur n'a pas été relu et les permissions requalifiées.
 
 Réutiliser Hermes seulement comme interlocuteur devant HQ, et seulement après preuve que le service 0.15.2 est Nous `hermes-agent` à une version dont l'API a été lue. Le client devra alors continuer une session serveur (`X-Hermes-Session-Id` ou `/api/sessions/{id}/chat`), pas renvoyer le tableau `messages` complet à la façon d'Open WebUI. L'idempotence des Runs (24 heures, 409 si le payload change) ne remplace pas le contrat HQ manquant. Ne pas activer `API_SERVER_ENABLED` dans ce lot.
 
-Rejeter Open WebUI comme coquille ORIA, LibreChat comme second chat, et Agent Canvas comme second atelier. Paperclip reste le témoin déjà décrit, avec `--yolo` et une idempotence de sept jours : ne pas l'empiler.
+Rejeter Open WebUI, LibreChat et Agent Canvas comme intégration complète, pas comme interdiction de réutiliser une idée ou un composant isolé. Paperclip reste le témoin déjà décrit, avec `--yolo` et une idempotence de sept jours : ne pas l'empiler.
 
 ## Actions concrètes
 
