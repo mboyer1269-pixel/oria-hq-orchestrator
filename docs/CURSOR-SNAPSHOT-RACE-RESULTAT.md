@@ -79,3 +79,30 @@ L'adaptateur Hermes vers une mission HQ/OpenHands appartient à Claude. Aucun se
 La revue en lecture seule de ce contrat n'a pas eu lieu : l'artefact n'est pas dans cette branche ni sur les branches distantes présentes après `git fetch` (`main`, `codex/cursor-recovery-handoff`, `codex/integrated-qualification`, `cursor/operator-inspect`, `cursor/snapshot-parent-race`). `integrations/` ne contient pas Hermes. `docs/PREMIERE-MISSION-HQ.md` est un mandat de première mission, pas ce contrat. La correction du snapshot n'attend pas cet artefact.
 
 Quand le contrat sera lisible, la revue devra trancher cinq points sans les inventer : une seule identité de mission, l'autorisation qui permet l'action, le refus d'un doublon, la reconnexion à la mission déjà ouverte, et un résultat incertain qui ne devient pas un succès. Aucune de ces conclusions n'est tirée ici.
+
+Claude a terminé l'intake et a reçu, dans un clone distinct, le mandat du pont vers le vrai service HQ. Son contrat proposait un lookup avant create. Ce n'est pas suffisant seul pour la concurrence. La revue backend attend un artefact figé : deux créations simultanées, même identité avec un payload différent, perte de réponse puis lookup, configuration protégée de l'espace et de l'acteur, création distincte de l'exécution. Cet artefact n'est pas dans ce dépôt. Il n'est ni fabriqué ni codé ici. Hermes reste le chef orchestrateur, HQ l'état canonique, OpenHands le délégué, l'UI Antigravity un lot séparé.
+
+## Contrat de plateforme
+
+Ce n'est pas une prise en charge Windows. `assertDevelopmentSnapshotPlatform` refuse si `process.platform` n'est pas `linux`, si `/proc/self/fd` n'est pas un répertoire, ou si `O_NOFOLLOW` manque. Le message est : `Development snapshot requires Linux with /proc/self/fd. Native Windows is not supported; use WSL2. There is no fallback.` L'appel est le premier geste de `planDevelopmentSnapshot` et de `exportDevelopmentSnapshot`, avant Git et avant toute création.
+
+Appelants vérifiés dans cet arbre : le CLI du même fichier, `development-snapshot.test.mjs`, et la commande de test dans `README.md`. `Execution.Source.Dockerfile.dockerignore` ne fait que citer le filtre déjà appliqué. Aucun `package.json` et aucun workflow `.github` n'appellent le script. Les rapports datés qui le mentionnent décrivent des exports passés ; ils ne sont pas mis à jour et ne deviennent pas une garantie.
+
+Parcours opérateur, viable seulement comme Linux WSL2, non exécuté depuis cette machine : cette machine est `Linux 6.12.94+ x86_64`, `process.platform` vaut `linux`, `/proc/self/fd` est un répertoire. Ce n'est pas le poste Windows et `wsl.exe` n'y est pas lancé. La commande à lancer dans la distribution déjà citée par l'intégration, si elle expose bien ce Linux :
+
+```sh
+wsl -d Ubuntu-24.04 -- node -e "const fs=require('fs'); if(process.platform!=='linux'||!fs.statSync('/proc/self/fd').isDirectory()) process.exit(1)"
+wsl -d Ubuntu-24.04 -- node --test deploy/hq-pilot/development-snapshot.test.mjs
+```
+
+Un échec de la première commande signifie que cette distribution ne satisfait pas le contrat. Ce texte ne le prouve pas à sa place.
+
+Le test `platform contract refuses native Windows` force `process.platform` à `win32` dans ce processus Linux. Il vérifie le refus et l'absence de création. Il ne démarre pas Windows.
+
+## Nettoyage et destination préexistante
+
+Une destination déjà présente, répertoire ou chemin refusé avant `mkdir`, reste en place avec son fichier `sentinel.txt`. Si la copie échoue ensuite, la suppression ne porte que sur le répertoire dont le couple `dev`/`ino` est celui créé par cet appel. Le test déplace ce répertoire et met le dossier de l'utilisateur à sa place avant le nettoyage : le script lève `unusable`, le fichier `USER-OWNED` reste, et le dossier créé, renommé `export-created`, n'est pas confondu avec celui de l'utilisateur.
+
+Rejeu : `node --test deploy/hq-pilot/development-snapshot.test.mjs` — 11 tests, 0 échec, 0,227 s.
+
+Hypothèse qui invaliderait ce complément : le couple `dev`/`ino` du dossier créé est réattribué au dossier de l'utilisateur avant le `lstat` de nettoyage. Le test n'exerce pas cette réattribution. Le refus Windows observé ici est un `process.platform` modifié, pas une exécution de Node pour Windows.

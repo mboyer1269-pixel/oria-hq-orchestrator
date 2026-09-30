@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {execFileSync} from 'node:child_process';
-import {classifyPath,validateEnvTemplate,planDevelopmentSnapshot,exportDevelopmentSnapshot} from './development-snapshot.mjs';
+import {assertDevelopmentSnapshotPlatform,classifyPath,validateEnvTemplate,planDevelopmentSnapshot,exportDevelopmentSnapshot} from './development-snapshot.mjs';
 function fixture(){const parent=fs.mkdtempSync(path.join(os.tmpdir(),'hq-dev-snapshot-'));const source=path.join(parent,'repo');fs.mkdirSync(source);execFileSync('git',['init','--quiet',source]);
  const write=(rel,text)=>{const file=path.join(source,rel);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,text);};
  for(const file of ['package.json','package-lock.json','tsconfig.json'])write(file,'{}');for(const file of ['AGENTS.md','SOUL.md','run-tests.mjs'])write(file,'// fixture\n');write('src/example.test.mjs','// test\n');write('.gitignore','.env.local\nnode_modules/\n.next/\n');
@@ -116,3 +116,33 @@ test('deleted tracked file is excluded and a copy failure leaves no destination'
  assert.equal(fs.existsSync(path.join(out,'development-source-manifest.json')),false);
  assert.equal(fs.lstatSync(out).isDirectory(),true);
 }finally{fs.mkdirSync=realMkdir;fs.rmSync=realRm;f.clean();}});
+
+test('platform contract refuses native Windows before any export and keeps a user directory',()=>{const f=fixture();const descriptor=Object.getOwnPropertyDescriptor(process,'platform');try{
+ const user=path.join(f.parent,'user-owned');fs.mkdirSync(user);fs.writeFileSync(path.join(user,'sentinel.txt'),'USER-OWNED\n');
+ const out=path.join(f.parent,'export');
+ Object.defineProperty(process,'platform',{value:'win32'});
+ assert.throws(()=>exportDevelopmentSnapshot(f.source,out),/Native Windows is not supported/);
+ assert.equal(fs.existsSync(out),false);
+ assert.equal(fs.readFileSync(path.join(user,'sentinel.txt'),'utf8'),'USER-OWNED\n');
+ assert.throws(()=>assertDevelopmentSnapshotPlatform({platform:'linux',proc:path.join(f.parent,'missing-proc')}),/Native Windows is not supported/);
+ assert.equal(fs.readFileSync(path.join(user,'sentinel.txt'),'utf8'),'USER-OWNED\n');
+}finally{Object.defineProperty(process,'platform',descriptor);f.clean();}});
+
+test('partial cleanup does not delete a pre-existing user destination',()=>{const f=fixture();const realMkdir=fs.mkdirSync;try{
+ const user=path.join(f.parent,'user-owned');fs.mkdirSync(user);fs.writeFileSync(path.join(user,'sentinel.txt'),'USER-OWNED\n');
+ assert.throws(()=>exportDevelopmentSnapshot(f.source,user),/exists/);
+ assert.equal(fs.readFileSync(path.join(user,'sentinel.txt'),'utf8'),'USER-OWNED\n');
+ assert.deepEqual(fs.readdirSync(user),['sentinel.txt']);
+ const kept=path.join(f.parent,'kept');fs.mkdirSync(kept);fs.writeFileSync(path.join(kept,'sentinel.txt'),'USER-OWNED\n');
+ const out=path.join(f.parent,'export');
+ let created=false;
+ fs.mkdirSync=function(target,options){
+  if(created){fs.renameSync(out,path.join(f.parent,'export-created'));fs.renameSync(user,out);throw Error('injected copy failure');}
+  const made=realMkdir.call(fs,target,options);if(target===out)created=true;return made;
+ };
+ assert.throws(()=>exportDevelopmentSnapshot(f.source,out),/unusable/);
+ assert.equal(fs.readFileSync(path.join(out,'sentinel.txt'),'utf8'),'USER-OWNED\n');
+ assert.equal(fs.lstatSync(out).isDirectory(),true);
+ assert.equal(fs.readFileSync(path.join(kept,'sentinel.txt'),'utf8'),'USER-OWNED\n');
+ assert.equal(fs.existsSync(path.join(f.parent,'export-created')),true);
+}finally{fs.mkdirSync=realMkdir;f.clean();}});

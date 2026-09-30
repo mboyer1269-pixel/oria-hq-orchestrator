@@ -51,14 +51,21 @@ function validateAsset(bytes,relative){
  if(!valid)throw Error(`Invalid public asset: ${relative}`);
 }
 // Node's synchronous API has no openat. On Linux, opening /proc/self/fd/<dirfd>/<name>
-// with O_NOFOLLOW looks the name up in the directory inode already held, which is the
-// supported equivalent. This refuses a symlink at that name. It does not run elsewhere,
-// and it does not claim to defeat a mount placed on a real directory entry.
+// with O_NOFOLLOW looks the name up in the directory inode already held. That is the
+// supported walk. It refuses a symlink at that name. It does not run on native Windows
+// and it has no less-safe fallback. WSL2 is Linux for this test; this file does not
+// prove a particular Windows machine. A mount on a real directory is not rejected.
 const fileFlags=()=>fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK;
 const directoryFlags=()=>fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW;
-function requireLinuxWalk(){
- if(process.platform!=='linux'||!Number.isInteger(fs.constants.O_NOFOLLOW)||!Number.isInteger(fs.constants.O_DIRECTORY)||!Number.isInteger(fs.constants.O_NONBLOCK))throw Error('Development snapshot safe walk requires Linux O_NOFOLLOW');
- try{fs.statSync('/proc/self/fd');}catch{throw Error('Development snapshot safe walk requires /proc/self/fd');}
+const platformRefusal='Development snapshot requires Linux with /proc/self/fd. Native Windows is not supported; use WSL2. There is no fallback.';
+export function assertDevelopmentSnapshotPlatform(env={}){
+ const platform=env.platform??process.platform;
+ const proc=env.proc??'/proc/self/fd';
+ if(platform!=='linux')throw Error(platformRefusal);
+ let stat;
+ try{stat=fs.statSync(proc);}catch{throw Error(platformRefusal);}
+ if(!stat.isDirectory())throw Error(platformRefusal);
+ if(!Number.isInteger(fs.constants.O_NOFOLLOW)||!Number.isInteger(fs.constants.O_DIRECTORY)||!Number.isInteger(fs.constants.O_NONBLOCK))throw Error(platformRefusal);
 }
 function symlinkRefusal(relative){return Error(`Symlink refused: ${relative}`);}
 function deletedFile(relative){const error=Error(`Deleted working file: ${relative}`);error.code='ENOENT';return error;}
@@ -80,7 +87,7 @@ function interpretChildError(error,dirfd,name,relative){
  return error;
 }
 function openDirectoryExact(directory){
- requireLinuxWalk();
+ assertDevelopmentSnapshotPlatform();
  let fd;
  try{fd=fs.openSync(directory,directoryFlags());}
  catch(error){
@@ -159,7 +166,22 @@ function writeTree(destination,files,manifestBytes){
   }finally{fs.closeSync(manifestFd);}
  }finally{for(const fd of owned)fs.closeSync(fd);fs.closeSync(destFd);}
 }
+function directoryIdentity(resolved){
+ const stat=fs.lstatSync(resolved);
+ if(stat.isSymbolicLink()||!stat.isDirectory())throw Error('Development snapshot failed and left an unusable destination');
+ return {dev:stat.dev,ino:stat.ino};
+}
+function removeExportIfOwned(resolved,identity){
+ let stat;
+ try{stat=fs.lstatSync(resolved);}catch(error){if(error.code==='ENOENT')return;throw error;}
+ if(stat.isSymbolicLink()||!stat.isDirectory()||stat.dev!==identity.dev||stat.ino!==identity.ino)throw Error('Development snapshot failed and left an unusable destination');
+ fs.rmSync(resolved,{recursive:true,force:true});
+ let remains=true;
+ try{fs.lstatSync(resolved);}catch(error){if(error.code==='ENOENT')remains=false;else throw error;}
+ if(remains)throw Error('Development snapshot failed and left an unusable destination');
+}
 export function planDevelopmentSnapshot(sourceArg){
+ assertDevelopmentSnapshotPlatform();
  const source=fs.realpathSync(sourceArg);
  const top=fs.realpathSync(execFileSync('git',['-C',source,'rev-parse','--show-toplevel'],{encoding:'utf8'}).trim());if(top!==source)throw Error('Expected repository root');
  const rootFd=openDirectoryExact(source);const walker=createWalker(rootFd,source);
@@ -186,23 +208,22 @@ export function planDevelopmentSnapshot(sourceArg){
  }finally{walker.close();fs.closeSync(rootFd);}
 }
 export function exportDevelopmentSnapshot(sourceArg,destinationArg){
+ assertDevelopmentSnapshotPlatform();
  const plan=planDevelopmentSnapshot(sourceArg);const destination=path.resolve(destinationArg);
  let existing=false;
  try{fs.lstatSync(destination);existing=true;}catch(error){if(error.code!=='ENOENT')throw error;}
  if(existing)throw Error('Destination already exists');
  const parent=fs.realpathSync(path.dirname(destination));const resolved=path.join(parent,path.basename(destination));
  if(resolved===plan.source||resolved.startsWith(plan.source+path.sep))throw Error('Destination must be outside source');
- // Inputs are validated before any output. A later error removes that output.
+ // Inputs are validated before any output. A later error removes only the directory this call created.
  fs.mkdirSync(resolved);
+ const identity=directoryIdentity(resolved);
  try{
   const manifest={version:1,purpose:'development-source',gitMetadataIncluded:false,dependenciesIncluded:false,files:plan.files.map(({bytes,...entry})=>entry),excluded:plan.excluded};
   writeTree(resolved,plan.files,JSON.stringify(manifest,null,2)+'\n');
   return {files:manifest.files.length,excluded:manifest.excluded.length};
  }catch(error){
-  fs.rmSync(resolved,{recursive:true,force:true});
-  let remains=true;
-  try{fs.lstatSync(resolved);}catch(statError){if(statError.code==='ENOENT')remains=false;else throw statError;}
-  if(remains)throw Error('Development snapshot failed and left an unusable destination');
+  removeExportIfOwned(resolved,identity);
   throw error;
  }
 }
