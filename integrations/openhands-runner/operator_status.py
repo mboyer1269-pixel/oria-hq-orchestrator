@@ -4,15 +4,21 @@ Exit 0 means an inspection report was produced. It does not mean a mission
 succeeded, a container is absent, or a provider account was authenticated.
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 from dossier import InvalidDossier, prepare
 from request_io import read_dossier
+from workspace import git_environment
+
+CONNECTOR_FILES = ("squid.conf", "entrypoint.sh", "relay.mjs")
 
 
 def _version(path, run):
@@ -74,18 +80,118 @@ def observe_lock(path, *, locks_text=None):
     return {"status": "held" if held else "free", "created": False}
 
 
-def _workspace(jobs_root):
+def _regular_bytes(path, limit):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("nonregular connector file")
+    if not 1 <= info.st_size <= limit:
+        raise ValueError("connector file size")
+    data = path.read_bytes()
+    if len(data) != info.st_size:
+        raise ValueError("connector file changed")
+    return data
+
+
+def _profile_consistent(folder):
+    """True only when the directory name, manifest id and artifact bytes agree."""
+    if folder.is_symlink() or not folder.is_dir():
+        return False
+    try:
+        raw = _regular_bytes(folder / "policy.json", 16384)
+        manifest = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    if manifest.get("id") != folder.name:
+        return False
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != set(CONNECTOR_FILES):
+        return False
+    for name, digest in files.items():
+        if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            return False
+        try:
+            content = _regular_bytes(folder / name, 65536)
+        except (OSError, ValueError):
+            return False
+        if hashlib.sha256(content).hexdigest() != digest:
+            return False
+    return True
+
+
+def observe_connector(policy_root):
+    """Presence of a directory is not a configured connector."""
+    if policy_root is None:
+        return {"directoryPresent": False, "configured": False, "reason": "not_requested"}
+    policy = Path(policy_root)
+    if policy.is_symlink() or not policy.is_dir():
+        return {"directoryPresent": False, "configured": False, "reason": "policy_root_not_directory"}
+    children = [child for child in policy.iterdir() if not child.name.startswith(".")]
+    if not children:
+        return {"directoryPresent": True, "configured": False, "reason": "connector_content_missing"}
+    validated = [child.name for child in children if _profile_consistent(child)]
+    if len(validated) != 1:
+        return {"directoryPresent": True, "configured": False, "reason": "connector_identity_not_validated"}
+    return {"directoryPresent": True, "configured": True, "reason": "manifest_bytes_match"}
+
+
+def _git(checkout, *args):
+    return subprocess.run(["git", "--no-replace-objects", "-C", str(checkout), *args],
+                          capture_output=True, text=True, timeout=5, env=git_environment())
+
+
+def _observe_checkout(job, expected_commit, source):
+    described = {"status": "present", "directoryPresent": True, "isolated": False, "jobName": job.name}
+    if not any(job.iterdir()):
+        described["reason"] = "empty_job_directory"
+        return described
+    if source is not None:
+        origin = Path(source).resolve()
+        resolved = job.resolve()
+        if resolved == origin or origin in resolved.parents or resolved in origin.parents:
+            described["reason"] = "not_outside_source"
+            return described
+    top = _git(job, "rev-parse", "--show-toplevel")
+    head = _git(job, "rev-parse", "HEAD")
+    status = _git(job, "status", "--porcelain=v1", "--untracked-files=all")
+    git_dir = _git(job, "rev-parse", "--absolute-git-dir")
+    if top.returncode or head.returncode or status.returncode or git_dir.returncode:
+        described["reason"] = "checkout_not_validated"
+        return described
+    if Path(top.stdout.strip()).resolve() != job.resolve() or status.stdout.strip():
+        described["reason"] = "checkout_not_clean" if status.stdout.strip() else "checkout_not_validated"
+        return described
+    commit = head.stdout.strip()
+    if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", commit):
+        described["reason"] = "checkout_not_validated"
+        return described
+    alternates = Path(git_dir.stdout.strip()) / "objects" / "info" / "alternates"
+    if alternates.exists():
+        described["reason"] = "shared_object_store"
+        return described
+    if expected_commit is not None and commit != expected_commit:
+        described["reason"] = "commit_identity_mismatch"
+        described["observedCommit"] = commit
+        return described
+    described["isolated"] = True
+    described["commitSha"] = commit
+    described["reason"] = "clean_checkout_identity"
+    return described
+
+
+def _workspace(jobs_root, *, expected_commit=None, source=None):
     if jobs_root is None:
-        return {"status": "not_requested", "isolated": False}
+        return {"status": "not_requested", "directoryPresent": False, "isolated": False}
     root = Path(jobs_root)
     if root.is_symlink() or not root.is_dir():
-        return {"status": "unknown", "reason": "jobs_root_not_directory", "isolated": False}
+        return {"status": "unknown", "directoryPresent": False, "isolated": False, "reason": "jobs_root_not_directory"}
     jobs = [child for child in root.iterdir() if child.name.startswith("job-")]
     if not jobs:
-        return {"status": "not_prepared", "isolated": False}
+        return {"status": "not_prepared", "directoryPresent": False, "isolated": False}
     if len(jobs) != 1 or jobs[0].is_symlink() or not jobs[0].is_dir():
-        return {"status": "unknown", "reason": "ambiguous_job_directory", "isolated": False}
-    return {"status": "present", "isolated": True, "jobName": jobs[0].name}
+        return {"status": "unknown", "directoryPresent": True, "isolated": False, "reason": "ambiguous_job_directory"}
+    return _observe_checkout(jobs[0], expected_commit, source)
 
 
 def inspect_operator(*, dossier=None, workspace=None, executor_version=None, source=None,
@@ -93,34 +199,40 @@ def inspect_operator(*, dossier=None, workspace=None, executor_version=None, sou
                      run=subprocess.run, locks_text=None, docker_probe=None):
     identity = None
     budget_defined = False
+    expected_commit = None
     if dossier is not None:
         verified = prepare(dossier, expected_workspace=workspace,
                            expected_executor_version=executor_version, checkout=source)
         identity = {"missionId": dossier["mission"]["id"], "workspaceId": dossier["mission"]["workspaceId"],
                     "executor": dossier["executor"], "executorVersion": dossier["executorVersion"],
                     "commitSha": verified["commitSha"]}
+        expected_commit = verified["commitSha"]
         budget_defined = True
-    policy_present = False
-    if policy_root is not None:
-        policy = Path(policy_root)
-        policy_present = policy.is_dir() and not policy.is_symlink()
+    connector = observe_connector(policy_root)
     docker = docker_probe() if docker_probe is not None else probe_docker(which=which, run=run)
     if docker.get("container") != "not_observed":
         raise ValueError("Docker inspection must not invent a container observation")
     tools = probe_tools(which=which, run=run)
-    missing = ["provider_authentication", "execution_authorization", "canonical_claim"]
+    workspace_state = _workspace(jobs_root, expected_commit=expected_commit, source=source)
+    missing = []
+    for name in ("python3", "node", "git", "flock"):
+        if not tools[name].get("available"):
+            missing.append(name)
     if docker["daemon"] != "available":
-        missing.append("docker_daemon")
+        missing.append("docker")
+    # This command never observes the canonical store or a provider account.
+    missing.extend(["provider_authentication", "execution_authorization", "canonical_claim"])
+    if not connector["configured"]:
+        missing.append("provider_connector")
     if not budget_defined:
         missing.append("budget")
-    workspace_state = _workspace(jobs_root)
     if not workspace_state.get("isolated"):
         missing.append("isolated_workspace")
     report = {
         "version": 1,
         "mode": "inspect",
         "outcome": "inspection_completed",
-        "readyForRealMission": False,
+        "readyForRealMission": False,  # canonical claim and provider authentication are never proved here
         "resourcesModified": False,
         "executionRequested": False,
         "automaticRetry": False,
@@ -135,7 +247,9 @@ def inspect_operator(*, dossier=None, workspace=None, executor_version=None, sou
         "lock": observe_lock(lock_path, locks_text=locks_text),
         "prerequisites": {
             "tools": tools,
-            "connectorConfigured": policy_present,
+            "connectorDirectoryPresent": connector["directoryPresent"],
+            "connectorConfigured": connector["configured"],
+            "connectorReason": connector["reason"],
             "authenticationVerified": False,
             "authorizationPresent": False,
             "budgetDefined": budget_defined,

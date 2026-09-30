@@ -17,7 +17,7 @@ class DossierTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.git("init")
         self.git("-c","user.name=Qualification","-c","user.email=qualification@example.invalid",
-                 "commit","--allow-empty","-m","Synthetic fixture")
+                 "-c","commit.gpgsign=false","commit","--allow-empty","-m","Synthetic fixture")
         self.commit = self.git("rev-parse","HEAD").strip()
         self.data = copy.deepcopy(FIXTURE)
         self.data["source"]["commitSha"] = self.commit
@@ -69,7 +69,7 @@ class DossierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as other:
             subprocess.run(["git","-C",other,"init"],check=True,capture_output=True,timeout=5)
             subprocess.run(["git","-C",other,"-c","user.name=Other","-c","user.email=other@example.invalid",
-                            "commit","--allow-empty","-m","Different commit"],check=True,capture_output=True,timeout=5)
+                            "-c","commit.gpgsign=false","commit","--allow-empty","-m","Different commit"],check=True,capture_output=True,timeout=5)
             foreign=subprocess.run(["git","-C",other,"rev-parse","HEAD"],check=True,capture_output=True,text=True,timeout=5).stdout.strip()
             self.data["source"]["commitSha"]=foreign
             self.rehash()

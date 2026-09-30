@@ -26,7 +26,11 @@ python integrations/openhands-runner/operator_status.py \
 | `docker.daemon` | `available`, `unavailable` ou une sonde en échec. |
 | `docker.container` | `not_observed`. Ce n'est pas `absent`. |
 | `lock` | `not_requested`, `absent`, `free`, `held` ou `unknown`. Le fichier de verrou n'est pas créé. |
-| `prerequisites.authenticationVerified` | Faux. Un répertoire de politique ou un fichier de configuration ne prouve pas l'authentification. |
+| `connectorDirectoryPresent` | Le chemin existe et est un répertoire. Cela ne configure rien. |
+| `connectorConfigured` | Vrai seulement si un seul profil a un manifeste dont l'identifiant égale le nom du répertoire et dont les empreintes égalent les octets des artefacts. |
+| `isolatedWorkspace.isolated` | Vrai seulement pour un clone Git propre, hors de la source, sans magasin d'objets partagé, et du même commit que le dossier quand un dossier est fourni. Un répertoire `job-*` vide ne l'est pas. |
+| `missingEvidence` | Nomme les outils absents (`python3`, `node`, `git`, `flock`, `docker`) en plus des preuves de mission manquantes. |
+| `prerequisites.authenticationVerified` | Faux. Un répertoire de politique, même valide, ne prouve pas l'authentification. |
 | `prerequisites.authorizationPresent` | Faux. Un dossier de préparation n'est pas une autorisation d'exécution. |
 | `blockCategory` | `real_mission_not_ready` tant qu'une preuve exigée manque. |
 | `nextAction` | Rester en inspection. Ne pas réconcilier ni relancer. |

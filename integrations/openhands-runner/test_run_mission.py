@@ -14,7 +14,7 @@ class MissionEntryTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name);self.repo=self.root/'repo';self.repo.mkdir()
         self.results=self.root/'results';self.results.mkdir()
-        self.git('init');self.git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--allow-empty','-m','fixture')
+        self.git('init');self.git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false','commit','--allow-empty','-m','fixture')
         self.data=json.loads((Path(__file__).parent/'fixtures/hq-memory-dossier.json').read_text(encoding='utf-8'))
         self.data['source']['commitSha']=self.git('rev-parse','HEAD')
         self.data['payloadHash']=digest({k:v for k,v in self.data.items() if k not in ('payloadHash','idempotencyKey')})

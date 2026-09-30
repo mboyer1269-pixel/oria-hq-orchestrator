@@ -28,7 +28,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def commit(self):
         self.git("add","content.txt")
-        self.git("-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-m","fixture")
+        self.git("-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-m","fixture")
 
     def prepare(self,**kwargs):
         return prepare_workspace(source=self.source,commit=kwargs.get("commit",self.old),
