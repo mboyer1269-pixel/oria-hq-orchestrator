@@ -50,8 +50,18 @@ function validateAsset(bytes,relative){
 function checkedFile(source,relative){
  let current=source;
  for(const part of relative.split('/')){current=path.join(current,part);const stat=fs.lstatSync(current);if(stat.isSymbolicLink())throw Error(`Symlink refused: ${relative}`);}
- const stat=fs.statSync(current);if(!stat.isFile()||stat.size>20*1024*1024)throw Error(`Nonregular/oversized source refused: ${relative}`);
- const bytes=fs.readFileSync(current);return bytes;
+ // Read through an O_NOFOLLOW descriptor and judge that descriptor, so the final
+ // component cannot be swapped for a symlink between the check and the read.
+ // Directory components are still checked by path: Node's sync API has no
+ // per-component openat, so that narrower race stays open and is documented.
+ let descriptor;
+ try{descriptor=fs.openSync(current,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);}
+ catch(error){if(error.code==='ELOOP')throw Error(`Symlink refused: ${relative}`);throw error;}
+ try{
+  const stat=fs.fstatSync(descriptor);
+  if(!stat.isFile()||stat.size>20*1024*1024)throw Error(`Nonregular/oversized source refused: ${relative}`);
+  return fs.readFileSync(descriptor);
+ }finally{fs.closeSync(descriptor);}
 }
 export function planDevelopmentSnapshot(sourceArg){
  const source=fs.realpathSync(sourceArg);
@@ -59,10 +69,21 @@ export function planDevelopmentSnapshot(sourceArg){
  const inventory=execFileSync('git',['-C',source,'ls-files','--cached','--others','--exclude-standard','-z'],{maxBuffer:32*1024*1024}).toString('utf8').split('\0').filter(Boolean);
  const files=[];const excluded=[];const casePaths=new Set();
  for(const relative of [...new Set(inventory)].sort()){
+  let current=source;let isDeleted=false;
+  for(const part of relative.split('/')){
+   current=path.join(current,part);
+   try{
+    const stat=fs.lstatSync(current);
+    if(stat.isSymbolicLink())throw Error(`Symlink refused: ${relative}`);
+   }catch(error){
+    if(error.code==='ENOENT'){excluded.push({path:relative,reason:'deleted_working_file'});isDeleted=true;break;}
+    throw error;
+   }
+  }
+  if(isDeleted)continue;
   const classification=classifyPath(relative);
   if(!['text','public_asset'].includes(classification)){excluded.push({path:relative,reason:classification});continue;}
   if(casePaths.has(relative.toLowerCase()))throw Error('Case-colliding source paths');casePaths.add(relative.toLowerCase());
-  try{fs.lstatSync(path.join(source,relative));}catch(error){if(error.code==='ENOENT'){excluded.push({path:relative,reason:'deleted_working_file'});continue;}throw error;}
   const bytes=checkedFile(source,relative);if(classification==='text')validateText(bytes,relative);else validateAsset(bytes,relative);
   files.push({path:relative,sha256:createHash('sha256').update(bytes).digest('hex'),size:bytes.length,bytes});
  }

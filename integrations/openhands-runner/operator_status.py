@@ -15,10 +15,10 @@ import sys
 from pathlib import Path
 
 from dossier import InvalidDossier, prepare
+from provider_policy import EXPECTED, FILES, validate_manifest
 from request_io import read_dossier
 from workspace import git_environment
 
-CONNECTOR_FILES = ("squid.conf", "entrypoint.sh", "relay.mjs")
 
 
 def _version(path, run):
@@ -93,7 +93,15 @@ def _regular_bytes(path, limit):
 
 
 def _profile_consistent(folder):
-    """True only when the directory name, manifest id and artifact bytes agree."""
+    """True only for the one real registry format, checked by its own validator.
+
+    `provider_policy.validate_manifest` is the single definition of that format,
+    so the inspector reuses it instead of restating it. Two inputs the inspector
+    cannot know are taken from what it can observe: the profile identity is the
+    registry directory name, and the runtime image is the manifest's own. This
+    therefore proves internal consistency and artifact integrity, never agreement
+    with a canonical mission configuration or an authenticated account.
+    """
     if folder.is_symlink() or not folder.is_dir():
         return False
     try:
@@ -101,16 +109,14 @@ def _profile_consistent(folder):
         manifest = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return False
-    if not isinstance(manifest, dict):
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("runtimeImage"), str):
         return False
-    if manifest.get("id") != folder.name:
+    profile = {**EXPECTED, "id": folder.name, "policySha256": hashlib.sha256(raw).hexdigest()}
+    try:
+        validate_manifest(raw, profile, manifest["runtimeImage"])
+    except (ValueError, TypeError, KeyError):
         return False
-    files = manifest.get("files")
-    if not isinstance(files, dict) or set(files) != set(CONNECTOR_FILES):
-        return False
-    for name, digest in files.items():
-        if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
-            return False
+    for name, digest in manifest["files"].items():
         try:
             content = _regular_bytes(folder / name, 65536)
         except (OSError, ValueError):

@@ -11,7 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dossier import InvalidDossier, digest
-from operator_status import CONNECTOR_FILES, inspect_operator, observe_lock
+from operator_status import inspect_operator, observe_connector, observe_lock
+from provider_policy import EXPECTED, FILES
 from workspace import prepare_workspace
 
 
@@ -56,6 +57,32 @@ def tree_snapshot(path):
 def unavailable_docker():
     return {"daemon": "unavailable", "reason": "docker_cli_absent", "container": "not_observed"}
 
+
+
+def connector_bytes():
+    """Artifact bytes of a synthetic profile; the registry format is the real one."""
+    return {name: (name + "-bytes" + chr(10)).encode() for name in FILES}
+
+
+def real_manifest(contents, **overrides):
+    """The one registry format provider_policy accepts: no id, canonical bytes."""
+    manifest = {**EXPECTED, "version": 1, "agentNetwork": "none",
+                "runtimeImage": "sha256:" + "a" * 64, "proxyImage": "sha256:" + "b" * 64,
+                "relayPort": 3129, "socketPath": "/provider/provider.sock",
+                "files": {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}}
+    manifest.update(overrides)
+    return manifest
+
+
+def write_profile(policy_root, name, contents, manifest, *, canonical=True):
+    profile = policy_root / name
+    profile.mkdir(parents=True)
+    raw = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) if canonical
+           else json.dumps(manifest, indent=2))
+    (profile / "policy.json").write_text(raw, encoding="utf-8")
+    for artifact, data in contents.items():
+        (profile / artifact).write_bytes(data)
+    return profile
 
 class OperatorStatusTests(unittest.TestCase):
     def test_environment_inspection_has_no_effects_and_hides_secrets(self):
@@ -243,13 +270,8 @@ class OperatorStatusTests(unittest.TestCase):
             jobs.mkdir()
             prepare_workspace(source=source, commit=commit, server_root=jobs, job_name="job-1")
             policy = root / "policies"
-            profile = policy / "local-connector"
-            profile.mkdir(parents=True)
-            contents = {name: f"{name}-bytes\n".encode() for name in CONNECTOR_FILES}
-            manifest = {"id": "local-connector", "files": {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}}
-            (profile / "policy.json").write_text(json.dumps(manifest), encoding="utf-8")
-            for name, data in contents.items():
-                (profile / name).write_bytes(data)
+            contents = connector_bytes()
+            write_profile(policy, "local-connector", contents, real_manifest(contents))
             before = tree_snapshot(root)
             report = inspect_operator(dossier=fixture_dossier(commit), workspace="synthetic-a", executor_version="1.50.0",
                                       source=source, jobs_root=jobs, policy_root=policy, docker_probe=unavailable_docker)
@@ -300,3 +322,65 @@ class OperatorStatusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectorFormatTests(unittest.TestCase):
+    """The inspector accepts the real registry format and nothing weaker."""
+
+    def test_the_real_registry_format_is_recognised(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policies"
+            contents = connector_bytes()
+            write_profile(policy, "claude-subscription-v1", contents, real_manifest(contents))
+            before = tree_snapshot(Path(directory))
+            observed = observe_connector(policy)
+            self.assertEqual(tree_snapshot(Path(directory)), before)
+            self.assertTrue(observed["configured"])
+            self.assertEqual(observed["reason"], "manifest_bytes_match")
+
+    def test_an_invented_id_field_is_refused(self):
+        # The earlier inspector required this field; provider_policy forbids it.
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policies"
+            contents = connector_bytes()
+            write_profile(policy, "local-connector", contents,
+                          real_manifest(contents, id="local-connector"))
+            observed = observe_connector(policy)
+            self.assertFalse(observed["configured"])
+            self.assertEqual(observed["reason"], "connector_identity_not_validated")
+
+    def test_weakened_reordered_or_tampered_policies_are_refused(self):
+        cases = {
+            "host_network": dict(overrides={"agentNetwork": "host"}),
+            "enabled_connectors": dict(overrides={"accountConnectors": "enabled"}),
+            "foreign_transport": dict(overrides={"socketPath": "/tmp/provider.sock"}),
+            "unpinned_proxy": dict(overrides={"proxyImage": "latest"}),
+            "noncanonical_bytes": dict(canonical=False),
+            "tampered_artifact": dict(tamper=True),
+            "unusable_profile_name": dict(name="Bad_Name"),
+        }
+        for label, case in cases.items():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                policy = root / "policies"
+                contents = connector_bytes()
+                profile = write_profile(policy, case.get("name", "local-connector"), contents,
+                                        real_manifest(contents, **case.get("overrides", {})),
+                                        canonical=case.get("canonical", True))
+                if case.get("tamper"):
+                    (profile / "relay.mjs").write_bytes(contents["relay.mjs"] + b"// changed")
+                before = tree_snapshot(root)
+                observed = observe_connector(policy)
+                self.assertEqual(tree_snapshot(root), before, label)
+                self.assertFalse(observed["configured"], label)
+                self.assertEqual(observed["reason"], "connector_identity_not_validated", label)
+
+    def test_two_valid_profiles_stay_ambiguous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policies"
+            contents = connector_bytes()
+            write_profile(policy, "profile-one", contents, real_manifest(contents))
+            write_profile(policy, "profile-two", contents, real_manifest(contents))
+            observed = observe_connector(policy)
+            self.assertFalse(observed["configured"])
+            self.assertEqual(observed["reason"], "connector_identity_not_validated")
