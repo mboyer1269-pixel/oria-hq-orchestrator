@@ -1,6 +1,6 @@
 # Reprise Cursor — inspection opérateur
 
-30 septembre 2026. Branche de travail initiale `codex/cursor-recovery-handoff`, commit documentaire `77f9b9e9233cc120fdd5774a21c94481efcd584f`. Base fonctionnelle `59f279260d8ed7db7054867a66d3266e979e86a6`. Branche de livraison `codex/cursor-operator-inspect`. Aucun déploiement, aucun accès VPS, aucun modèle payant, aucun changement de permissions réseau.
+30 septembre 2026. Branche de travail initiale `codex/cursor-recovery-handoff`, commit documentaire `77f9b9e9233cc120fdd5774a21c94481efcd584f`. Base fonctionnelle `59f279260d8ed7db7054867a66d3266e979e86a6`. Branche de livraison `cursor/operator-inspect`. Aucun déploiement, aucun accès VPS, aucun modèle payant, aucun changement de permissions réseau.
 
 Le dépôt compagnon public `Oria.HQ.Michael.HQ-APP` au commit `e9ff840a38b4532b687bb29f3e2371afeeb3024e` n'a pas été mélangé à ce checkout et n'a pas été modifié. Cette livraison ne change pas ses contrats.
 
