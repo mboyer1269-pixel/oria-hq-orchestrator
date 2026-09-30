@@ -34,6 +34,12 @@ node --test integrations/antigravity/runner.test.mjs integrations/antigravity/pa
 node --test deploy/hq-pilot/readiness.test.mjs deploy/hq-pilot/development-snapshot.test.mjs
 ```
 
+`deploy/hq-pilot/development-snapshot.mjs` refuse Windows natif. Le parcours sûr exige Linux et `/proc/self/fd` ; il n'a pas de repli. WSL2 est un Linux pour ce contrat, pas une prise en charge Windows. Depuis le poste Windows, la commande se lance dans la distribution WSL2, pas dans PowerShell. Ce dépôt n'a pas de workflow CI qui appelle ce script. Une phrase d'opérateur n'est pas une exécution observée sur ce poste :
+
+```sh
+wsl -d Ubuntu-24.04 -- node --test deploy/hq-pilot/development-snapshot.test.mjs
+```
+
 Inspection sans effet, sans modèle et sans réconciliation :
 
 ```sh
