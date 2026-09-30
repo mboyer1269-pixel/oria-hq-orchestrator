@@ -63,3 +63,19 @@ La neutralisation de `fs.rmSync` force la branche d'échec du nettoyage. Ce n'es
 - Un descripteur dont le chemin sort de la racine, y compris après un renommage, est refusé avec l'erreur de lien. Le test qui déplace `nested` hors du dépôt observe ce refus, pas une lecture du lien.
 - Un `kill` pendant la copie peut laisser un dossier partiel. Le chemin d'erreur, lui, ne retourne pas de succès.
 - La suite Python de l'hôte n'a pas été rejouée : ces fichiers ne sont pas dans ce diff.
+
+Relecture du 30 septembre, sans changement de mécanisme : `node --test deploy/hq-pilot/development-snapshot.test.mjs` donne 9 tests, 0 échec, 0,204 s.
+
+## Hypothèse qui invaliderait la conclusion
+
+La conclusion est étroite : sur ce Linux, remplacer un répertoire parent par un lien symbolique ne fait plus exporter les octets étrangers. Elle tomberait si `/proc/self/fd/<descripteur>/<nom>` avec `O_NOFOLLOW` suivait quand même un lien, ou si `readlink` de ce descripteur restait préfixé par la racine source alors que l'inode lu est un arbre étranger. Le cas déjà connu qui la ferait tomber sans contredire les tests actuels : un point de montage, donc un vrai répertoire et non un lien, posé sur une entrée après l'ouverture du parent. `O_NOFOLLOW` ne le refuse pas. Aucun test ici ne monte un système de fichiers. Les substitutions exercées sont des liens et un renommage, séquencés dans le processus au bord de `openSync`, pas deux processus concurrents.
+
+## Contrat Hermes, revue non faite
+
+Direction retenue, non implémentée dans ce lot : ORIA héberge HQ ; Hermes est l'interlocuteur quotidien et le chef orchestrateur ; OpenHands est l'outil de développement délégué ; HQ garde les missions, les permissions et les preuves. Deux vues, Discuter et Atelier, portent la même mission. La maquette Antigravity attend une validation utilisateur. Elle n'est pas construite ici.
+
+L'adaptateur Hermes vers une mission HQ/OpenHands appartient à Claude. Aucun second adaptateur n'est ajouté.
+
+La revue en lecture seule de ce contrat n'a pas eu lieu : l'artefact n'est pas dans cette branche ni sur les branches distantes présentes après `git fetch` (`main`, `codex/cursor-recovery-handoff`, `codex/integrated-qualification`, `cursor/operator-inspect`, `cursor/snapshot-parent-race`). `integrations/` ne contient pas Hermes. `docs/PREMIERE-MISSION-HQ.md` est un mandat de première mission, pas ce contrat. La correction du snapshot n'attend pas cet artefact.
+
+Quand le contrat sera lisible, la revue devra trancher cinq points sans les inventer : une seule identité de mission, l'autorisation qui permet l'action, le refus d'un doublon, la reconnexion à la mission déjà ouverte, et un résultat incertain qui ne devient pas un succès. Aucune de ces conclusions n'est tirée ici.
