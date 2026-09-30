@@ -87,4 +87,6 @@ Prochaine action minimale vers une mission avec modèle : sur un hôte où `dock
 
 L'inspection ne prend pas le verrou et ne crée pas `launch.lock`. Elle ne lit pas le store canonique : l'état reste `unknown`, donc `readyForRealMission` reste faux. Un connecteur dont les empreintes concordent ne vérifie pas un compte fournisseur. Un démon Docker absent n'autorise aucune conclusion sur un conteneur. Le défaut Linux de `development-snapshot` n'est pas modifié ici ; il est traité à part par Antigravity. Le script d'installation d'environnement n'exécute plus `git config --global commit.gpgsign false`.
 
+La construction brouillon `bld-20260930-5b8ceacb-883c-482b-8026-779dc3b5bccf` a réussi le 30 septembre 2026. Son journal d'installation utilisateur se termine par `git version 2.43.0` et le code de sortie 0. Il ne contient pas de commande `commit.gpgsign`. La construction précédente `bld-20260930-2ef6ba32-1dba-4a25-8656-8aaac6e77b79` validait l'ancien script et ne doit pas être enregistrée. Cette nouvelle construction clone `main` ; elle ne rejoue pas la suite de `cursor/operator-inspect`. `commit.gpgsign` global reste `true` sur la machine où les suites ont tourné.
+
 AgentMemory n'est pas accessible depuis cet environnement et n'est pas utilisé comme mémoire de production.
