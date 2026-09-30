@@ -14,6 +14,7 @@
 - [x] Fournir scripts et qualifications du contexte Memex et de la contribution gouvernée.
 - [x] Fournir adaptateur Antigravity expérimental et tests de contrat.
 - [x] Documenter le candidat staging, distinct de l'application active.
+- [x] Fournir une inspection opérateur sans effet depuis un checkout Linux (`operator_status.py`). Elle ne prouve ni l'authentification fournisseur, ni Docker, ni une mission réelle.
 
 ## À terminer avant de déclarer l'atelier utilisable
 
