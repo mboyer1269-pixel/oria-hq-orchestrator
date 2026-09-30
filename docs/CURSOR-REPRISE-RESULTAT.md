@@ -28,7 +28,7 @@ La réconciliation qui peut écrire une transition reste `reconcile_launch.py`. 
 | --- | --- | --- |
 | Mandat documentaire | `77f9b9e9233cc120fdd5774a21c94481efcd584f` | Décrit les cinq phases. |
 | Base fonctionnelle | `59f279260d8ed7db7054867a66d3266e979e86a6` | Coordination lancement / réconciliation déjà qualifiée par Codex sur un agent synthétique. |
-| Livraison | commit de cette branche qui ajoute `operator_status.py` | Inspection portable. |
+| Livraison | `b12df830ab3cdb9b03fb28cfbfbc987ac7fb6efa` | Inspection portable. |
 
 Fichiers essentiels : `integrations/openhands-runner/operator_status.py`, `integrations/openhands-runner/test_operator_status.py`, `integrations/openhands-runner/OPERATOR-STATUS.md`. Le rapport réutilise `dossier.prepare` et `request_io.read_dossier`. Il ne réimplémente pas le verrou, la réconciliation ni le superviseur.
 
