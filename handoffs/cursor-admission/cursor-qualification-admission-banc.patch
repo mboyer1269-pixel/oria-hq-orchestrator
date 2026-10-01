@@ -1,0 +1,418 @@
+From 489a7c399fcadab39d9101da1ecf10fc3b6fe688 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 08:26:29 +0000
+Subject: [PATCH] Tighten the admission RLS bench without changing the product
+ contract.
+
+The temporary grant now checks current_user before each trial and requires valid client writes to leave every probe row unchanged.
+---
+ ...QUALIFICATION-ADMISSION-BANC-2026-10-01.md |  26 ++
+ proofs/admission-boundary-structure.test.mjs  |  52 ++--
+ proofs/prove-admission-rls.sql                | 235 +++++++++++++++++-
+ 3 files changed, 288 insertions(+), 25 deletions(-)
+ create mode 100644 docs/CURSOR-QUALIFICATION-ADMISSION-BANC-2026-10-01.md
+
+diff --git a/docs/CURSOR-QUALIFICATION-ADMISSION-BANC-2026-10-01.md b/docs/CURSOR-QUALIFICATION-ADMISSION-BANC-2026-10-01.md
+new file mode 100644
+index 0000000..cc9dcb7
+--- /dev/null
++++ b/docs/CURSOR-QUALIFICATION-ADMISSION-BANC-2026-10-01.md
+@@ -0,0 +1,26 @@
++# Supplément de banc — frontières d'admission
++
++Portée exacte : `proofs/prove-admission-rls.sql`, `proofs/admission-boundary-structure.test.mjs`, et ce rapport. Aucune migration. Aucun code de route, d'authentification, de service ou de contrat. Aucun composant. Aucun audit. Le patch déjà appliqué reste `cursor-qualification-admission.patch`, SHA256 `8041679e12194d91b677906a568b5d965147e76eef343b99ef8055a2913c1cb3`, arbre `e305d80f031f0e7d7d810d43e78af7ddab4160f8`. Ce fichier ne le remplace pas.
++
++## Assertions ajoutées
++
++Dans la transaction qui accorde puis annule `select, insert, update, delete`, pour `anon` et pour `authenticated` :
++
++- juste après `SET ROLE`, `current_user` doit être ce rôle, avant toute lecture ou écriture. Le même contrôle précède les essais sans grant et les appels `service_role`. Un échec de `SET ROLE` arrête le banc. Il n'est pas capturé comme un refus de requête.
++- fixtures valides, en plus de l'INSERT mission déjà présent : UPDATE et DELETE sur `missions` ; INSERT, UPDATE et DELETE sur `hq_call_budget_ceiling`, `hq_call_budget_quote`, `hq_call_emit_right` et `hq_call_reservation`.
++- effet nul : privilège insuffisant, ou zéro ligne touchée. Revenu au rôle de session, chaque table sonde a encore une ligne, et cette ligne complète est identique à l'instantané pris avant les essais.
++- `ROLLBACK` retire les grants et les lignes. Aucune policy n'est conservée.
++
++La suite ciblée ne lance plus le script réel. Le cas sans moteur est un binaire `docker` factice en tête de `PATH` : `docker info` échoue, le script sort 127 avec `NON EXECUTE`, et l'unique invocation enregistrée est `info`. Aucun conteneur n'est créé. Pas de nouveau test regex qui reflète l'implémentation. Le banc réel reste la commande explicite `sh proofs/run-admission-rls-real-db.sh`.
++
++## Ce qui a tourné ici
++
++Node 22.14.0. `node --test --test-concurrency=1 src/app/api/missions/development/route-owner-boundary.test.mjs proofs/admission-boundary-structure.test.mjs` : 10 tests, 0 échec, exit 0. Les 6 cas de route sont inchangés.
++
++`sh proofs/run-admission-rls-real-db.sh` : exit 127, `NON EXECUTE`. Docker est absent. Ce n'est pas le passage du SQL nouveau, et ce n'est pas le run `1790842532_79642`.
++
++Contrôle local séparé, pas le script Docker, pas l'image `postgres:16.4-alpine`, pas une session Supabase : PostgreSQL 16.15, mêmes rôles `nobypassrls`, migrations `0001`, `0005` et `0028`, puis `proofs/prove-admission-rls.sql`. Exit 0. Après coup, cinq comptes à 0 et grants client absents. Base détruite. Un échec de `SET ROLE` hors superutilisateur sort sur `permission denied to set role` ; l'ancien handler d'essai, lui, avale cette erreur et termine quand même.
++
++## Non couvert
++
++Pas de JWT, pas de clé service réelle, pas de VPS, pas de Hermes, pas de lancement OpenHands. Les quatre portes globales ne sont pas relancées. Hermes reste le prochain prérequis réel. Le raccordement déjà existant est `POST /api/missions/development` par le propriétaire, puis `POST /api/orchestration/openhands` avec le flag prévu.
+diff --git a/proofs/admission-boundary-structure.test.mjs b/proofs/admission-boundary-structure.test.mjs
+index e51c65c..8601690 100644
+--- a/proofs/admission-boundary-structure.test.mjs
++++ b/proofs/admission-boundary-structure.test.mjs
+@@ -1,10 +1,12 @@
+ #!/usr/bin/env node
+-// Structural checks that do not require Docker and do not claim real_infra.
+-// The disposable PostgreSQL script is executed separately.
++// Source checks, plus one bounded fake docker process.
++// This file does not start a container and does not claim real_infra.
++// The disposable PostgreSQL bench is the explicit shell command, not this suite.
+ 
+ import assert from "node:assert/strict";
+ import { execFileSync } from "node:child_process";
+-import { readFileSync } from "node:fs";
++import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
+ import path from "node:path";
+ import test from "node:test";
+ import { fileURLToPath } from "node:url";
+@@ -41,26 +43,44 @@ test("mission and budget migrations do not grant client table access or bypassrl
+   assert.match(script, /exit 127/);
+ });
+ 
+-test("the admission SQL bench reports absence or a real run, never a renamed simulation", () => {
+-  let stderr = "";
+-  let stdout = "";
++test("absent docker is a bounded fake process and does not create a container", () => {
++  const bin = mkdtempSync(path.join(tmpdir(), "admission-fake-docker-"));
++  const log = path.join(bin, "invocations.log");
++  writeFileSync(
++    path.join(bin, "docker"),
++    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ADMISSION_FAKE_DOCKER_LOG\"\nexit 1\n",
++    { mode: 0o755 },
++  );
+   let code = 0;
++  let stdout = "";
++  let stderr = "";
++  let invocations = "";
+   try {
+     stdout = execFileSync("sh", ["proofs/run-admission-rls-real-db.sh"], {
+       cwd: root,
+       encoding: "utf8",
++      timeout: 15000,
+       stdio: ["ignore", "pipe", "pipe"],
++      env: {
++        ...process.env,
++        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
++        ADMISSION_FAKE_DOCKER_LOG: log,
++      },
+     });
+   } catch (error) {
+-    code = error.status;
+-    stdout = error.stdout ?? "";
+-    stderr = error.stderr ?? "";
+-  }
+-  if (code === 127) {
+-    assert.match(stderr, /NON EXECUTE/);
+-    assert.doesNotMatch(`${stdout}\n${stderr}`, /QUALIFIÉE/);
+-    return;
++    code = error.status ?? 1;
++    stdout = `${error.stdout ?? ""}`;
++    stderr = `${error.stderr ?? ""}`;
++  } finally {
++    try {
++      invocations = readFileSync(log, "utf8");
++    } catch {
++      invocations = "";
++    }
++    rmSync(bin, { recursive: true, force: true });
+   }
+-  assert.equal(code, 0, stderr);
+-  assert.match(stdout, /ADMISSION RLS QUALIFIÉE/);
++  assert.equal(code, 127, stderr);
++  assert.match(stderr, /NON EXECUTE/);
++  assert.equal(stdout.includes("QUALIFIÉE") || stderr.includes("QUALIFIÉE"), false);
++  assert.equal(invocations, "info\n");
+ });
+diff --git a/proofs/prove-admission-rls.sql b/proofs/prove-admission-rls.sql
+index 3a3ca29..5e27f23 100644
+--- a/proofs/prove-admission-rls.sql
++++ b/proofs/prove-admission-rls.sql
+@@ -2,6 +2,8 @@
+ -- anon, authenticated and service_role are local role names, not Supabase sessions.
+ -- None of them is superuser and none bypasses row security.
+ -- A rolled-back grant only makes the RLS predicate observable. It is not kept.
++-- current_user is checked immediately after set role, before any trial.
++-- A failed set role stops the bench. It is not a refused query.
+ 
+ \set ON_ERROR_STOP on
+ 
+@@ -53,17 +55,20 @@ begin
+       'select public.hq_mark_call_emitted(''w'', ''s'', ''c'', ''openai'')',
+       'select public.hq_consume_call_attempt(''w'', ''s'', ''c'', ''openai'')'
+     ] loop
++      execute format('set role %I', v_role);
++      if current_user is distinct from v_role then
++        raise exception 'set role did not take effect before denial trial: expected % but current_user is %', v_role, current_user;
++      end if;
+       begin
+-        execute format('set role %I', v_role);
+         execute v_statement;
+-        raise exception '% executed %', v_role, v_statement;
++        raise exception '% was allowed to execute %', v_role, v_statement;
+       exception
+         when insufficient_privilege then
+           null;
+       end;
+       reset role;
+-      if current_user <> session_user then
+-        raise exception 'role % was not reset', v_role;
++      if current_user is distinct from session_user then
++        raise exception 'role % was not reset after denial trial', v_role;
+       end if;
+     end loop;
+   end loop;
+@@ -76,8 +81,8 @@ declare
+   v_count bigint;
+ begin
+   set role service_role;
+-  if current_user <> 'service_role' then
+-    raise exception 'service_role was not the effective role';
++  if current_user is distinct from 'service_role' then
++    raise exception 'set role did not take effect before service_role trials: current_user is %', current_user;
+   end if;
+   if (select rolsuper or rolbypassrls from pg_roles where rolname = current_user) then
+     raise exception 'effective service_role is privileged';
+@@ -147,11 +152,49 @@ do $$
+ declare
+   v_role text;
+   v_seen bigint;
++  v_rows bigint;
++  v_mission_before public.missions%rowtype;
++  v_mission_after public.missions%rowtype;
++  v_ceiling_before public.hq_call_budget_ceiling%rowtype;
++  v_ceiling_after public.hq_call_budget_ceiling%rowtype;
++  v_quote_before public.hq_call_budget_quote%rowtype;
++  v_quote_after public.hq_call_budget_quote%rowtype;
++  v_right_before public.hq_call_emit_right%rowtype;
++  v_right_after public.hq_call_emit_right%rowtype;
++  v_reservation_before public.hq_call_reservation%rowtype;
++  v_reservation_after public.hq_call_reservation%rowtype;
+ begin
++  if (select count(*) from public.missions) <> 1
++     or (select count(*) from public.hq_call_budget_ceiling) <> 1
++     or (select count(*) from public.hq_call_budget_quote) <> 1
++     or (select count(*) from public.hq_call_emit_right) <> 1
++     or (select count(*) from public.hq_call_reservation) <> 1 then
++    raise exception 'probe fixture was not one row per table';
++  end if;
++  select * into strict v_mission_before from public.missions;
++  select * into strict v_ceiling_before from public.hq_call_budget_ceiling;
++  select * into strict v_quote_before from public.hq_call_budget_quote;
++  select * into strict v_right_before from public.hq_call_emit_right;
++  select * into strict v_reservation_before from public.hq_call_reservation;
++  if v_mission_before.id is distinct from 'probe-mission'
++     or v_ceiling_before.workspace_id is distinct from 'probe-ws'
++     or v_quote_before.provider is distinct from 'openai'
++     or v_quote_before.model_id is distinct from 'probe-model'
++     or v_right_before.workspace_id is distinct from 'probe-ws'
++     or v_right_before.subject_id is distinct from 'probe-subject'
++     or v_reservation_before.workspace_id is distinct from 'probe-ws'
++     or v_reservation_before.subject_id is distinct from 'probe-subject'
++     or v_reservation_before.provider is distinct from 'openai' then
++    raise exception 'probe fixture keys changed';
++  end if;
++
+   foreach v_role in array array['anon', 'authenticated'] loop
+     execute format('set role %I', v_role);
++    if current_user is distinct from v_role then
++      raise exception 'set role did not take effect before rls trials: expected % but current_user is %', v_role, current_user;
++    end if;
+     if (select rolsuper or rolbypassrls from pg_roles where rolname = current_user) then
+-      raise exception 'probe role % bypasses rls', v_role;
++      raise exception 'probe role % bypasses rls', current_user;
+     end if;
+     select count(*) into v_seen from public.missions;
+     if v_seen <> 0 then raise exception '% read % missions through rls', v_role, v_seen; end if;
+@@ -163,14 +206,188 @@ begin
+     if v_seen <> 0 then raise exception '% read an emit right through rls', v_role; end if;
+     select count(*) into v_seen from public.hq_call_reservation;
+     if v_seen <> 0 then raise exception '% read a reservation through rls', v_role; end if;
++
++    v_rows := 0;
+     begin
+       insert into public.missions (id, workspace_id, mode_id, title, objective, assigned_agent_id)
+       values ('client-write', 'probe-ws', 'hq', 'no', 'no', 'none');
+-      raise exception '% inserted a mission', v_role;
++      v_rows := 1;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows <> 0 then raise exception '% inserted a mission', v_role; end if;
++
++    v_rows := null;
++    begin
++      update public.missions set title = 'probe-changed' where id = 'probe-mission';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% updated % mission rows', v_role, v_rows; end if;
++
++    v_rows := null;
++    begin
++      delete from public.missions where id = 'probe-mission';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% deleted % mission rows', v_role, v_rows; end if;
++
++    v_rows := 0;
++    begin
++      insert into public.hq_call_budget_ceiling (workspace_id, currency, max_amount_cents)
++      values ('client-ws', 'USD', 0);
++      v_rows := 1;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows <> 0 then raise exception '% inserted a ceiling', v_role; end if;
++
++    v_rows := null;
++    begin
++      update public.hq_call_budget_ceiling set max_amount_cents = 1 where workspace_id = 'probe-ws';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% updated % ceiling rows', v_role, v_rows; end if;
++
++    v_rows := null;
++    begin
++      delete from public.hq_call_budget_ceiling where workspace_id = 'probe-ws';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% deleted % ceiling rows', v_role, v_rows; end if;
++
++    v_rows := 0;
++    begin
++      insert into public.hq_call_budget_quote (
++        provider, model_id, currency, not_to_exceed_cents, quote_scope, quote_version,
++        valid_until, covers_input_bytes, covers_output_tokens, reliable
++      ) values (
++        'anthropic', 'probe-model', 'USD', 1, 'prompt_system_output', 'probe',
++        now() + interval '1 hour', 16, 16, false
++      );
++      v_rows := 1;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows <> 0 then raise exception '% inserted a quote', v_role; end if;
++
++    v_rows := null;
++    begin
++      update public.hq_call_budget_quote
++      set not_to_exceed_cents = 2
++      where provider = 'openai' and model_id = 'probe-model';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% updated % quote rows', v_role, v_rows; end if;
++
++    v_rows := null;
++    begin
++      delete from public.hq_call_budget_quote where provider = 'openai' and model_id = 'probe-model';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% deleted % quote rows', v_role, v_rows; end if;
++
++    v_rows := 0;
++    begin
++      insert into public.hq_call_emit_right (workspace_id, subject_id, caller_id)
++      values ('probe-ws', 'client-subject', 'probe-caller');
++      v_rows := 1;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows <> 0 then raise exception '% inserted an emit right', v_role; end if;
++
++    v_rows := null;
++    begin
++      update public.hq_call_emit_right
++      set caller_id = 'other-caller'
++      where workspace_id = 'probe-ws' and subject_id = 'probe-subject';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% updated % emit right rows', v_role, v_rows; end if;
++
++    v_rows := null;
++    begin
++      delete from public.hq_call_emit_right
++      where workspace_id = 'probe-ws' and subject_id = 'probe-subject';
++      get diagnostics v_rows = row_count;
+     exception
+-      when insufficient_privilege then null;
++      when insufficient_privilege then v_rows := 0;
+     end;
++    if v_rows is distinct from 0 then raise exception '% deleted % emit right rows', v_role, v_rows; end if;
++
++    v_rows := 0;
++    begin
++      insert into public.hq_call_reservation (
++        workspace_id, subject_id, provider, caller_id, access_class, currency,
++        reserved_cents, state, reconciliation_required, model_id, max_tokens, input_bytes, network_emitted
++      ) values (
++        'probe-ws', 'probe-subject', 'anthropic', 'probe-caller', 'api', 'USD',
++        1, 'held', false, 'probe-model', 16, 16, false
++      );
++      v_rows := 1;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows <> 0 then raise exception '% inserted a reservation', v_role; end if;
++
++    v_rows := null;
++    begin
++      update public.hq_call_reservation
++      set reserved_cents = 2
++      where workspace_id = 'probe-ws' and subject_id = 'probe-subject' and provider = 'openai';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% updated % reservation rows', v_role, v_rows; end if;
++
++    v_rows := null;
++    begin
++      delete from public.hq_call_reservation
++      where workspace_id = 'probe-ws' and subject_id = 'probe-subject' and provider = 'openai';
++      get diagnostics v_rows = row_count;
++    exception
++      when insufficient_privilege then v_rows := 0;
++    end;
++    if v_rows is distinct from 0 then raise exception '% deleted % reservation rows', v_role, v_rows; end if;
++
+     reset role;
++    if current_user is distinct from session_user then
++      raise exception 'role % was not reset after rls trials', v_role;
++    end if;
++    if (select count(*) from public.missions) <> 1
++       or (select count(*) from public.hq_call_budget_ceiling) <> 1
++       or (select count(*) from public.hq_call_budget_quote) <> 1
++       or (select count(*) from public.hq_call_emit_right) <> 1
++       or (select count(*) from public.hq_call_reservation) <> 1 then
++      raise exception '% left a probe table with a row count other than 1', v_role;
++    end if;
++    select * into strict v_mission_after from public.missions;
++    select * into strict v_ceiling_after from public.hq_call_budget_ceiling;
++    select * into strict v_quote_after from public.hq_call_budget_quote;
++    select * into strict v_right_after from public.hq_call_emit_right;
++    select * into strict v_reservation_after from public.hq_call_reservation;
++    if v_mission_after is distinct from v_mission_before
++       or v_ceiling_after is distinct from v_ceiling_before
++       or v_quote_after is distinct from v_quote_before
++       or v_right_after is distinct from v_right_before
++       or v_reservation_after is distinct from v_reservation_before then
++      raise exception '% changed a complete probe row', v_role;
++    end if;
+   end loop;
+ end
+ $$;
+-- 
+2.43.0
+
