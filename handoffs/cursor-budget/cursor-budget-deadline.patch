@@ -1,0 +1,409 @@
+From 669c1d35e6c1cca78315b4c3c9c5909955ddc60a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 07:28:08 +0000
+Subject: [PATCH 1/2] Keep the JSON client deadline armed through the response
+ body.
+
+clearTimeout no longer runs before response.json(). The native AbortSignal
+covers the body read, and the timer is cleared in finally.
+---
+ src/server/ai/anthropic-json-client.ts      |  18 +-
+ src/server/ai/json-client-deadline.test.mjs | 245 ++++++++++++++++++++
+ src/server/ai/openai-json-client.ts         |  18 +-
+ 3 files changed, 271 insertions(+), 10 deletions(-)
+ create mode 100644 src/server/ai/json-client-deadline.test.mjs
+
+diff --git a/src/server/ai/anthropic-json-client.ts b/src/server/ai/anthropic-json-client.ts
+index 6c1c175..66faf67 100644
+--- a/src/server/ai/anthropic-json-client.ts
++++ b/src/server/ai/anthropic-json-client.ts
+@@ -104,6 +104,7 @@ export async function generateJsonWithAnthropic(
+   const timeoutMs = input.timeoutMs ?? ANTHROPIC_JSON_DEFAULT_TIMEOUT_MS;
+   const temperature = input.temperature ?? ANTHROPIC_JSON_DEFAULT_TEMPERATURE;
+ 
++  // Armed through response.json(). Clearing after headers leaves a stalled body unbounded.
+   const controller = new AbortController();
+   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+ 
+@@ -125,8 +126,6 @@ export async function generateJsonWithAnthropic(
+       }),
+     });
+ 
+-    clearTimeout(timeoutId);
+-
+     if (!response.ok) {
+       return {
+         ok: false,
+@@ -173,9 +172,7 @@ export async function generateJsonWithAnthropic(
+ 
+     return { ok: true, json, rawText, modelId, tokenUsage };
+   } catch (err) {
+-    clearTimeout(timeoutId);
+-
+-    if (err instanceof Error && err.name === "AbortError") {
++    if (isAbortError(err)) {
+       return {
+         ok: false,
+         errorCode: "timeout",
+@@ -190,5 +187,16 @@ export async function generateJsonWithAnthropic(
+       fallbackReason: "Unexpected error contacting Anthropic",
+       modelId,
+     };
++  } finally {
++    clearTimeout(timeoutId);
+   }
+ }
++
++function isAbortError(err: unknown): boolean {
++  if (!err || typeof err !== "object") return false;
++  const name = "name" in err ? err.name : undefined;
++  if (name === "AbortError" || name === "TimeoutError") return true;
++  const cause = "cause" in err ? err.cause : undefined;
++  if (!cause || typeof cause !== "object" || !("name" in cause)) return false;
++  return cause.name === "AbortError" || cause.name === "TimeoutError";
++}
+diff --git a/src/server/ai/json-client-deadline.test.mjs b/src/server/ai/json-client-deadline.test.mjs
+new file mode 100644
+index 0000000..1fe839e
+--- /dev/null
++++ b/src/server/ai/json-client-deadline.test.mjs
+@@ -0,0 +1,245 @@
++#!/usr/bin/env node
++// Loopback deadline for the two JSON clients. Real fetch to 127.0.0.1 only.
++// An injected fetch that ignores AbortSignal is not treated as a covered timeout.
++// No provider network and no model call.
++
++import assert from "node:assert/strict";
++import http from "node:http";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..");
++const { createJiti } = await import("jiti");
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(projectRoot, "src"),
++    "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++  },
++});
++
++const { generateJsonWithAnthropic } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/anthropic-json-client.ts"),
++);
++const { generateJsonWithOpenAI } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/openai-json-client.ts"),
++);
++const { generateStructuredJson } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/llm-json-provider.ts"),
++);
++
++const TIMEOUT_MS = 600;
++const HANG_BOUND_MS = 2500;
++
++const CLIENTS = [
++  {
++    name: "anthropic",
++    env: "ANTHROPIC_API_KEY",
++    modelId: "claude-haiku-4-5-20251001",
++    call: generateJsonWithAnthropic,
++    body: JSON.stringify({
++      content: [{ type: "text", text: JSON.stringify({ reply: "ok" }) }],
++      usage: { input_tokens: 1, output_tokens: 1 },
++    }),
++  },
++  {
++    name: "openai",
++    env: "OPENAI_API_KEY",
++    modelId: "gpt-4o-mini",
++    call: generateJsonWithOpenAI,
++    body: JSON.stringify({
++      choices: [{ message: { content: JSON.stringify({ reply: "ok" }) } }],
++      usage: { prompt_tokens: 1, completion_tokens: 1 },
++    }),
++  },
++];
++
++function listen(mode, body) {
++  const server = http.createServer((req, res) => {
++    req.on("error", () => {});
++    res.on("error", () => {});
++    req.resume();
++    if (mode === "headers") return;
++    res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
++    res.flushHeaders();
++    if (mode === "body") return;
++    res.end(body);
++  });
++  server.requestTimeout = 0;
++  server.headersTimeout = 0;
++  server.timeout = 0;
++  return new Promise((resolve, reject) => {
++    server.once("error", reject);
++    server.listen(0, "127.0.0.1", () => resolve(server));
++  });
++}
++
++function closeServer(server) {
++  server.closeAllConnections();
++  return new Promise((resolve) => server.close(() => resolve()));
++}
++
++function loopbackFetch(port) {
++  return (_url, init) => fetch(`http://127.0.0.1:${port}/`, init);
++}
++
++function ignoringFetch() {
++  return () => new Promise(() => {});
++}
++
++async function settle(work, boundMs = HANG_BOUND_MS) {
++  const started = performance.now();
++  let timer;
++  const hang = new Promise((resolve) => {
++    timer = setTimeout(() => resolve({ settled: false }), boundMs);
++  });
++  const outcome = await Promise.race([
++    work.then((result) => ({ settled: true, result })),
++    hang,
++  ]);
++  clearTimeout(timer);
++  return { ...outcome, elapsed: Math.round(performance.now() - started) };
++}
++
++function recordingGate() {
++  const state = { status: "none", releaseCalls: 0, reservedCents: null };
++  return {
++    state,
++    async reserve() {
++      state.status = "held";
++      state.reservedCents = 40;
++      return {
++        configured: true,
++        status: "held",
++        currency: "USD",
++        reservedCents: 40,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++    },
++    async markEmitted() {
++      state.status = "emitted_unknown";
++      return {
++        configured: true,
++        status: "emitted_unknown",
++        currency: "USD",
++        reservedCents: 40,
++        networkEmitted: true,
++        reconciliationRequired: true,
++      };
++    },
++    async release() {
++      state.releaseCalls += 1;
++      state.status = "released";
++      state.reservedCents = null;
++      return {
++        configured: true,
++        status: "released",
++        currency: null,
++        reservedCents: null,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++    },
++    async consume() {
++      state.status = "consumed";
++      return {
++        configured: true,
++        status: "consumed",
++        currency: "USD",
++        reservedCents: state.reservedCents,
++        networkEmitted: true,
++        reconciliationRequired: false,
++      };
++    },
++  };
++}
++
++for (const client of CLIENTS) {
++  test(`${client.name} loopback deadline covers headers and body`, async () => {
++    process.env[client.env] = "synthetic";
++    const measured = [];
++    try {
++      for (const mode of ["headers", "complete", "body"]) {
++        const server = await listen(mode, client.body);
++        const port = server.address().port;
++        try {
++          const outcome = await settle(client.call(
++            { systemPrompt: "sys", userPrompt: "user", timeoutMs: TIMEOUT_MS, modelId: client.modelId },
++            loopbackFetch(port),
++          ));
++          measured.push(`${mode}=${outcome.elapsed}`);
++          assert.equal(outcome.settled, true, `${client.name} ${mode} still pending after ${HANG_BOUND_MS}ms`);
++          if (mode === "complete") {
++            assert.equal(outcome.result.ok, true);
++            assert.equal(outcome.result.json.reply, "ok");
++            assert.ok(outcome.elapsed < 400, `complete took ${outcome.elapsed}ms`);
++          } else {
++            assert.equal(outcome.result.ok, false);
++            assert.equal(outcome.result.errorCode, "timeout");
++            assert.ok(outcome.elapsed >= TIMEOUT_MS - 50, `${mode} returned early at ${outcome.elapsed}ms`);
++            assert.ok(outcome.elapsed < 1500, `${mode} took ${outcome.elapsed}ms`);
++          }
++        } finally {
++          await closeServer(server);
++        }
++      }
++      console.log(`DEADLINE ${client.name} ${measured.join(" ")}`);
++    } finally {
++      delete process.env[client.env];
++    }
++  });
++
++  test(`${client.name} injected fetch that ignores AbortSignal stays outside the deadline`, async () => {
++    process.env[client.env] = "synthetic";
++    try {
++      const outcome = await settle(client.call(
++        { systemPrompt: "sys", userPrompt: "user", timeoutMs: TIMEOUT_MS, modelId: client.modelId },
++        ignoringFetch(),
++      ), 1200);
++      console.log(`DEADLINE ${client.name} ignored-signal settled=${outcome.settled} elapsed=${outcome.elapsed}`);
++      assert.equal(outcome.settled, false);
++    } finally {
++      delete process.env[client.env];
++    }
++  });
++
++  test(`${client.name} body timeout after emission keeps the unknown reservation`, async () => {
++    process.env.HQ_CALL_RESERVATION = "1";
++    process.env[client.env] = "synthetic";
++    const server = await listen("body", client.body);
++    const port = server.address().port;
++    const gate = recordingGate();
++    try {
++      const outcome = await settle(generateStructuredJson({
++        providerPreference: client.name,
++        modelId: client.modelId,
++        workspaceId: "ws-deadline",
++        callSubjectId: `deadline-${client.name}`,
++        timeoutMs: TIMEOUT_MS,
++        systemPrompt: "sys",
++        userPrompt: "user",
++        reservationGate: gate,
++        fetchFns: { [client.name]: loopbackFetch(port) },
++      }));
++      console.log(`DEADLINE ${client.name} reservation elapsed=${outcome.elapsed} status=${gate.state.status} releases=${gate.state.releaseCalls}`);
++      assert.equal(outcome.settled, true);
++      assert.equal(outcome.result.ok, false);
++      assert.equal(gate.state.status, "emitted_unknown");
++      assert.equal(gate.state.releaseCalls, 0);
++      assert.equal(gate.state.reservedCents, 40);
++      assert.notEqual(gate.state.reservedCents, 0);
++      assert.equal(outcome.result.reservation.status, "emitted_unknown");
++      assert.equal(outcome.result.reservation.reconciliationRequired, true);
++      assert.equal(outcome.result.reservation.reservedCents, 40);
++      assert.equal(outcome.result.cost.kind, "failed_maybe_billed");
++      assert.equal(outcome.result.cost.monetaryUsd, null);
++      assert.equal(outcome.result.cost.networkRequestSent, true);
++    } finally {
++      await closeServer(server);
++      delete process.env.HQ_CALL_RESERVATION;
++      delete process.env[client.env];
++    }
++  });
++}
+diff --git a/src/server/ai/openai-json-client.ts b/src/server/ai/openai-json-client.ts
+index fc31e6a..df0851f 100644
+--- a/src/server/ai/openai-json-client.ts
++++ b/src/server/ai/openai-json-client.ts
+@@ -101,6 +101,7 @@ export async function generateJsonWithOpenAI(
+   const timeoutMs = input.timeoutMs ?? OPENAI_JSON_DEFAULT_TIMEOUT_MS;
+   const temperature = input.temperature ?? OPENAI_JSON_DEFAULT_TEMPERATURE;
+ 
++  // Armed through response.json(). Clearing after headers leaves a stalled body unbounded.
+   const controller = new AbortController();
+   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+ 
+@@ -124,8 +125,6 @@ export async function generateJsonWithOpenAI(
+       }),
+     });
+ 
+-    clearTimeout(timeoutId);
+-
+     if (!response.ok) {
+       return {
+         ok: false,
+@@ -172,9 +171,7 @@ export async function generateJsonWithOpenAI(
+ 
+     return { ok: true, json, rawText, modelId, tokenUsage };
+   } catch (err) {
+-    clearTimeout(timeoutId);
+-
+-    if (err instanceof Error && err.name === "AbortError") {
++    if (isAbortError(err)) {
+       return {
+         ok: false,
+         errorCode: "timeout",
+@@ -189,5 +186,16 @@ export async function generateJsonWithOpenAI(
+       fallbackReason: "Unexpected error contacting OpenAI",
+       modelId,
+     };
++  } finally {
++    clearTimeout(timeoutId);
+   }
+ }
++
++function isAbortError(err: unknown): boolean {
++  if (!err || typeof err !== "object") return false;
++  const name = "name" in err ? err.name : undefined;
++  if (name === "AbortError" || name === "TimeoutError") return true;
++  const cause = "cause" in err ? err.cause : undefined;
++  if (!cause || typeof cause !== "object" || !("name" in cause)) return false;
++  return cause.name === "AbortError" || cause.name === "TimeoutError";
++}
+-- 
+2.43.0
+
+
+From 4225cc1f4f19d2429afff382c3d4c80d9fd29eae Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 07:28:27 +0000
+Subject: [PATCH 2/2] Record the JSON client deadline measurements.
+
+The note cites the client commit, the loopback timings, and the kept reservation.
+---
+ docs/CURSOR-BUDGET-DEADLINE-RESULTAT.md | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+ create mode 100644 docs/CURSOR-BUDGET-DEADLINE-RESULTAT.md
+
+diff --git a/docs/CURSOR-BUDGET-DEADLINE-RESULTAT.md b/docs/CURSOR-BUDGET-DEADLINE-RESULTAT.md
+new file mode 100644
+index 0000000..39a57c6
+--- /dev/null
++++ b/docs/CURSOR-BUDGET-DEADLINE-RESULTAT.md
+@@ -0,0 +1,21 @@
++# Délai des clients JSON — correctif supplémentaire
++
++Le patch budget `58712d08..1ff9da57` n'est pas modifié. Ce correctif part de `1ff9da576788d39ec9df6e8ee4b2c5b4b7f59431`. Code `669c1d35e6c1cca78315b4c3c9c5909955ddc60a`.
++
++`anthropic-json-client.ts` et `openai-json-client.ts` annulaient le délai après les en-têtes, avant `response.json()`. Le même `AbortSignal` reste armé pendant la lecture du corps. `clearTimeout` est dans `finally`. Aucun tarif, aucune activation de `HQ_CALL_RESERVATION`, aucun plafond OpenHands. `budget_agent.py` n'est pas recopié. Un devis absent laisse le mode budgété bloqué, comme dans le lot précédent.
++
++Un fetch injecté qui ignore le signal n'est pas couvert : l'appel reste pendant. Un timeout loopback après émission laisse la réservation `emitted_unknown`, sans libération et sans remettre les cents à zéro.
++
++## Commandes
++
++Node 22.14.0, fetch réel vers `127.0.0.1` seulement. Aucun appel modèle. Docker n'a pas été lancé.
++
++`node --test --test-concurrency=1 src/server/ai/json-client-deadline.test.mjs src/server/ai/anthropic-json-client.test.mjs src/server/ai/openai-json-client.test.mjs` — 27 tests, 0 échec, exit 0.
++
++Mesures `timeoutMs=600` :
++
++- Anthropic : en-têtes bloqués 598 ms, réponse complète 7 ms, corps bloqué 601 ms, réservation encore `emitted_unknown` à 602 ms, 0 libération.
++- OpenAI : en-têtes bloqués 600 ms, réponse complète 2 ms, corps bloqué 601 ms, réservation encore `emitted_unknown` à 601 ms, 0 libération.
++- Fetch injecté qui ignore le signal : toujours pendant à 1201 ms, des deux côtés.
++
++`npx tsc --noEmit` — exit 0. `npx eslint` sur les deux clients et `json-client-deadline.test.mjs` — exit 0. Les quatre portes et PostgreSQL ne sont pas rejouées ici.
+-- 
+2.43.0
+

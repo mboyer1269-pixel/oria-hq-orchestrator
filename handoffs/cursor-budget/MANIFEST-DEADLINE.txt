@@ -1,0 +1,44 @@
+Supplementary transfer. Do not replace handoffs/cursor-budget/cursor-budget-reservation.patch.
+That budget patch stays sha256 5105873bc9d143c7a4ada14468cc29e09391b71e791e64fe89b02a3fec46ee92.
+Apply this patch only after the budget patch, in a clone of the product repository.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_base: 1ff9da576788d39ec9df6e8ee4b2c5b4b7f59431
+product_base_tree: d93acb1b81912da5cbe8d655a9ce0f9780ed2e4c
+deadline_commit: 669c1d35e6c1cca78315b4c3c9c5909955ddc60a
+product_head: 4225cc1f4f19d2429afff382c3d4c80d9fd29eae
+product_tree: cb461c21c37457a6a384d33b6646dc885fb5eaf6
+patch_range: 1ff9da576788d39ec9df6e8ee4b2c5b4b7f59431..4225cc1f4f19d2429afff382c3d4c80d9fd29eae
+patch_commits: 2
+patch_path: handoffs/cursor-budget/cursor-budget-deadline.patch
+report_path: handoffs/cursor-budget/CURSOR-BUDGET-DEADLINE-RESULTAT.md
+sha256: bea0c3093e250bbdc27b933f8f4ef5953eef8d8084b4b883be5889dd8356cb7a
+size_bytes: 15536
+
+files:
+docs/CURSOR-BUDGET-DEADLINE-RESULTAT.md
+src/server/ai/anthropic-json-client.ts
+src/server/ai/json-client-deadline.test.mjs
+src/server/ai/openai-json-client.ts
+
+apply:
+git checkout 1ff9da576788d39ec9df6e8ee4b2c5b4b7f59431
+git am handoffs/cursor-budget/cursor-budget-deadline.patch
+git rev-parse HEAD^{tree}
+expected_tree: cb461c21c37457a6a384d33b6646dc885fb5eaf6
+
+verified:
+git am on a detached worktree at 1ff9da57 produced commit 10b7018ee993d73408dfb7c803927c8104ed0604
+and tree cb461c21c37457a6a384d33b6646dc885fb5eaf6, equal to product HEAD^{tree}.
+The applied commit hash differs. The tree does not.
+Product push was not retried.
+
+commands:
+node --test --test-concurrency=1 src/server/ai/json-client-deadline.test.mjs src/server/ai/anthropic-json-client.test.mjs src/server/ai/openai-json-client.test.mjs
+exit 0, 27 tests, 0 fail
+anthropic headers=598 complete=7 body=601 reservation=602 emitted_unknown releases=0
+openai headers=600 complete=2 body=601 reservation=601 emitted_unknown releases=0
+ignored-signal settled=false elapsed=1201 on both clients
+npx tsc --noEmit exit 0
+npx eslint on the two clients and json-client-deadline.test.mjs exit 0
+Docker was not started. PostgreSQL proof was not run. Global gates were not run.
