@@ -1,0 +1,868 @@
+From 8ec216414359f7b2484b05c62bf18281fcf8fb8a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 07:35:37 +0000
+Subject: [PATCH] Keep an unconfirmed mark as an unknown hold and bound the
+ server quote.
+
+A lost mark response is not reported as released. The PostgreSQL proof uses the
+race winner, and a quote must cover prompt, system and output or send nothing.
+---
+ db/migrations/0028_call_reservation.sql       |  50 +++--
+ .../0028_call_reservation_revert.sql          |   1 +
+ .../0028_call_reservation_verify.sql          |   6 +-
+ docs/CURSOR-BUDGET-ECARTS-RESULTAT.md         |  21 ++
+ proofs/prove-call-reservation-real-db.mjs     | 136 +++++++-----
+ proofs/run-call-reservation-real-db.sh        |   2 +-
+ src/server/ai/call-reservation.test.mjs       | 208 +++++++++++++++++-
+ src/server/ai/call-reservation.ts             |  68 ++++--
+ src/server/ai/llm-json-provider.ts            |   4 +
+ src/server/db/types.ts                        |  12 +-
+ 10 files changed, 416 insertions(+), 92 deletions(-)
+ create mode 100644 docs/CURSOR-BUDGET-ECARTS-RESULTAT.md
+
+diff --git a/db/migrations/0028_call_reservation.sql b/db/migrations/0028_call_reservation.sql
+index 8a9d9d4..e4cdce2 100644
+--- a/db/migrations/0028_call_reservation.sql
++++ b/db/migrations/0028_call_reservation.sql
+@@ -8,9 +8,11 @@
+ -- Contract:
+ --   * Unit is integer USD cents. Routing weights are not stored and are not
+ --     converted into cents.
+---   * A send requires a server ceiling row and a reliable server quote that
+---     covers the max tokens of that attempt. The function takes no amount
+---     argument. The client cannot name a price or a cap.
++--   * A send requires a server ceiling row and a reliable server quote whose
++--     scope is prompt_system_output: versioned, unexpired, and bounding both
++--     the UTF-8 bytes of system+user and the output max tokens. The function
++--     takes no amount argument. The client cannot name a price or a cap.
++--     valid_until does not release a hold. There is still no TTL.
+ --   * One caller wins hq_call_emit_right for (workspace, subject) while the
+ --     ceiling row is locked. A unique key is not the mutex. Another caller
+ --     is lost and cannot emit any provider, including a fallback.
+@@ -46,9 +48,19 @@ create table if not exists public.hq_call_budget_quote (
+   not_to_exceed_cents bigint not null
+     constraint hq_call_budget_quote_amount_check
+     check (not_to_exceed_cents > 0 and not_to_exceed_cents <= 9007199254740991),
+-  covers_max_tokens integer not null
+-    constraint hq_call_budget_quote_tokens_check
+-    check (covers_max_tokens > 0),
++  quote_scope text not null
++    constraint hq_call_budget_quote_scope_check
++    check (quote_scope = 'prompt_system_output'),
++  quote_version text not null
++    constraint hq_call_budget_quote_version_check
++    check (char_length(quote_version) between 1 and 80),
++  valid_until timestamptz not null,
++  covers_input_bytes integer not null
++    constraint hq_call_budget_quote_input_check
++    check (covers_input_bytes > 0),
++  covers_output_tokens integer not null
++    constraint hq_call_budget_quote_output_check
++    check (covers_output_tokens > 0),
+   reliable boolean not null,
+   created_at timestamptz not null default now(),
+   primary key (provider, model_id)
+@@ -88,6 +100,9 @@ create table if not exists public.hq_call_reservation (
+   max_tokens integer not null
+     constraint hq_call_reservation_max_tokens_check
+     check (max_tokens > 0),
++  input_bytes integer not null
++    constraint hq_call_reservation_input_bytes_check
++    check (input_bytes >= 0),
+   network_emitted boolean not null default false,
+   created_at timestamptz not null default now(),
+   updated_at timestamptz not null default now(),
+@@ -109,6 +124,8 @@ alter table public.hq_call_reservation enable row level security;
+ create index if not exists hq_call_reservation_workspace_state_idx
+   on public.hq_call_reservation (workspace_id, state);
+ 
++drop function if exists public.hq_reserve_call_attempt(text, text, text, text, text, text, integer);
++
+ create or replace function public.hq_reserve_call_attempt(
+   p_workspace_id text,
+   p_subject_id text,
+@@ -116,7 +133,8 @@ create or replace function public.hq_reserve_call_attempt(
+   p_provider text,
+   p_model_id text,
+   p_access_class text,
+-  p_max_tokens integer
++  p_max_tokens integer,
++  p_input_bytes integer
+ ) returns jsonb
+ language plpgsql
+ security definer
+@@ -149,7 +167,8 @@ begin
+     );
+   end if;
+ 
+-  if p_max_tokens is null or p_max_tokens < 1 or p_max_tokens > 200000 then
++  if p_max_tokens is null or p_max_tokens < 1 or p_max_tokens > 200000
++     or p_input_bytes is null or p_input_bytes < 0 or p_input_bytes > 2000000 then
+     return jsonb_build_object('status', 'refused', 'reason', 'estimate_insufficient', 'currency', null, 'reservedCents', null);
+   end if;
+ 
+@@ -169,7 +188,11 @@ begin
+     and model_id = p_model_id
+     and currency = 'USD'
+     and reliable = true
+-    and covers_max_tokens >= p_max_tokens;
++    and quote_scope = 'prompt_system_output'
++    and char_length(quote_version) between 1 and 80
++    and valid_until > now()
++    and covers_input_bytes >= p_input_bytes
++    and covers_output_tokens >= p_max_tokens;
+ 
+   if not found then
+     return jsonb_build_object('status', 'refused', 'reason', 'estimate_insufficient', 'currency', null, 'reservedCents', null);
+@@ -240,6 +263,7 @@ begin
+         reconciliation_required = false,
+         model_id = p_model_id,
+         max_tokens = p_max_tokens,
++        input_bytes = p_input_bytes,
+         network_emitted = false,
+         updated_at = now()
+     where workspace_id = p_workspace_id
+@@ -248,10 +272,10 @@ begin
+   else
+     insert into public.hq_call_reservation (
+       workspace_id, subject_id, provider, caller_id, access_class, currency,
+-      reserved_cents, state, reconciliation_required, model_id, max_tokens, network_emitted
++      reserved_cents, state, reconciliation_required, model_id, max_tokens, input_bytes, network_emitted
+     ) values (
+       p_workspace_id, p_subject_id, p_provider, p_caller_id, 'api', 'USD',
+-      v_quote, 'held', false, p_model_id, p_max_tokens, false
++      v_quote, 'held', false, p_model_id, p_max_tokens, p_input_bytes, false
+     );
+   end if;
+ 
+@@ -410,7 +434,7 @@ begin
+ end;
+ $$;
+ 
+-revoke all on function public.hq_reserve_call_attempt(text, text, text, text, text, text, integer) from public;
++revoke all on function public.hq_reserve_call_attempt(text, text, text, text, text, text, integer, integer) from public;
+ revoke all on function public.hq_release_call_attempt(text, text, text, text) from public;
+ revoke all on function public.hq_mark_call_emitted(text, text, text, text) from public;
+ revoke all on function public.hq_consume_call_attempt(text, text, text, text) from public;
+@@ -418,7 +442,7 @@ revoke all on function public.hq_consume_call_attempt(text, text, text, text) fr
+ do $$
+ begin
+   if exists (select 1 from pg_roles where rolname = 'service_role') then
+-    grant execute on function public.hq_reserve_call_attempt(text, text, text, text, text, text, integer) to service_role;
++    grant execute on function public.hq_reserve_call_attempt(text, text, text, text, text, text, integer, integer) to service_role;
+     grant execute on function public.hq_release_call_attempt(text, text, text, text) to service_role;
+     grant execute on function public.hq_mark_call_emitted(text, text, text, text) to service_role;
+     grant execute on function public.hq_consume_call_attempt(text, text, text, text) to service_role;
+diff --git a/db/migrations/0028_call_reservation_revert.sql b/db/migrations/0028_call_reservation_revert.sql
+index 0be3003..422cd2a 100644
+--- a/db/migrations/0028_call_reservation_revert.sql
++++ b/db/migrations/0028_call_reservation_revert.sql
+@@ -6,6 +6,7 @@
+ drop function if exists public.hq_consume_call_attempt(text, text, text, text);
+ drop function if exists public.hq_mark_call_emitted(text, text, text, text);
+ drop function if exists public.hq_release_call_attempt(text, text, text, text);
++drop function if exists public.hq_reserve_call_attempt(text, text, text, text, text, text, integer, integer);
+ drop function if exists public.hq_reserve_call_attempt(text, text, text, text, text, text, integer);
+ 
+ drop table if exists public.hq_call_reservation;
+diff --git a/db/migrations/0028_call_reservation_verify.sql b/db/migrations/0028_call_reservation_verify.sql
+index 5ba683f..7677daf 100644
+--- a/db/migrations/0028_call_reservation_verify.sql
++++ b/db/migrations/0028_call_reservation_verify.sql
+@@ -38,7 +38,11 @@ where conname in (
+   'hq_call_budget_quote_currency_check',
+   'hq_call_reservation_currency_check',
+   'hq_call_reservation_cents_check',
+-  'hq_call_reservation_state_flags_check'
++  'hq_call_reservation_state_flags_check',
++  'hq_call_budget_quote_scope_check',
++  'hq_call_budget_quote_version_check',
++  'hq_call_budget_quote_input_check',
++  'hq_call_budget_quote_output_check'
+ )
+ order by conname;
+ 
+diff --git a/docs/CURSOR-BUDGET-ECARTS-RESULTAT.md b/docs/CURSOR-BUDGET-ECARTS-RESULTAT.md
+new file mode 100644
+index 0000000..8155bca
+--- /dev/null
++++ b/docs/CURSOR-BUDGET-ECARTS-RESULTAT.md
+@@ -0,0 +1,21 @@
++# Écarts du registre — correctif séparé
++
++Le supplément délai reste. Ce commit part de `4225cc1f4f19d2429afff382c3d4c80d9fd29eae`. Aucun tarif, aucun seed, `HQ_CALL_RESERVATION` n'est pas allumé.
++
++1. Si `markEmitted` a commis mais que la réponse RPC est perdue, `release` refuse `emitted_unknown`. Le résultat n'est plus fabriqué en `released`. Le montant, l'état inconnu et `reconciliation_required` restent. Aucun socket n'est ouvert, y compris le fallback.
++
++2. La course PostgreSQL déduit le gagnant et le perdant des statuts, puis les réutilise. La même course est rejouée avec l'ordre des appelants inversé.
++
++3. La reprise compare les lignes triées (identité, propriétaire, fournisseur, modèle, cents, état, émission, réconciliation, jetons, octets), plus le droit d'émettre. Plus seulement un agrégat.
++
++4. Un devis utilisable a le périmètre `prompt_system_output`, une version, un `valid_until` futur, une borne d'octets UTF-8 du système et du prompt, et une borne de jetons de sortie. Sinon `estimate_insufficient`. `valid_until` ne libère pas une retenue.
++
++## Commandes
++
++Node 22.14.0. Aucun modèle.
++
++- `npx tsc --noEmit` — exit 0
++- `npx eslint` sur `call-reservation.ts`, `call-reservation.test.mjs`, `llm-json-provider.ts`, `types.ts` — exit 0
++- `node --test --test-concurrency=1 src/server/ai/call-reservation.test.mjs` — 9 tests, 0 échec, exit 0
++- Le test délai loopback, déjà vert sur ce même arbre de clients, n'a pas été modifié.
++- `sh proofs/run-call-reservation-real-db.sh` — `NON EXECUTE`, exit 127. Docker absent. Les assertions PostgreSQL n'ont pas tourné.
+diff --git a/proofs/prove-call-reservation-real-db.mjs b/proofs/prove-call-reservation-real-db.mjs
+index 6786402..9fd1eca 100644
+--- a/proofs/prove-call-reservation-real-db.mjs
++++ b/proofs/prove-call-reservation-real-db.mjs
+@@ -1,7 +1,8 @@
+ /**
+  * Assertions against the disposable PostgreSQL started by
+  * proofs/run-call-reservation-real-db.sh. No model and no provider network.
+- * The 40 and 80 cent rows are fixtures for this process, not a tariff.
++ * The cent amounts are fixtures for this process, not a tariff.
++ * Winner and loser come from the race result, never from a fixed caller name.
+  */
+ import assert from "node:assert/strict";
+ import { spawn } from "node:child_process";
+@@ -12,7 +13,8 @@ if (!container) {
+   process.exit(1);
+ }
+ 
+-const RESTART_SQL = "select (select coalesce(string_agg(line, ',' order by line), '') from (select state || '|' || reconciliation_required::text || '|' || reserved_cents::text || '|' || count(*)::text as line from public.hq_call_reservation group by state, reconciliation_required, reserved_cents) s) || ';' || (select count(*)::text from public.hq_call_emit_right);";
++const INPUT_BYTES = 16;
++const ROW_SQL = "select coalesce(string_agg(line, ',' order by line), '') from (select 'attempt|' || workspace_id || '|' || subject_id || '|' || caller_id || '|' || provider || '|' || model_id || '|' || currency || '|' || reserved_cents::text || '|' || state || '|' || network_emitted::text || '|' || reconciliation_required::text || '|' || max_tokens::text || '|' || input_bytes::text as line from public.hq_call_reservation union all select 'right|' || workspace_id || '|' || subject_id || '|' || caller_id as line from public.hq_call_emit_right) s;";
+ 
+ function psql(sql) {
+   return new Promise((resolve, reject) => {
+@@ -49,56 +51,77 @@ function field(jsonText, name) {
+   return JSON.parse(jsonText)[name];
+ }
+ 
+-function reserve(workspaceId, subjectId, callerId, provider, modelId, maxTokens = 2048, accessClass = "api") {
++function reserve(workspaceId, subjectId, callerId, provider, modelId, maxTokens = 2048, accessClass = "api", inputBytes = INPUT_BYTES) {
+   return psql(
+-    `select public.hq_reserve_call_attempt(${quote(workspaceId)}, ${quote(subjectId)}, ${quote(callerId)}, ${quote(provider)}, ${quote(modelId)}, ${quote(accessClass)}, ${Number(maxTokens)});`,
++    `select public.hq_reserve_call_attempt(${quote(workspaceId)}, ${quote(subjectId)}, ${quote(callerId)}, ${quote(provider)}, ${quote(modelId)}, ${quote(accessClass)}, ${Number(maxTokens)}, ${Number(inputBytes)});`,
+   );
+ }
+ 
+-await psql("insert into public.hq_call_budget_ceiling (workspace_id, currency, max_amount_cents) values ('ws-a', 'USD', 100), ('ws-b', 'USD', 500);");
+-await psql(`insert into public.hq_call_budget_quote (provider, model_id, currency, not_to_exceed_cents, covers_max_tokens, reliable) values
+-  ('openai', 'gpt-4o-mini', 'USD', 40, 2048, true),
+-  ('anthropic', 'claude-haiku-4-5-20251001', 'USD', 80, 2048, true),
+-  ('openai', 'gpt-4o', 'USD', 50, 2048, false);`);
++function attemptLine(workspaceId, subjectId, callerId, provider, modelId, cents, state, emitted, reconcile) {
++  return `attempt|${workspaceId}|${subjectId}|${callerId}|${provider}|${modelId}|USD|${cents}|${state}|${emitted}|${reconcile}|2048|${INPUT_BYTES}`;
++}
++
++await psql("insert into public.hq_call_budget_ceiling (workspace_id, currency, max_amount_cents) values ('ws-a', 'USD', 100), ('ws-b', 'USD', 500), ('ws-c', 'USD', 100);");
++await psql(`insert into public.hq_call_budget_quote
++  (provider, model_id, currency, not_to_exceed_cents, quote_scope, quote_version, valid_until, covers_input_bytes, covers_output_tokens, reliable)
++  values
++  ('openai', 'gpt-4o-mini', 'USD', 40, 'prompt_system_output', 'fixture', now() + interval '1 day', 100000, 2048, true),
++  ('anthropic', 'claude-haiku-4-5-20251001', 'USD', 80, 'prompt_system_output', 'fixture', now() + interval '1 day', 100000, 2048, true),
++  ('openai', 'gpt-4o', 'USD', 50, 'prompt_system_output', 'fixture', now() + interval '1 day', 8, 2048, true),
++  ('anthropic', 'claude-sonnet-4-6', 'USD', 50, 'prompt_system_output', 'fixture', now() - interval '1 hour', 100000, 2048, true);`);
+ 
+ const forbidden = await psql("select count(*) from information_schema.columns where table_schema = 'public' and table_name in ('hq_call_budget_ceiling', 'hq_call_budget_quote', 'hq_call_emit_right', 'hq_call_reservation') and (column_name = 'relative_weight' or column_name = 'monetary_usd' or column_name = 'expires_at' or column_name like '%ttl%');");
+ assert.equal(forbidden, "0");
+ 
+-const [first, second] = await Promise.all([
+-  reserve("ws-a", "mission-1", "caller-a", "openai", "gpt-4o-mini"),
+-  reserve("ws-a", "mission-1", "caller-b", "openai", "gpt-4o-mini"),
+-]);
+-const statuses = [field(first, "status"), field(second, "status")].sort();
+-assert.deepEqual(statuses, ["held", "lost"], `concurrence ${statuses.join(",")}`);
+-const winner = field(first, "status") === "held" ? first : second;
+-const loser = winner === first ? second : first;
+-assert.equal(field(winner, "currency"), "USD");
+-assert.equal(field(winner, "reservedCents"), 40);
+-assert.equal(field(loser, "reason"), "emit_right_held");
+-assert.equal(field(loser, "reservedCents"), null);
+-assert.equal(Object.hasOwn(JSON.parse(winner), "relativeWeight"), false);
+-
+-const stolenFallback = await reserve("ws-a", "mission-1", "caller-b", "anthropic", "claude-haiku-4-5-20251001");
+-assert.equal(field(stolenFallback, "status"), "lost");
+-assert.equal(field(stolenFallback, "reason"), "emit_right_held");
+-
+-const winnerFallback = await reserve("ws-a", "mission-1", "caller-a", "anthropic", "claude-haiku-4-5-20251001");
+-assert.equal(field(winnerFallback, "status"), "refused");
+-assert.equal(field(winnerFallback, "reason"), "ceiling_exhausted");
+-assert.equal(await psql("select count(*) from public.hq_call_reservation where workspace_id = 'ws-a';"), "1");
+-
+-const marked = await psql("select public.hq_mark_call_emitted('ws-a', 'mission-1', 'caller-a', 'openai');");
+-assert.equal(field(marked, "status"), "emitted_unknown");
+-assert.equal(field(marked, "reconciliationRequired"), true);
+-assert.equal(field(marked, "currency"), "USD");
+-assert.equal(field(marked, "reservedCents"), 40);
+-
+-const released = await psql("select public.hq_release_call_attempt('ws-a', 'mission-1', 'caller-a', 'openai');");
+-assert.equal(field(released, "reason"), "release_refused");
+-assert.equal(field(released, "status"), "emitted_unknown");
+-assert.equal(field(released, "reservedCents"), 40);
+-assert.notEqual(field(released, "reservedCents"), 0);
+-assert.equal(await psql("select reserved_cents::text || '|' || state from public.hq_call_reservation where workspace_id = 'ws-a';"), "40|emitted_unknown");
++async function contested(workspaceId, subjectId, orderedCallers) {
++  const [leftCaller, rightCaller] = orderedCallers;
++  const [left, right] = await Promise.all([
++    reserve(workspaceId, subjectId, leftCaller, "openai", "gpt-4o-mini"),
++    reserve(workspaceId, subjectId, rightCaller, "openai", "gpt-4o-mini"),
++  ]);
++  const leftStatus = field(left, "status");
++  const rightStatus = field(right, "status");
++  assert.deepEqual([leftStatus, rightStatus].sort(), ["held", "lost"], `${subjectId} ${leftStatus},${rightStatus}`);
++  const winnerCaller = leftStatus === "held" ? leftCaller : rightCaller;
++  const loserCaller = winnerCaller === leftCaller ? rightCaller : leftCaller;
++  const winnerJson = leftStatus === "held" ? left : right;
++  const loserJson = winnerJson === left ? right : left;
++  assert.equal(field(winnerJson, "currency"), "USD");
++  assert.equal(field(winnerJson, "reservedCents"), 40);
++  assert.equal(Object.hasOwn(JSON.parse(winnerJson), "relativeWeight"), false);
++  assert.equal(field(loserJson, "reason"), "emit_right_held");
++  assert.equal(field(loserJson, "reservedCents"), null);
++
++  const stolen = await reserve(workspaceId, subjectId, loserCaller, "anthropic", "claude-haiku-4-5-20251001");
++  assert.equal(field(stolen, "status"), "lost");
++  assert.equal(field(stolen, "reason"), "emit_right_held");
++
++  const winnerFallback = await reserve(workspaceId, subjectId, winnerCaller, "anthropic", "claude-haiku-4-5-20251001");
++  assert.equal(field(winnerFallback, "status"), "refused");
++  assert.equal(field(winnerFallback, "reason"), "ceiling_exhausted");
++  assert.equal(await psql(`select count(*) from public.hq_call_reservation where workspace_id = ${quote(workspaceId)} and subject_id = ${quote(subjectId)};`), "1");
++
++  const marked = await psql(`select public.hq_mark_call_emitted(${quote(workspaceId)}, ${quote(subjectId)}, ${quote(winnerCaller)}, 'openai');`);
++  assert.equal(field(marked, "status"), "emitted_unknown");
++  assert.equal(field(marked, "reconciliationRequired"), true);
++  assert.equal(field(marked, "currency"), "USD");
++  assert.equal(field(marked, "reservedCents"), 40);
++
++  const released = await psql(`select public.hq_release_call_attempt(${quote(workspaceId)}, ${quote(subjectId)}, ${quote(winnerCaller)}, 'openai');`);
++  assert.equal(field(released, "reason"), "release_refused");
++  assert.equal(field(released, "status"), "emitted_unknown");
++  assert.equal(field(released, "reservedCents"), 40);
++  assert.notEqual(field(released, "reservedCents"), 0);
++
++  const owner = await psql(`select caller_id || '|' || model_id || '|' || state || '|' || reserved_cents::text || '|' || reconciliation_required::text from public.hq_call_reservation where workspace_id = ${quote(workspaceId)} and subject_id = ${quote(subjectId)} and provider = 'openai';`);
++  assert.equal(owner, `${winnerCaller}|gpt-4o-mini|emitted_unknown|40|true`);
++  return winnerCaller;
++}
++
++const forwardWinner = await contested("ws-a", "mission-fwd", ["caller-a", "caller-b"]);
++const reverseWinner = await contested("ws-c", "mission-rev", ["caller-b", "caller-a"]);
++assert.notEqual(forwardWinner, "");
++assert.notEqual(reverseWinner, "");
+ 
+ const isolated = await reserve("ws-b", "mission-1", "caller-c", "openai", "gpt-4o-mini");
+ assert.equal(field(isolated, "status"), "held");
+@@ -111,14 +134,27 @@ const notApi = await reserve("ws-b", "mission-2", "caller-c", "openai", "gpt-4o-
+ assert.equal(field(notApi, "status"), "refused");
+ assert.equal(field(notApi, "reason"), "access_class");
+ 
+-const unreliable = await reserve("ws-b", "mission-3", "caller-c", "openai", "gpt-4o");
+-assert.equal(field(unreliable, "status"), "refused");
+-assert.equal(field(unreliable, "reason"), "estimate_insufficient");
++const narrowInput = await reserve("ws-b", "mission-3", "caller-c", "openai", "gpt-4o", 2048, "api", 9);
++assert.equal(field(narrowInput, "status"), "refused");
++assert.equal(field(narrowInput, "reason"), "estimate_insufficient");
++
++const expired = await reserve("ws-b", "mission-4", "caller-c", "anthropic", "claude-sonnet-4-6");
++assert.equal(field(expired, "status"), "refused");
++assert.equal(field(expired, "reason"), "estimate_insufficient");
+ 
+-const uncovered = await reserve("ws-b", "mission-4", "caller-c", "openai", "gpt-4o-mini", 2049);
++const uncovered = await reserve("ws-b", "mission-5", "caller-c", "openai", "gpt-4o-mini", 2049);
+ assert.equal(field(uncovered, "status"), "refused");
+ assert.equal(field(uncovered, "reason"), "estimate_insufficient");
+ 
+-const before = await psql(RESTART_SQL);
+-assert.equal(before, "emitted_unknown|true|40|1,held|false|40|1,held|false|80|1;2");
++const expected = [
++  attemptLine("ws-a", "mission-fwd", forwardWinner, "openai", "gpt-4o-mini", 40, "emitted_unknown", "true", "true"),
++  attemptLine("ws-b", "mission-1", "caller-c", "anthropic", "claude-haiku-4-5-20251001", 80, "held", "false", "false"),
++  attemptLine("ws-b", "mission-1", "caller-c", "openai", "gpt-4o-mini", 40, "held", "false", "false"),
++  attemptLine("ws-c", "mission-rev", reverseWinner, "openai", "gpt-4o-mini", 40, "emitted_unknown", "true", "true"),
++  `right|ws-a|mission-fwd|${forwardWinner}`,
++  "right|ws-b|mission-1|caller-c",
++  `right|ws-c|mission-rev|${reverseWinner}`,
++].sort().join(",");
++const before = await psql(ROW_SQL);
++assert.equal(before, expected);
+ process.stdout.write(`BEFORE_RESTART ${before}\n`);
+diff --git a/proofs/run-call-reservation-real-db.sh b/proofs/run-call-reservation-real-db.sh
+index 8fecb02..65ca96c 100644
+--- a/proofs/run-call-reservation-real-db.sh
++++ b/proofs/run-call-reservation-real-db.sh
+@@ -70,7 +70,7 @@ until timeout -k 2 3 docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres >/dev
+ done
+ 
+ after=$(timeout -k 2 10 docker exec "$pg" psql -h 127.0.0.1 -U postgres -X -A -t -q -c \
+-  "select (select coalesce(string_agg(line, ',' order by line), '') from (select state || '|' || reconciliation_required::text || '|' || reserved_cents::text || '|' || count(*)::text as line from public.hq_call_reservation group by state, reconciliation_required, reserved_cents) s) || ';' || (select count(*)::text from public.hq_call_emit_right);" < /dev/null)
++  "select coalesce(string_agg(line, ',' order by line), '') from (select 'attempt|' || workspace_id || '|' || subject_id || '|' || caller_id || '|' || provider || '|' || model_id || '|' || currency || '|' || reserved_cents::text || '|' || state || '|' || network_emitted::text || '|' || reconciliation_required::text || '|' || max_tokens::text || '|' || input_bytes::text as line from public.hq_call_reservation union all select 'right|' || workspace_id || '|' || subject_id || '|' || caller_id as line from public.hq_call_emit_right) s;" < /dev/null)
+ after=$(printf '%s' "$after" | tr -d '\r')
+ before=$(printf '%s' "$before" | tr -d '\r')
+ [ "$before" = "$after" ] || {
+diff --git a/src/server/ai/call-reservation.test.mjs b/src/server/ai/call-reservation.test.mjs
+index ec8006f..9842940 100644
+--- a/src/server/ai/call-reservation.test.mjs
++++ b/src/server/ai/call-reservation.test.mjs
+@@ -4,6 +4,7 @@
+ // No provider network.
+ 
+ import assert from "node:assert/strict";
++import http from "node:http";
+ import path from "node:path";
+ import test from "node:test";
+ import { fileURLToPath } from "node:url";
+@@ -41,17 +42,42 @@ const HAIKU = "claude-haiku-4-5-20251001";
+ const SONNET = "claude-sonnet-4-6";
+ const MINI = "gpt-4o-mini";
+ 
++const FAR_FUTURE_MS = Date.now() + 86_400_000;
++
++function quoteRow(cents, extra = {}) {
++  return {
++    cents,
++    reliable: true,
++    scope: "prompt_system_output",
++    version: "fixture",
++    validUntilMs: FAR_FUTURE_MS,
++    coversInputBytes: 100_000,
++    coversOutputTokens: 2048,
++    ...extra,
++  };
++}
++
+ function standardQuotes() {
+   return new Map([
+-    [`anthropic|${ANTHROPIC_JSON_DEFAULT_MODEL}`, { cents: 80, coversMaxTokens: ANTHROPIC_JSON_DEFAULT_MAX_TOKENS, reliable: true }],
+-    [`openai|${OPENAI_JSON_DEFAULT_MODEL}`, { cents: 40, coversMaxTokens: OPENAI_JSON_DEFAULT_MAX_TOKENS, reliable: true }],
+-    [`anthropic|${HAIKU}`, { cents: 80, coversMaxTokens: 2048, reliable: true }],
+-    [`openai|${MINI}`, { cents: 40, coversMaxTokens: 2048, reliable: true }],
+-    [`anthropic|${SONNET}`, { cents: 200, coversMaxTokens: 2048, reliable: true }],
+-    ["openai|gpt-4o", { cents: 200, coversMaxTokens: 2048, reliable: false }],
++    [`anthropic|${ANTHROPIC_JSON_DEFAULT_MODEL}`, quoteRow(80, { coversOutputTokens: ANTHROPIC_JSON_DEFAULT_MAX_TOKENS })],
++    [`openai|${OPENAI_JSON_DEFAULT_MODEL}`, quoteRow(40, { coversOutputTokens: OPENAI_JSON_DEFAULT_MAX_TOKENS })],
++    [`anthropic|${HAIKU}`, quoteRow(80)],
++    [`openai|${MINI}`, quoteRow(40)],
++    [`anthropic|${SONNET}`, quoteRow(200)],
++    ["openai|gpt-4o", quoteRow(200, { reliable: false })],
+   ]);
+ }
+ 
++function quoteCovers(quote, input) {
++  if (!quote || quote.reliable !== true || quote.cents <= 0) return false;
++  if (quote.scope !== "prompt_system_output") return false;
++  if (typeof quote.version !== "string" || quote.version.length < 1) return false;
++  if (typeof quote.validUntilMs !== "number" || quote.validUntilMs <= Date.now()) return false;
++  if (typeof quote.coversInputBytes !== "number" || quote.coversInputBytes < input.inputBytes) return false;
++  if (typeof quote.coversOutputTokens !== "number" || quote.coversOutputTokens < input.maxTokens) return false;
++  return true;
++}
++
+ /** Synchronous stand-in for hq_reserve_call_attempt. Not the production store. */
+ function memoryGate(ceilings, quotes) {
+   const rights = new Map();
+@@ -81,7 +107,7 @@ function memoryGate(ceilings, quotes) {
+       }
+       if (!ceilings.has(input.workspaceId)) return snap("unavailable", { reason: "ceiling_not_configured" });
+       const quote = quotes.get(`${input.provider}|${input.modelId}`);
+-      if (!quote || quote.reliable !== true || quote.cents <= 0 || quote.coversMaxTokens < input.maxTokens) {
++      if (!quoteCovers(quote, input)) {
+         return snap("refused", { reason: "estimate_insufficient" });
+       }
+       const owner = rights.get(rightKey(input.workspaceId, input.subjectId));
+@@ -549,3 +575,171 @@ test("an exhausted quote ceiling blocks the authorized fallback without releasin
+     delete process.env.OPENAI_API_KEY;
+   }
+ });
++
++test("a quote that does not bound prompt, system and output does not emit", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.OPENAI_API_KEY = "synthetic";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const quotes = new Map([
++    ["openai|gpt-4o-mini", quoteRow(40, { coversInputBytes: 4 })],
++    ["openai|gpt-4o", quoteRow(40, { validUntilMs: Date.now() - 1000 })],
++    ["anthropic|claude-haiku-4-5-20251001", quoteRow(80, { version: "" })],
++  ]);
++  const gate = memoryGate(new Map([["ws-a", 1000]]), quotes);
++  let calls = 0;
++  const fetchFn = async () => {
++    calls += 1;
++    throw new Error("network must not be used");
++  };
++  try {
++    const tooLarge = await generateStructuredJson({
++      providerPreference: "openai",
++      modelId: MINI,
++      workspaceId: "ws-a",
++      callSubjectId: "call-input-bound",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { openai: fetchFn, anthropic: fetchFn },
++    });
++    assert.equal(calls, 0);
++    assert.equal(tooLarge.reservation.reason, "estimate_insufficient");
++    assert.equal(tooLarge.reservation.reservedCents, null);
++    assert.equal(gate.rows.size, 0);
++
++    const expired = await generateStructuredJson({
++      providerPreference: "openai",
++      modelId: "gpt-4o",
++      workspaceId: "ws-a",
++      callSubjectId: "call-expired-quote",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { openai: fetchFn, anthropic: fetchFn },
++    });
++    assert.equal(calls, 0);
++    assert.equal(expired.reservation.reason, "estimate_insufficient");
++
++    const unversioned = await generateStructuredJson({
++      providerPreference: "anthropic",
++      modelId: HAIKU,
++      workspaceId: "ws-a",
++      callSubjectId: "call-unversioned-quote",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { openai: fetchFn, anthropic: fetchFn },
++    });
++    assert.equal(calls, 0);
++    assert.equal(unversioned.reservation.reason, "estimate_insufficient");
++    assert.equal(gate.rows.size, 0);
++  } finally {
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.OPENAI_API_KEY;
++    delete process.env.ANTHROPIC_API_KEY;
++  }
++});
++
++test("a lost mark response is not announced as released and opens no socket", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  const server = http.createServer((req, res) => {
++    req.resume();
++    res.end("{}");
++  });
++  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const port = server.address().port;
++  let sockets = 0;
++  server.on("connection", () => {
++    sockets += 1;
++  });
++  const rows = new Map();
++  const gate = {
++    rows,
++    async reserve(input) {
++      const row = {
++        ...input,
++        state: "held",
++        reservedCents: 40,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++      rows.set(input.provider, row);
++      return {
++        configured: true,
++        status: "held",
++        currency: "USD",
++        reservedCents: 40,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++    },
++    async markEmitted(input) {
++      const row = rows.get(input.provider);
++      row.state = "emitted_unknown";
++      row.networkEmitted = true;
++      row.reconciliationRequired = true;
++      return {
++        configured: true,
++        status: "unavailable",
++        reason: "malformed",
++        currency: null,
++        reservedCents: null,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++    },
++    async release(input) {
++      const row = rows.get(input.provider);
++      return {
++        configured: true,
++        status: row.state,
++        reason: "release_refused",
++        currency: "USD",
++        reservedCents: row.reservedCents,
++        networkEmitted: true,
++        reconciliationRequired: true,
++      };
++    },
++    async consume() {
++      throw new Error("consume must not run");
++    },
++  };
++  const fetchFn = (_url, init) => fetch(`http://127.0.0.1:${port}/`, init);
++  try {
++    const result = await generateStructuredJson({
++      providerPreference: "auto",
++      workspaceId: "ws-a",
++      callSubjectId: "call-lost-mark",
++      paidFallback: { authorized: true, workspaceId: "ws-a" },
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { anthropic: fetchFn, openai: fetchFn },
++    });
++    assert.equal(sockets, 0);
++    assert.equal(result.ok, false);
++    assert.equal(result.reservation.status, "emitted_unknown");
++    assert.notEqual(result.reservation.status, "released");
++    assert.equal(result.reservation.reason, "mark_unconfirmed");
++    assert.equal(result.reservation.currency, "USD");
++    assert.equal(result.reservation.reservedCents, 40);
++    assert.notEqual(result.reservation.reservedCents, 0);
++    assert.equal(result.reservation.reconciliationRequired, true);
++    assert.equal(result.reservation.networkEmitted, true);
++    assert.equal(result.cost.networkRequestSent, false);
++    assert.equal(result.cost.monetaryUsd, null);
++    const row = rows.get("anthropic");
++    assert.equal(row.state, "emitted_unknown");
++    assert.equal(row.reservedCents, 40);
++    assert.equal(row.reconciliationRequired, true);
++    assert.equal(rows.has("openai"), false);
++  } finally {
++    server.closeAllConnections();
++    await new Promise((resolve) => server.close(() => resolve()));
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.ANTHROPIC_API_KEY;
++    delete process.env.OPENAI_API_KEY;
++  }
++});
+diff --git a/src/server/ai/call-reservation.ts b/src/server/ai/call-reservation.ts
+index 18ec71f..60b3ca6 100644
+--- a/src/server/ai/call-reservation.ts
++++ b/src/server/ai/call-reservation.ts
+@@ -12,10 +12,12 @@ import { executionTargetForModel } from "@/server/ai/execution-models";
+  *
+  * A budgeted send needs both of these server rows, never a client field:
+  *   - `hq_call_budget_ceiling`: workspace cap in USD cents
+- *   - `hq_call_budget_quote`: reliable not-to-exceed USD cents for that
+- *     provider and model id, covering the max tokens actually sent
+- * Missing ceiling → unavailable. Missing or unreliable quote, or a quote that
+- * does not cover max tokens → no send. No price is invented by this module.
++ *   - `hq_call_budget_quote`: scope `prompt_system_output`, a non-empty
++ *     version, `valid_until` still in the future, and not-to-exceed USD cents
++ *     that bound the UTF-8 bytes of system+user plus the output max tokens.
++ *     Quote expiry does not release a hold.
++ * Missing ceiling → unavailable. A quote that is not reliable, not versioned,
++ * expired, or short of that scope → no send. No price is invented here.
+  *
+  * Emit right: under the ceiling row lock, one caller id owns
+  * `hq_call_emit_right` for (workspace, subject). The unique key is only a
+@@ -69,6 +71,7 @@ export type CallReservationGate = {
+     accessClass: CallAccessClass;
+     modelId: string;
+     maxTokens: number;
++    inputBytes: number;
+   }): Promise<CallReservationSnapshot>;
+   release(input: CallReservationIdentity): Promise<CallReservationSnapshot>;
+   markEmitted(input: CallReservationIdentity): Promise<CallReservationSnapshot>;
+@@ -90,6 +93,11 @@ export function accessClassForModel(modelId: string): CallAccessClass {
+   return "unknown";
+ }
+ 
++/** UTF-8 size of the system and user text this process is about to send. */
++export function requestInputBytes(systemPrompt: string, userPrompt: string): number {
++  return new TextEncoder().encode(systemPrompt).length + new TextEncoder().encode(userPrompt).length;
++}
++
+ export function unavailableReservation(reason?: string): CallReservationSnapshot {
+   return {
+     configured: false,
+@@ -185,6 +193,7 @@ export function createDurableCallReservationGate(
+         p_model_id: input.modelId,
+         p_access_class: input.accessClass,
+         p_max_tokens: input.maxTokens,
++        p_input_bytes: input.inputBytes,
+       });
+       if (error) return fail("store_unavailable");
+       return snapshotFromRpc(data, true);
+@@ -240,6 +249,7 @@ export async function authorizeCallAttempt(input: {
+   provider: "anthropic" | "openai";
+   modelId: string;
+   maxTokens: number;
++  inputBytes: number;
+   hasApiKey: boolean;
+ }): Promise<AttemptAuthorization> {
+   if (!input.configured) {
+@@ -283,7 +293,10 @@ export async function authorizeCallAttempt(input: {
+     };
+   }
+ 
+-  if (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1 || input.maxTokens > 200_000) {
++  if (
++    !Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1 || input.maxTokens > 200_000
++    || !Number.isSafeInteger(input.inputBytes) || input.inputBytes < 0 || input.inputBytes > 2_000_000
++  ) {
+     return {
+       emit: false,
+       reservation: {
+@@ -308,31 +321,52 @@ export async function authorizeCallAttempt(input: {
+     accessClass,
+     modelId: input.modelId,
+     maxTokens: input.maxTokens,
++    inputBytes: input.inputBytes,
+   });
+   if (reserved.status !== "held" || reserved.currency !== "USD" || reserved.reservedCents === null) {
+     return { emit: false, reservation: { ...reserved, configured: true } };
+   }
+ 
+   const emitted = await input.gate.markEmitted(identity);
++  if (markConfirmed(emitted, reserved.reservedCents)) {
++    return {
++      emit: true,
++      reservation: { ...emitted, configured: true, accessClass },
++      identity,
++    };
++  }
++
++  const released = await input.gate.release(identity);
+   if (
+-    emitted.status !== "emitted_unknown" ||
+-    emitted.currency !== "USD" ||
+-    emitted.reservedCents === null ||
+-    emitted.reservedCents !== reserved.reservedCents
++    released.status === "released" &&
++    released.networkEmitted === false &&
++    released.reconciliationRequired === false
+   ) {
+-    await input.gate.release(identity);
+     return {
+       emit: false,
+-      reservation: {
+-        ...emptyHold("released", true, "mark_failed"),
+-        accessClass,
+-      },
++      reservation: { ...released, configured: true, accessClass, reason: released.reason ?? "mark_failed" },
+     };
+   }
+ 
++  const preserved = released.status === "emitted_unknown" || released.status === "consumed" ? released : emitted;
+   return {
+-    emit: true,
+-    reservation: { ...emitted, configured: true, accessClass },
+-    identity,
++    emit: false,
++    reservation: {
++      ...preserved,
++      configured: true,
++      accessClass,
++      reconciliationRequired: true,
++      reservedCents: preserved.reservedCents,
++      currency: preserved.currency,
++      reason: "mark_unconfirmed",
++    },
+   };
+ }
++
++function markConfirmed(emitted: CallReservationSnapshot, reservedCents: number): boolean {
++  return emitted.status === "emitted_unknown"
++    && emitted.currency === "USD"
++    && emitted.reservedCents === reservedCents
++    && emitted.networkEmitted === true
++    && emitted.reconciliationRequired === true;
++}
+diff --git a/src/server/ai/llm-json-provider.ts b/src/server/ai/llm-json-provider.ts
+index 0f7207f..179f7b7 100644
+--- a/src/server/ai/llm-json-provider.ts
++++ b/src/server/ai/llm-json-provider.ts
+@@ -30,6 +30,7 @@ import {
+   authorizeCallAttempt,
+   callReservationConfigured,
+   createDurableCallReservationGate,
++  requestInputBytes,
+   unavailableReservation,
+   type CallReservationGate,
+   type CallReservationSnapshot,
+@@ -277,6 +278,7 @@ export async function generateStructuredJson(
+   }
+ 
+   const order = resolveOrder(input);
++  const inputBytes = requestInputBytes(input.systemPrompt, input.userPrompt);
+   const failureChain: string[] = [];
+   const attempts: LlmAttemptCost[] = [];
+   let attemptCount = 0;
+@@ -308,6 +310,7 @@ export async function generateStructuredJson(
+       provider,
+       modelId,
+       maxTokens,
++      inputBytes,
+       hasApiKey: providerHasApiKey(provider),
+     });
+     reservation = decision.reservation;
+@@ -317,6 +320,7 @@ export async function generateStructuredJson(
+         decision.reservation.reason === "store_unavailable" ||
+         decision.reservation.reason === "access_class" ||
+         decision.reservation.reason === "emit_right_held" ||
++        decision.reservation.reason === "mark_unconfirmed" ||
+         decision.reservation.status === "lost";
+       failureChain.push(`${provider}: reservation ${decision.reservation.reason ?? decision.reservation.status}`);
+       attempts.push({ provider, cost: refused() });
+diff --git a/src/server/db/types.ts b/src/server/db/types.ts
+index ac5bf98..7de1591 100644
+--- a/src/server/db/types.ts
++++ b/src/server/db/types.ts
+@@ -350,7 +350,11 @@ export type HqCallBudgetQuoteRow = {
+   model_id: string;
+   currency: "USD";
+   not_to_exceed_cents: number;
+-  covers_max_tokens: number;
++  quote_scope: "prompt_system_output";
++  quote_version: string;
++  valid_until: string;
++  covers_input_bytes: number;
++  covers_output_tokens: number;
+   reliable: boolean;
+   created_at: string;
+ };
+@@ -374,6 +378,7 @@ export type HqCallReservationRow = {
+   reconciliation_required: boolean;
+   model_id: string;
+   max_tokens: number;
++  input_bytes: number;
+   network_emitted: boolean;
+   created_at: string;
+   updated_at: string;
+@@ -475,7 +480,7 @@ export type MichaelHqDatabase = {
+       hq_call_budget_quote: {
+         Row: HqCallBudgetQuoteRow;
+         Insert: Omit<HqCallBudgetQuoteRow, "created_at"> & { created_at?: string };
+-        Update: Partial<Pick<HqCallBudgetQuoteRow, "not_to_exceed_cents" | "covers_max_tokens" | "reliable">>;
++        Update: Partial<Pick<HqCallBudgetQuoteRow, "not_to_exceed_cents" | "covers_input_bytes" | "covers_output_tokens" | "reliable" | "valid_until" | "quote_version">>;
+         Relationships: [];
+       };
+       hq_call_emit_right: {
+@@ -490,7 +495,7 @@ export type MichaelHqDatabase = {
+           created_at?: string;
+           updated_at?: string;
+         };
+-        Update: Partial<Pick<HqCallReservationRow, "state" | "reconciliation_required" | "network_emitted" | "updated_at" | "caller_id" | "reserved_cents" | "model_id" | "max_tokens">>;
++        Update: Partial<Pick<HqCallReservationRow, "state" | "reconciliation_required" | "network_emitted" | "updated_at" | "caller_id" | "reserved_cents" | "model_id" | "max_tokens" | "input_bytes">>;
+         Relationships: [];
+       };
+     };
+@@ -505,6 +510,7 @@ export type MichaelHqDatabase = {
+           p_model_id: string;
+           p_access_class: string;
+           p_max_tokens: number;
++          p_input_bytes: number;
+         };
+         Returns: Json;
+       };
+-- 
+2.43.0
+
