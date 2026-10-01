@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "fixtureClass": "synthetic",
   "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "limits": [
@@ -34,15 +34,22 @@
       "secondExecutionStarted": false,
       "assertions": [
         {
-          "id": "single_row"
+          "id": "single_row",
+          "passed": true,
+          "expected": 1,
+          "observed": 1
         },
         {
-          "id": "both_callers_same_row"
+          "id": "both_callers_same_row",
+          "passed": true,
+          "expected": true,
+          "observed": true
         }
       ],
       "outputs": [
         {
           "command": "psql -c concurrent",
+          "expectedExitCode": 0,
           "exitCode": 0,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "concurrent"
@@ -59,16 +66,23 @@
       "secondPayloadStored": false,
       "assertions": [
         {
-          "id": "payload_conflict_refused"
+          "id": "payload_conflict_refused",
+          "passed": true,
+          "expected": true,
+          "observed": true
         },
         {
-          "id": "stored_payload_unchanged"
+          "id": "stored_payload_unchanged",
+          "passed": true,
+          "expected": true,
+          "observed": true
         }
       ],
       "outputs": [
         {
           "command": "psql -c divergent",
-          "exitCode": 0,
+          "expectedExitCode": 409,
+          "exitCode": 409,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "divergent"
         }
@@ -84,12 +98,16 @@
       "procedure": "lookup",
       "assertions": [
         {
-          "id": "lookup_before_create"
+          "id": "lookup_before_create",
+          "passed": true,
+          "expected": true,
+          "observed": true
         }
       ],
       "outputs": [
         {
           "command": "psql -c lookup",
+          "expectedExitCode": 0,
           "exitCode": 0,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "lookup"
@@ -106,28 +124,35 @@
       "assertions": [
         {
           "id": "sql_count_before_restart",
-          "rowCount": 1
+          "passed": true,
+          "expected": 1,
+          "observed": 1
         },
         {
           "id": "sql_count_after_restart",
-          "rowCount": 1
+          "passed": true,
+          "expected": 1,
+          "observed": 1
         }
       ],
       "outputs": [
         {
           "command": "psql -c count_before_restart",
+          "expectedExitCode": 0,
           "exitCode": 0,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "count_before_restart"
         },
         {
           "command": "psql -c restart_database",
+          "expectedExitCode": 0,
           "exitCode": 0,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "restart_database"
         },
         {
           "command": "psql -c count_after_restart",
+          "expectedExitCode": 0,
           "exitCode": 0,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "count_after_restart"
@@ -144,15 +169,22 @@
       "bodyWorkspaceUsed": false,
       "assertions": [
         {
-          "id": "workspace_from_protected_context"
+          "id": "workspace_from_protected_context",
+          "passed": true,
+          "expected": true,
+          "observed": true
         },
         {
-          "id": "foreign_workspace_denied"
+          "id": "foreign_workspace_denied",
+          "passed": true,
+          "expected": true,
+          "observed": true
         }
       ],
       "outputs": [
         {
           "command": "psql -c foreign_workspace",
+          "expectedExitCode": 0,
           "exitCode": 0,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "foreign_workspace"
@@ -174,12 +206,16 @@
       },
       "assertions": [
         {
-          "id": "states_observed_separately"
+          "id": "states_observed_separately",
+          "passed": true,
+          "expected": true,
+          "observed": true
         }
       ],
       "outputs": [
         {
           "command": "psql -c state_counts",
+          "expectedExitCode": 0,
           "exitCode": 0,
           "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "phase": "state_counts"

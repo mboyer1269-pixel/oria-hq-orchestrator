@@ -10,7 +10,7 @@ import re
 import sys
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 VERDICTS = ("incomplete", "refused", "reviewable")
 EXIT_CODES = {"incomplete": 2, "refused": 3, "reviewable": 4}
 REQUIRED_SCENARIOS = (
@@ -80,7 +80,9 @@ def validate_report(report):
     if type(report) is not dict:
         return verdict_document("incomplete", [reason("schema_invalid", "Le rapport doit être un objet JSON.")])
     if report.get("schemaVersion") != SCHEMA_VERSION:
-        return verdict_document("incomplete", [reason("schema_invalid", "schemaVersion doit valoir 1.")])
+        if report.get("schemaVersion") == 1:
+            return verdict_document("incomplete", [reason("schema_obsolete", "La version 1 ne porte pas le succès explicite des assertions.")])
+        return verdict_document("incomplete", [reason("schema_invalid", "schemaVersion doit valoir 2.")])
 
     refused = []
     incomplete = []
@@ -200,12 +202,9 @@ def real_scenario_refusals(scenario_id, scenario, commit):
         reasons.append(reason("missing_outputs", f"{scenario_id} n'a pas de sorties."))
         outputs = []
     for output in outputs:
-        if type(output) is not dict or not isinstance(output.get("command"), str) or not output.get("command") or not is_int(output.get("exitCode")):
-            reasons.append(reason("missing_outputs", f"Sortie incomplète pour {scenario_id}."))
-            continue
-        if output.get("testedCommit") != commit:
-            reasons.append(reason("mixed_commits", f"Une sortie de {scenario_id} cite un autre commit."))
-    assertions = assertion_ids(scenario.get("assertions"))
+        reasons.extend(output_refusals(scenario_id, output, commit))
+    assertions, assertion_reasons = evaluate_assertions(scenario.get("assertions"))
+    reasons.extend(assertion_reasons)
     if scenario_id == "same_request_concurrent":
         reasons.extend(expect_ids(scenario_id, assertions, {"single_row", "both_callers_same_row"}))
         if scenario.get("rowCount") != 1 or scenario.get("secondExecutionStarted") is not False:
@@ -227,10 +226,51 @@ def real_scenario_refusals(scenario_id, scenario, commit):
     return reasons
 
 
-def assertion_ids(assertions):
+def same_scalar(expected, observed):
+    return type(expected) is type(observed) and type(expected) in {bool, int, str}
+
+
+def evaluate_assertions(assertions):
     if type(assertions) is not list:
-        return set()
-    return {item.get("id") for item in assertions if type(item) is dict and isinstance(item.get("id"), str)}
+        return set(), [reason("assertion_malformed", "assertions doit être une liste.")]
+    ok_ids = set()
+    reasons = []
+    for index, item in enumerate(assertions):
+        if type(item) is not dict or not isinstance(item.get("id"), str) or not item.get("id"):
+            reasons.append(reason("assertion_malformed", f"Assertion {index} illisible."))
+            continue
+        name = item["id"]
+        passed = item.get("passed")
+        if type(passed) is not bool or "expected" not in item or "observed" not in item or not same_scalar(item.get("expected"), item.get("observed")):
+            reasons.append(reason("assertion_malformed", f"Assertion {name} sans succès explicite et valeurs comparables."))
+            continue
+        expected, observed = item["expected"], item["observed"]
+        if is_int(expected) and (expected < 0 or observed < 0):
+            reasons.append(reason("negative_value", f"Assertion {name} a une valeur négative."))
+            continue
+        if expected != observed:
+            reasons.append(reason("assertion_contradiction", f"Assertion {name} : attendu et observé diffèrent."))
+        if passed is False:
+            reasons.append(reason("assertion_failed", f"Assertion {name} est échouée."))
+        elif expected == observed:
+            ok_ids.add(name)
+    return ok_ids, reasons
+
+
+def output_refusals(scenario_id, output, commit):
+    if type(output) is not dict or not isinstance(output.get("command"), str) or not output.get("command"):
+        return [reason("missing_outputs", f"Sortie incomplète pour {scenario_id}.")]
+    reasons = []
+    expected, observed = output.get("expectedExitCode"), output.get("exitCode")
+    if not is_int(expected) or not is_int(observed):
+        reasons.append(reason("assertion_malformed", f"Sortie de {scenario_id} sans expectedExitCode et exitCode entiers."))
+    elif expected < 0 or observed < 0:
+        reasons.append(reason("negative_value", f"Code de sortie négatif pour {scenario_id}."))
+    elif expected != observed:
+        reasons.append(reason("assertion_contradiction", f"Code de sortie observé différent de l'attendu pour {scenario_id}."))
+    if output.get("testedCommit") != commit:
+        reasons.append(reason("mixed_commits", f"Une sortie de {scenario_id} cite un autre commit."))
+    return reasons
 
 
 def expect_ids(scenario_id, present, required):
@@ -261,11 +301,19 @@ def restart_refusals(scenario, outputs):
     if type(assertions) is not list:
         assertions = []
     for assertion_id in ("sql_count_before_restart", "sql_count_after_restart"):
-        matches = [item for item in assertions if type(item) is dict and item.get("id") == assertion_id and is_int(item.get("rowCount"))]
+        matches = [item for item in assertions if type(item) is dict and item.get("id") == assertion_id]
         if len(matches) != 1:
             reasons.append(reason("restart_count_assertion_missing", f"Assertion {assertion_id} absente."))
-        else:
-            counts[assertion_id] = matches[0]["rowCount"]
+            continue
+        item = matches[0]
+        observed = item.get("observed")
+        if not is_int(observed) or observed < 0 or item.get("expected") != observed:
+            reasons.append(reason("restart_count_assertion_missing", f"Assertion {assertion_id} sans compte observé."))
+            continue
+        if "rowCount" in item and item.get("rowCount") != observed:
+            reasons.append(reason("assertion_contradiction", f"Assertion {assertion_id} contredit son rowCount."))
+            continue
+        counts[assertion_id] = observed
     phases = {item.get("phase") for item in outputs if type(item) is dict}
     if not {"count_before_restart", "restart_database", "count_after_restart"} <= phases:
         reasons.append(reason("restart_count_assertion_missing", "Les sorties avant et après redémarrage sont absentes."))
@@ -278,8 +326,10 @@ def admission_refusals(scenario, assertions):
     reasons = []
     counts = scenario.get("stateCounts")
     keys = {"admitted", "authorized", "executed"}
-    if type(counts) is not dict or set(counts) < keys or any(not is_int(counts.get(key)) for key in keys):
+    if type(counts) is not dict or not keys <= set(counts) or any(not is_int(counts.get(key)) for key in keys):
         reasons.append(reason("admission_confused_with_execution", "Les trois comptes admission, autorisation et exécution sont absents."))
+    elif any(counts.get(key) < 0 for key in keys):
+        reasons.append(reason("negative_value", "Un compte d'admission est négatif."))
     if scenario.get("admissionMeansExecution") is not False or "admission_is_execution" in assertions or "states_observed_separately" not in assertions:
         reasons.append(reason("admission_confused_with_execution", "L'admission real est confondue avec l'exécution."))
     return reasons

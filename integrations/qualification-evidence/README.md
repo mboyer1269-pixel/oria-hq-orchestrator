@@ -2,7 +2,7 @@
 
 Outil hors ligne. Il lit un JSON déjà écrit. Il ne démarre pas PostgreSQL, ne contacte pas le réseau et ne modifie aucun script Antigravity.
 
-Le guide humain est `docs/CURSOR-VALIDATEUR-PREUVES.md`. Le contrat des champs est `SCHEMA.md`.
+Le guide humain est `docs/CURSOR-VALIDATEUR-PREUVES.md`. Le contrat stable des champs est `SCHEMA.md`, version 2. La version 1 ne peut plus être `reviewable`.
 
 Vérifier le contrôleur :
 

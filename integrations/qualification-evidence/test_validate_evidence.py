@@ -16,13 +16,23 @@ DIGEST = "sha256:" + "ab" * 32
 CLI = [sys.executable, str(ROOT / "validate_evidence.py")]
 
 
-def output(phase, commit=COMMIT):
-    return {"command": f"psql -c {phase}", "exitCode": 0, "testedCommit": commit, "phase": phase}
+def output(phase, commit=COMMIT, exit_code=0):
+    return {
+        "command": f"psql -c {phase}",
+        "expectedExitCode": exit_code,
+        "exitCode": exit_code,
+        "testedCommit": commit,
+        "phase": phase,
+    }
+
+
+def assertion(name, expected=True, observed=True):
+    return {"id": name, "passed": True, "expected": expected, "observed": observed}
 
 
 def coherent_real_report():
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "fixtureClass": "collected",
         "testedCommit": COMMIT,
         "limits": ["Historique de migration incomplet.", "Aucune mission réelle n'est revendiquée."],
@@ -48,7 +58,7 @@ def coherent_real_report():
                 "testedCommit": COMMIT,
                 "rowCount": 1,
                 "secondExecutionStarted": False,
-                "assertions": [{"id": "single_row"}, {"id": "both_callers_same_row"}],
+                "assertions": [assertion("single_row", 1, 1), assertion("both_callers_same_row")],
                 "outputs": [output("concurrent")],
                 "limits": ["Deux appels seulement."],
             },
@@ -57,8 +67,8 @@ def coherent_real_report():
                 "status": "real",
                 "testedCommit": COMMIT,
                 "secondPayloadStored": False,
-                "assertions": [{"id": "payload_conflict_refused"}, {"id": "stored_payload_unchanged"}],
-                "outputs": [output("divergent")],
+                "assertions": [assertion("payload_conflict_refused"), assertion("stored_payload_unchanged")],
+                "outputs": [output("divergent", exit_code=409)],
                 "limits": ["Payload synthétique."],
             },
             {
@@ -67,11 +77,11 @@ def coherent_real_report():
                 "testedCommit": COMMIT,
                 "procedure": "commit_then_drop_response_then_replay",
                 "assertions": [
-                    {"id": "committed_before_loss"},
-                    {"id": "response_dropped_after_commit"},
-                    {"id": "replay_creates_nothing"},
+                    assertion("committed_before_loss"),
+                    assertion("response_dropped_after_commit"),
+                    assertion("replay_creates_nothing"),
                 ],
-                "outputs": [output("commit"), output("drop_response"), output("replay")],
+                "outputs": [output("commit"), output("drop_response", exit_code=1), output("replay")],
                 "limits": ["La perte est injectée par le banc, pas par le réseau."],
             },
             {
@@ -79,8 +89,8 @@ def coherent_real_report():
                 "status": "real",
                 "testedCommit": COMMIT,
                 "assertions": [
-                    {"id": "sql_count_before_restart", "rowCount": 1},
-                    {"id": "sql_count_after_restart", "rowCount": 1},
+                    assertion("sql_count_before_restart", 1, 1),
+                    assertion("sql_count_after_restart", 1, 1),
                 ],
                 "outputs": [output("count_before_restart"), output("restart_database"), output("count_after_restart")],
                 "limits": ["Un redémarrage du processus PostgreSQL du banc."],
@@ -90,7 +100,7 @@ def coherent_real_report():
                 "status": "real",
                 "testedCommit": COMMIT,
                 "bodyWorkspaceUsed": False,
-                "assertions": [{"id": "workspace_from_protected_context"}, {"id": "foreign_workspace_denied"}],
+                "assertions": [assertion("workspace_from_protected_context"), assertion("foreign_workspace_denied")],
                 "outputs": [output("foreign_workspace")],
                 "limits": ["Identités synthétiques."],
             },
@@ -100,7 +110,7 @@ def coherent_real_report():
                 "testedCommit": COMMIT,
                 "admissionMeansExecution": False,
                 "stateCounts": {"admitted": 1, "authorized": 0, "executed": 0},
-                "assertions": [{"id": "states_observed_separately"}],
+                "assertions": [assertion("states_observed_separately")],
                 "outputs": [output("state_counts")],
                 "limits": ["L'exécution n'a pas été lancée."],
             },
@@ -182,7 +192,7 @@ class ValidatorTests(unittest.TestCase):
         report = coherent_real_report()
         scenario = next(item for item in report["scenarios"] if item["id"] == "lost_response_after_commit")
         scenario["procedure"] = "lookup_before_create"
-        scenario["assertions"] = [{"id": "lookup_before_create"}]
+        scenario["assertions"] = [{"id": "lookup_before_create", "passed": True, "expected": True, "observed": True}]
         scenario["outputs"] = [output("lookup")]
         document = validate_report(report)
         self.assertEqual(document["verdict"], "refused")
@@ -199,7 +209,7 @@ class ValidatorTests(unittest.TestCase):
     def test_restart_without_sql_counts_is_refused(self):
         report = coherent_real_report()
         scenario = next(item for item in report["scenarios"] if item["id"] == "restart")
-        scenario["assertions"] = [{"id": "sql_count_before_restart", "rowCount": 1}]
+        scenario["assertions"] = [assertion("sql_count_before_restart", 1, 1)]
         scenario["outputs"] = [output("count_before_restart")]
         document = validate_report(report)
         self.assertEqual(document["verdict"], "refused")
@@ -208,10 +218,68 @@ class ValidatorTests(unittest.TestCase):
     def test_disagreeing_restart_counts_are_refused(self):
         report = coherent_real_report()
         scenario = next(item for item in report["scenarios"] if item["id"] == "restart")
-        scenario["assertions"][1]["rowCount"] = 2
+        scenario["assertions"][1]["expected"] = 2
+        scenario["assertions"][1]["observed"] = 2
         document = validate_report(report)
         self.assertEqual(document["verdict"], "refused")
         self.assertIn("restart_counts_disagree", codes(document))
+
+    def test_failed_or_contradictory_assertion_is_not_reviewable(self):
+        failed = coherent_real_report()
+        failed["scenarios"][0]["assertions"][0]["passed"] = False
+        document = validate_report(failed)
+        self.assertEqual(document["verdict"], "refused")
+        self.assertIn("assertion_failed", codes(document))
+        contradicted = coherent_real_report()
+        contradicted["scenarios"][0]["assertions"][0]["observed"] = 0
+        document = validate_report(contradicted)
+        self.assertEqual(document["verdict"], "refused")
+        self.assertIn("assertion_contradiction", codes(document))
+        both = coherent_real_report()
+        both["scenarios"][0]["assertions"][0]["passed"] = False
+        both["scenarios"][0]["assertions"][0]["observed"] = 0
+        document = validate_report(both)
+        self.assertEqual(document["verdict"], "refused")
+        self.assertIn("assertion_failed", codes(document))
+        self.assertIn("assertion_contradiction", codes(document))
+
+    def test_malformed_and_negative_values_are_refused(self):
+        cases = []
+        string_passed = coherent_real_report()
+        string_passed["scenarios"][0]["assertions"][0]["passed"] = "true"
+        cases.append(string_passed)
+        mixed_types = coherent_real_report()
+        mixed_types["scenarios"][0]["assertions"][0]["expected"] = True
+        mixed_types["scenarios"][0]["assertions"][0]["observed"] = 1
+        cases.append(mixed_types)
+        missing_observed = coherent_real_report()
+        del missing_observed["scenarios"][0]["assertions"][0]["observed"]
+        cases.append(missing_observed)
+        negative_count = coherent_real_report()
+        negative_count["scenarios"][0]["assertions"][0]["expected"] = -1
+        negative_count["scenarios"][0]["assertions"][0]["observed"] = -1
+        cases.append(negative_count)
+        negative_exit = coherent_real_report()
+        negative_exit["scenarios"][0]["outputs"][0]["expectedExitCode"] = -1
+        negative_exit["scenarios"][0]["outputs"][0]["exitCode"] = -1
+        cases.append(negative_exit)
+        negative_state = coherent_real_report()
+        negative_state["scenarios"][-1]["stateCounts"]["executed"] = -1
+        cases.append(negative_state)
+        exit_mismatch = coherent_real_report()
+        exit_mismatch["scenarios"][1]["outputs"][0]["exitCode"] = 0
+        cases.append(exit_mismatch)
+        for report in cases:
+            document = validate_report(report)
+            self.assertEqual(document["verdict"], "refused")
+            self.assertTrue(set(codes(document)) & {"assertion_malformed", "negative_value", "assertion_contradiction"})
+
+    def test_schema_v1_cannot_stay_reviewable(self):
+        report = coherent_real_report()
+        report["schemaVersion"] = 1
+        document = validate_report(report)
+        self.assertEqual(document["verdict"], "incomplete")
+        self.assertIn("schema_obsolete", codes(document))
 
     def test_admission_is_not_execution(self):
         report = coherent_real_report()

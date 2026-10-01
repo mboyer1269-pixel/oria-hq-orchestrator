@@ -18,7 +18,7 @@ python3 integrations/qualification-evidence/validate_evidence.py rapport.json
 
 ## Ce que l'outil fait
 
-Il valide la version 1 du schéma décrit dans `integrations/qualification-evidence/SCHEMA.md` : commit testé, versions et digests, migrations, contrainte SQL, six scénarios, assertions, sorties, statut et limites.
+Il valide la version 2 du schéma décrit dans `integrations/qualification-evidence/SCHEMA.md`. La version 1 est refusée comme close : un identifiant d'assertion ne suffit plus. Un scénario `real` exige `passed: true` avec `expected` égal à `observed`, et `expectedExitCode` égal à `exitCode`. Ces codes peuvent être différents de 0 quand le conflit ou la perte de réponse l'attendent. Une assertion échouée, contradictoire, malformée ou négative ne peut pas laisser le rapport `reviewable`.
 
 Le verdict calculé est seulement `incomplete`, `refused` ou `reviewable`. `readyForProduction` et `authenticatesExecution` restent faux dans la réponse. Un champ du même nom dans le rapport, ou un verdict annoncé par l'auteur, est ignoré ou refuse le paquet.
 
