@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 2,
+  "fixtureClass": "synthetic",
+  "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "limits": [
+    "Historique de migration incomplet.",
+    "Aucune mission réelle n'est revendiquée."
+  ],
+  "database": {
+    "backendKind": "postgresql",
+    "engine": "postgresql",
+    "implementation": "postgresql+postgrest",
+    "selectVersion": "PostgreSQL 17.11 on x86_64",
+    "postgrestVersion": "13.0.0",
+    "imageDigests": [
+      "sha256:abababababababababababababababababababababababababababababababab"
+    ],
+    "migrationsApplied": [
+      "0001_admission.sql"
+    ],
+    "migrationHistoryComplete": false,
+    "sqlConstraint": {
+      "name": "admission_identity_unique",
+      "definition": "UNIQUE (identity)",
+      "catalogSource": "pg_constraint"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "same_request_concurrent",
+      "status": "real",
+      "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rowCount": 1,
+      "secondExecutionStarted": false,
+      "assertions": [
+        {
+          "id": "single_row",
+          "passed": true,
+          "expected": 1,
+          "observed": 1
+        },
+        {
+          "id": "both_callers_same_row",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        }
+      ],
+      "outputs": [
+        {
+          "command": "psql -c concurrent",
+          "expectedExitCode": 0,
+          "exitCode": 0,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "concurrent"
+        }
+      ],
+      "limits": [
+        "Deux appels seulement."
+      ]
+    },
+    {
+      "id": "divergent_payload",
+      "status": "real",
+      "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "secondPayloadStored": false,
+      "assertions": [
+        {
+          "id": "payload_conflict_refused",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        },
+        {
+          "id": "stored_payload_unchanged",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        }
+      ],
+      "outputs": [
+        {
+          "command": "psql -c divergent",
+          "expectedExitCode": 409,
+          "exitCode": 409,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "divergent"
+        }
+      ],
+      "limits": [
+        "Payload synthétique."
+      ]
+    },
+    {
+      "id": "lost_response_after_commit",
+      "status": "real",
+      "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "procedure": "commit_then_drop_response_then_replay",
+      "assertions": [
+        {
+          "id": "committed_before_loss",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        },
+        {
+          "id": "response_dropped_after_commit",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        },
+        {
+          "id": "replay_creates_nothing",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        }
+      ],
+      "outputs": [
+        {
+          "command": "psql -c commit",
+          "expectedExitCode": 0,
+          "exitCode": 0,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "commit"
+        },
+        {
+          "command": "psql -c drop_response",
+          "expectedExitCode": 1,
+          "exitCode": 1,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "drop_response"
+        },
+        {
+          "command": "psql -c replay",
+          "expectedExitCode": 0,
+          "exitCode": 0,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "replay"
+        }
+      ],
+      "limits": [
+        "La perte est injectée par le banc, pas par le réseau."
+      ]
+    },
+    {
+      "id": "restart",
+      "status": "real",
+      "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "assertions": [],
+      "outputs": [
+        {
+          "command": "psql -c lookup",
+          "expectedExitCode": 0,
+          "exitCode": 0,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "lookup"
+        }
+      ],
+      "limits": [
+        "Un redémarrage du processus PostgreSQL du banc."
+      ]
+    },
+    {
+      "id": "protected_identity",
+      "status": "real",
+      "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bodyWorkspaceUsed": false,
+      "assertions": [
+        {
+          "id": "workspace_from_protected_context",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        },
+        {
+          "id": "foreign_workspace_denied",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        }
+      ],
+      "outputs": [
+        {
+          "command": "psql -c foreign_workspace",
+          "expectedExitCode": 0,
+          "exitCode": 0,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "foreign_workspace"
+        }
+      ],
+      "limits": [
+        "Identités synthétiques."
+      ]
+    },
+    {
+      "id": "admission_authorization_execution",
+      "status": "real",
+      "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "admissionMeansExecution": false,
+      "stateCounts": {
+        "admitted": 1,
+        "authorized": 0,
+        "executed": 0
+      },
+      "assertions": [
+        {
+          "id": "states_observed_separately",
+          "passed": true,
+          "expected": true,
+          "observed": true
+        }
+      ],
+      "outputs": [
+        {
+          "command": "psql -c state_counts",
+          "expectedExitCode": 0,
+          "exitCode": 0,
+          "testedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "state_counts"
+        }
+      ],
+      "limits": [
+        "L'exécution n'a pas été lancée."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+Tous les JSON de ce dossier sont des fixtures synthétiques. Aucun n'a été collecté sur une base. `fixtureClass` vaut `synthetic` : le validateur doit refuser tout scénario `real` ici, et ne doit jamais rendre `reviewable`.
