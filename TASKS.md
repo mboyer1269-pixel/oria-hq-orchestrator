@@ -20,6 +20,7 @@
 - [x] Claude puis Cursor : reproduire et corriger le délai HTTP après les en-têtes; Codex confirme 27 tests et une interruption du corps bloqué à 601–792 ms pour 600 ms demandés. Correctif intégré au candidat validé `286a211`.
 - [x] Faire passer typecheck, lint, build et smoke sur le candidat de code `286a211` (0 erreur lint, 5 avertissements hors lot).
 - [ ] Qualifier le vrai Hermes installé et l'accès modèle autorisé; réaliser la mission complète décrite ci-dessous.
+- [x] Cursor puis Codex : qualifier les frontières route/owner et les refus SQL avec rôles ordinaires. 10 tests sans exclusion, lint ciblé et banc PostgreSQL `1790843349_80260` réussis; lectures/écritures et lignes inchangées vérifiées. Candidat `cf4fc4a`, aucun code applicatif modifié. [Portée exacte](docs/HQ-FRONTIERES-ACCES-2026-10-01.md); compte réel et worker toujours à qualifier.
 
 ## Implémenté ou qualifié dans un périmètre borné
 

@@ -1,0 +1,77 @@
+Qualification indépendante Codex — 2026-10-01
+Produit cf4fc4addee7ffe8ef4f0a2d6a1027b0d643b6c6
+Arbre 73f9985d65f97d41879d7835fcb05ac363952711
+Node 22.14 / WSL Ubuntu 24.04
+
+TESTS CIBLES
+TAP version 13
+# Subtest: the development route keeps the owner boundary and ignores the test global
+ok 1 - the development route keeps the owner boundary and ignores the test global
+  ---
+  duration_ms: 1.181112
+  ...
+# Subtest: mission and budget migrations do not grant client table access or bypassrls
+ok 2 - mission and budget migrations do not grant client table access or bypassrls
+  ---
+  duration_ms: 0.496798
+  ...
+# Subtest: absent docker is a bounded fake process and does not create a container
+ok 3 - absent docker is a bounded fake process and does not create a container
+  ---
+  duration_ms: 17.590792
+  ...
+# Subtest: development route owner boundary
+    # Subtest: absent synthetic session is 401 and writes nothing
+    ok 1 - absent synthetic session is 401 and writes nothing
+      ---
+      duration_ms: 5.359029
+      ...
+    # Subtest: synthetic non-owner is 403 and writes nothing
+    ok 2 - synthetic non-owner is 403 and writes nothing
+      ---
+      duration_ms: 0.552412
+      ...
+    # Subtest: owner id is the session id, and workspace comes from the server
+    ok 3 - owner id is the session id, and workspace comes from the server
+      ---
+      duration_ms: 4.035351
+      ...
+    # Subtest: owner email still attributes createdBy to the session id
+    ok 4 - owner email still attributes createdBy to the session id
+      ---
+      duration_ms: 1.125509
+      ...
+    # Subtest: usurped actor and workspace fields are refused before any write
+    ok 5 - usurped actor and workspace fields are refused before any write
+      ---
+      duration_ms: 1.580164
+      ...
+    # Subtest: a production test global does not authorize the development route
+    ok 6 - a production test global does not authorize the development route
+      ---
+      duration_ms: 0.72357
+      ...
+    1..6
+ok 4 - development route owner boundary
+  ---
+  duration_ms: 14.767259
+  ...
+1..4
+# tests 10
+# suites 0
+# pass 10
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 479.534343
+
+LINT CIBLE : exit 0, aucune sortie
+
+POSTGRESQL DOCKER
+NOTICE:  function public.hq_reserve_call_attempt(text,text,text,text,text,text,pg_catalog.int4) does not exist, skipping
+ADMISSION RLS QUALIFIÉE 1790843349_80260
+--- Nettoyage des ressources jetables du run 1790843349_80260 ---
+
+Nettoyage vérifié séparément : container, volume, réseau exacts absents.
+Limites : comptes synthétiques, rôles SQL locaux; aucun JWT, compte réel, VPS, modèle ou worker.
