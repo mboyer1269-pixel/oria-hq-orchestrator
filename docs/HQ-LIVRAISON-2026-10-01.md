@@ -2,16 +2,20 @@
 
 ## Pilotage courant — prime sur les états historiques
 
-Le candidat produit est assemblé dans la branche isolée `codex/hq-delivery-integration`, commit `c4659f1`. Cursor et Antigravity ont livré leur lot courant. Claude traite un dernier correctif React trouvé par le lint central. Les 61 tests de routage, 18 tests d'admission et 107 tests d'accès/reprise couvrent des périmètres distincts; ils ne remplacent pas une mission réelle.
+Le candidat produit est assemblé dans la branche isolée `codex/hq-delivery-integration`, commit de code `2f08e96`. Les trois agents ont livré leur lot courant; Codex a repris le correctif Claude `abe4b81` et terminé les quatre validations globales. Les 61 tests de routage, 18 tests d'admission et 110 tests d'accès/reprise couvrent des périmètres distincts; ils ne remplacent pas une mission réelle.
+
+Branche produit publiée : [codex/hq-delivery-integration](https://github.com/mboyer1269-pixel/Oria.HQ.Michael.HQ-APP/tree/codex/hq-delivery-integration), tête documentaire `e56d713`. Le checkout canonique reste à `e9ff840`; ni fusion ni déploiement. Les agents repartent de ce candidat pour la qualification suivante, en préservant leurs autres travaux locaux.
 
 | Responsable | Action immédiate | Sortie attendue |
 | --- | --- | --- |
-| Claude Code | Corriger le reset d'état et la lecture de ref au rendu du formulaire, sans désactiver le lint. | Commit minimal, lint ciblé et tests de reprise réussis. |
+| Claude Code | Lot accès/reprise terminé. À la levée du prérequis d'accès, qualifier le runtime Hermes avec sa sonde existante, sans reprendre l'admission. | Version, capacités et limites observées; pas de conclusion tirée du seul nom Hermes. Recette navigateur du formulaire avant activation. |
 | Cursor | Lot routage terminé et revérifié; attendre la preuve backend pour sa revue indépendante. | Pas de recherche ou nouvelle couche en attendant; revue des tentatives, modèles et coûts sur le futur parcours réel. |
 | Antigravity | Lots admission/harnais et maquette livrés; attendre hôte Docker autorisé et retour visuel de Michael. | Exécuter le banc réel dès que le prérequis existe; conserver les quatre niveaux de preuve séparés. |
-| Codex | Reprendre le correctif Claude, valider le candidat, conserver provenance et limites. | Typecheck, lint, build et smoke sur le même candidat; bilan exploitable et documentation exacte. |
+| Codex | Candidat validé; organiser l'hôte de qualification autorisé et contrôler les preuves du parcours complet. | Chaîne directive → mission unique → autorisation → OpenHands → tests → revue → aperçu, puis reprise sans doublon. |
 
 Les agents exécutent leurs tests ciblés; Codex centralise les quatre validations globales. Rapports concis avec liens vers les journaux, pas de répétition des mêmes sorties. Une fois ce lot accepté, la priorité est la qualification réelle du stockage et du lanceur, puis Hermes et une mission OpenHands complète. Aucune nouvelle plateforme n'est nécessaire pour ce jalon.
+
+Contrôles centraux du candidat : TypeScript 15 s, lint 29 s (0 erreur, 5 avertissements préexistants), build 37 s, smoke local 1 s, tous réussis. Copie de validation Linux native, code du correctif vérifié par empreintes. Aucune performance d'une mission réelle ne peut être déduite de ces temps.
 
 Pré-requis non satisfaits : Docker opérationnel, observation autorisée du runtime Hermes et de son compte, validation visuelle de Michael. L'inspection SSH demandée reste en attente après un refus automatique; ne pas la contourner. Aucun accès ou modèle payant nouveau n'est autorisé implicitement.
 

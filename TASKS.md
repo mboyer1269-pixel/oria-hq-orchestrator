@@ -7,11 +7,12 @@
 - [x] Attribuer chaque périmètre à un seul agent et transmettre les directives.
 - [x] Récupérer le patch Cursor sans étendre ses droits GitHub; vérifier le contenu transféré et le correctif avec 61 tests ciblés.
 - [x] Assembler le runtime d'admission et le routage dans une copie isolée; 18 tests d'admission réussis dans cette copie.
-- [x] Revoir et assembler les corrections d'accès et de reprise de Claude (`13930e1` → `c4659f1`); 107 tests ciblés/dépendants passés chez Codex. La recette navigateur reste à faire.
-- [ ] Corriger puis exécuter le banc PostgreSQL réel d'Antigravity avec concurrence, réponse perdue et contenu préservé après redémarrage.
+- [x] Revoir et assembler les corrections d'accès et de reprise de Claude (`13930e1`, `abe4b81` → candidat `2f08e96`); 110 tests ciblés/dépendants passés chez Codex. La recette navigateur reste à faire.
+- [x] Corriger et vérifier la syntaxe du banc PostgreSQL d'Antigravity (`720d513`); ne pas confondre préparation et exécution.
+- [ ] Exécuter ce banc réel avec concurrence, réponse perdue et contenu préservé après redémarrage, sur un hôte Docker autorisé.
 - [x] Corriger et vérifier dans le navigateur la continuité Aujourd'hui → Discuter → Atelier de la maquette et l'état après GO (`87c00df`).
 - [ ] Obtenir la validation visuelle de Michael puis raccorder l'interface aux événements réels.
-- [ ] Faire passer typecheck, lint, build et smoke sur l'ensemble final assemblé.
+- [x] Faire passer typecheck, lint, build et smoke sur le candidat de code `2f08e96` (0 erreur lint, 5 avertissements hors lot).
 - [ ] Qualifier le vrai Hermes installé et l'accès modèle autorisé; réaliser la mission complète décrite ci-dessous.
 
 ## Implémenté ou qualifié dans un périmètre borné

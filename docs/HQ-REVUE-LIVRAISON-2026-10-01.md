@@ -4,13 +4,15 @@ Ce relevé complète le contrat de livraison. Il distingue le code inspecté, le
 
 ## État courant de l'assemblage
 
-Candidat isolé `codex/hq-delivery-integration`, commit `c4659f1`, base `e9ff840`. Il inclut les sept commits Cursor, l'admission Antigravity et les accès/reprise Claude; aucune maquette et aucune fusion dans le checkout canonique.
+Candidat isolé `codex/hq-delivery-integration`, commit de code `2f08e96`, base `e9ff840`. Il inclut les sept commits Cursor, l'admission Antigravity et les accès/reprise Claude; aucune maquette et aucune fusion dans le checkout canonique.
 
 - Cursor : 61 tests ciblés passés; identifiants invalides et coût des tentatives corrigés.
 - Admission : 18 tests de contrat passés; harnais réel `720d513` repris avec syntaxe vérifiée. Docker bloque toujours son exécution réelle.
-- Claude : source `13930e1`; 107 tests ciblés et dépendants rejoués par Codex, réussis. TypeScript global passe. Lint global révèle deux causes d'erreur dans le formulaire (reset d'état dans l'effet et lecture d'une ref au rendu, neuf diagnostics). Correction minimale renvoyée à Claude; build et smoke finaux non exécutés après cet échec.
-- Avant le lot Claude, les quatre contrôles globaux avaient passé. Cela ne qualifie pas le nouveau candidat.
+- Claude : sources `13930e1` puis `abe4b81`; 110 tests ciblés et dépendants rejoués par Codex, réussis. Le correctif résout les neuf diagnostics lint et une charge de requête susceptible de survivre au changement de workspace. Une instance interne React par workspace isole état et refs. La recette navigateur du formulaire reste à faire.
+- Candidat final : TypeScript, lint (0 erreur, 5 avertissements préexistants), build et smoke local réussis. Durées respectives 15/29/37/1 secondes dans une copie native Linux, Node 22.14. Le code du correctif final est identique par empreintes au snapshot validé. Journaux : `.validation/hq-candidate-native/`. Ce sont des mesures de validation, pas de latence du produit.
 - UI `87c00df` : deux directives successives vérifiées au navigateur, puis état après GO cohérent (zéro arbitrage, pas de nouveau GO). Historique distingué et budget explicitement démonstratif. Mobile 390 × 844, largeur client/scroll 375/375. Réactiver une carte historique crée une nouvelle mission démo; libellé à clarifier. Validation visuelle et allègement de l'en-tête soumis à Michael.
+
+Autre réserve UI visible : le sélecteur « moteur d'intelligence » mélange Hermes (agent) et les modèles. Avant raccordement, séparer l'identité stable Hermes du modèle/fournisseur réellement disponible. Aucun des choix de cette maquette ne démontre un accès fournisseur.
 
 Les sections suivantes conservent la chronologie et les reproductions. L'état courant ci-dessus prime sur leurs anciens statuts.
 
