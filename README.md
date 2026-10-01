@@ -65,6 +65,14 @@ node --test integrations/antigravity/runner.test.mjs integrations/antigravity/pa
 node --test deploy/hq-pilot/readiness.test.mjs deploy/hq-pilot/development-snapshot.test.mjs
 ```
 
+Inspection sans effet, sans modèle et sans réconciliation :
+
+```sh
+python integrations/openhands-runner/operator_status.py
+```
+
+Le code de sortie 0 signifie qu'un rapport a été produit. Il ne signifie pas qu'une mission réelle est prête. `readyForRealMission` reste faux tant que l'authentification fournisseur, l'autorisation d'exécution, la revendication canonique et Docker ne sont pas observés. Une indisponibilité Docker n'est pas une absence de conteneur. Voir [le rapport d'inspection](integrations/openhands-runner/OPERATOR-STATUS.md).
+
 Le test `deploy/hq-pilot/execution-bundle.test.mjs` exige en plus `HQ_SOURCE_ROOT` pointant vers le dépôt HQ réel et ses dépendances ; exécuter ce test séparément après configuration.
 
 Certains tests hôte exigent les primitives Unix et sont ignorés sous Windows. Les qualifications `qualify_*.py` et les scripts `deploy/` ont des prérequis spécifiques décrits dans leurs README ; ne pas les assimiler à des tests locaux sans effets. Plusieurs exigent Docker Linux, les dépôts frères HQ/Memex et des configurations protégées.
