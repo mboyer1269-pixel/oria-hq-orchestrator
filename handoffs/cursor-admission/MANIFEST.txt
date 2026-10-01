@@ -1,0 +1,68 @@
+Admission boundary qualification. Does not replace the budget patches.
+Apply in a product clone. Do not push this patch to the product remote from Cursor.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_branch: codex/hq-delivery-integration
+product_base: 3af7ec6dd2c6d4db83802f804664a86f9d458a09
+product_base_tree: f6642d70c527abf7d12edc7d3d4365b83d3a1731
+product_code: 286a211f6ab4de042d61604df1a33bb9d969b289
+product_code_tree: f7151f6ccb27e4a5bb461663cb1f1e911efcf8d9
+product_head: 1782572704911c553a0ad82b95340b5285021237
+product_tree: e305d80f031f0e7d7d810d43e78af7ddab4160f8
+patch_range: 3af7ec6dd2c6d4db83802f804664a86f9d458a09..1782572704911c553a0ad82b95340b5285021237
+patch_commits: 1
+patch_path: handoffs/cursor-admission/cursor-qualification-admission.patch
+report_path: handoffs/cursor-admission/CURSOR-QUALIFICATION-ADMISSION-2026-10-01.md
+sha256: 8041679e12194d91b677906a568b5d965147e76eef343b99ef8055a2913c1cb3
+size_bytes: 28217
+
+apply:
+git checkout 3af7ec6dd2c6d4db83802f804664a86f9d458a09
+git am handoffs/cursor-admission/cursor-qualification-admission.patch
+git rev-parse HEAD^{tree}
+expected_tree: e305d80f031f0e7d7d810d43e78af7ddab4160f8
+
+verified:
+git am on a detached worktree at 3af7ec6 produced commit bcd732ed2309e64d1ff4eed489e9203da048080d
+and tree e305d80f031f0e7d7d810d43e78af7ddab4160f8, equal to product HEAD^{tree}.
+The applied commit hash differs. The tree does not.
+Product push was not attempted.
+
+command:
+sh proofs/run-admission-rls-real-db.sh
+Docker was absent here. Exit 127, NON EXECUTE. Not a passed PostgreSQL proof.
+Replay that command on the already authorized local Docker.
+
+supplement:
+The applied patch above is unchanged.
+product_parent: 1782572704911c553a0ad82b95340b5285021237
+product_parent_tree: e305d80f031f0e7d7d810d43e78af7ddab4160f8
+product_head: 489a7c399fcadab39d9101da1ecf10fc3b6fe688
+product_tree: 73f9985d65f97d41879d7835fcb05ac363952711
+patch_range: 1782572704911c553a0ad82b95340b5285021237..489a7c399fcadab39d9101da1ecf10fc3b6fe688
+patch_commits: 1
+patch_path: handoffs/cursor-admission/cursor-qualification-admission-banc.patch
+report_path: handoffs/cursor-admission/CURSOR-QUALIFICATION-ADMISSION-BANC-2026-10-01.md
+sha256: a083fa2a95806346e94c63973471bfaba68cd90837bb27ea1e6e2f47a6632fb5
+size_bytes: 19699
+scope: proofs/prove-admission-rls.sql, proofs/admission-boundary-structure.test.mjs, docs/CURSOR-QUALIFICATION-ADMISSION-BANC-2026-10-01.md
+No migration. No product contract code.
+
+apply:
+git checkout 1782572704911c553a0ad82b95340b5285021237
+git am handoffs/cursor-admission/cursor-qualification-admission-banc.patch
+git rev-parse HEAD^{tree}
+expected_tree: 73f9985d65f97d41879d7835fcb05ac363952711
+
+verified:
+git am on a detached worktree at 1782572704911c553a0ad82b95340b5285021237
+produced commit 3cbcb899905a62b83f290e536dfbe2a10a174893
+and tree 73f9985d65f97d41879d7835fcb05ac363952711, equal to product HEAD^{tree}.
+The applied commit hash differs. The tree does not.
+
+local_sql_check:
+PostgreSQL 16.15, not the Docker script and not a Supabase session.
+Same nobypassrls roles, migrations 0001, 0005, 0028, then prove-admission-rls.sql.
+Exit 0. Probe counts returned to 0. Client grants did not survive. Database dropped.
+sh proofs/run-admission-rls-real-db.sh still exits 127 here because Docker is absent.
+That command remains the explicit bench to replay. Run 1790842532_79642 does not cover this supplement.

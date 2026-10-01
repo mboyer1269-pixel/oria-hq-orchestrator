@@ -1,0 +1,674 @@
+From 1782572704911c553a0ad82b95340b5285021237 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 08:13:53 +0000
+Subject: [PATCH] Qualify the existing development admission boundary without
+ changing it.
+
+---
+ ...RSOR-QUALIFICATION-ADMISSION-2026-10-01.md |  39 ++++
+ proofs/admission-boundary-structure.test.mjs  |  66 ++++++
+ proofs/prove-admission-rls.sql                | 195 ++++++++++++++++++
+ proofs/run-admission-rls-real-db.sh           |  79 +++++++
+ .../development/route-owner-admin-double.mjs  |  45 ++++
+ .../development/route-owner-auth-double.mjs   |  18 ++
+ .../development/route-owner-boundary.test.mjs | 164 +++++++++++++++
+ 7 files changed, 606 insertions(+)
+ create mode 100644 docs/CURSOR-QUALIFICATION-ADMISSION-2026-10-01.md
+ create mode 100644 proofs/admission-boundary-structure.test.mjs
+ create mode 100644 proofs/prove-admission-rls.sql
+ create mode 100755 proofs/run-admission-rls-real-db.sh
+ create mode 100644 src/app/api/missions/development/route-owner-admin-double.mjs
+ create mode 100644 src/app/api/missions/development/route-owner-auth-double.mjs
+ create mode 100644 src/app/api/missions/development/route-owner-boundary.test.mjs
+
+diff --git a/docs/CURSOR-QUALIFICATION-ADMISSION-2026-10-01.md b/docs/CURSOR-QUALIFICATION-ADMISSION-2026-10-01.md
+new file mode 100644
+index 0000000..3a1dc86
+--- /dev/null
++++ b/docs/CURSOR-QUALIFICATION-ADMISSION-2026-10-01.md
+@@ -0,0 +1,39 @@
++# Qualification des frontières d'admission
++
++Base produit `3af7ec6dd2c6d4db83802f804664a86f9d458a09`, code `286a211f6ab4de042d61604df1a33bb9d969b289`, arbre de code `f7151f6ccb27e4a5bb461663cb1f1e911efcf8d9`. Arbre publié avant ce document : `f6642d70c527abf7d12edc7d3d4365b83d3a1731`. Aucun fichier de contrat, de migration ou d'Antigravity n'est modifié. Aucun défaut de contrat n'a été reproduit ; rien n'a été changé dans la barrière.
++
++## Frontière
++
++`POST/GET /api/missions/development` appelle `getCurrentAuthUser` puis `isOwnerUser`. Sans session : HTTP 401. Session non propriétaire : HTTP 403. Le corps ne choisit ni l'acteur, ni le workspace, ni le mode. `createdBy` est l'id de session. Le workspace `michael-hq` et le mode `hq` viennent de `getActiveWorkspaceContext`. L'écriture durable passe ensuite par le client service, pas par le rôle du navigateur. Cette route ne lit pas `__ownerApiSessionTestResult`.
++
++Déjà couvert, non rejoué comme preuve nouvelle : `handlers.test.mjs` (dépendances injectées, origine, schéma strict), `owner-api-session-guard.test.mjs` (`requireOwnerApiSession` ignore le global en production). Le banc d'intake `qualification_service` et le run budget `1790840244_77530` restent des preuves de persistance privilégiée ; ils ne qualifient pas RLS.
++
++## Preuves
++
++Identités HTTP synthétiques. Ce n'est pas une session OAuth.
++
++- Session absente : 401, zéro écriture.
++- Non-propriétaire : 403, zéro écriture.
++- Propriétaire par id, puis par email : `createdBy` est l'id de session, pas l'id configuré quand seul l'email correspond. Workspace et mode viennent du serveur. Reçu `saved`, statut `draft`, `executionRequested` false.
++- `createdBy`, `workspaceId` ou `actorId` dans le corps : 400, zéro écriture.
++- `NODE_ENV=production` et global de test à `null` : la route reste 401, y compris le GET. Aucun socket réseau.
++
++PostgreSQL : `sh proofs/run-admission-rls-real-db.sh`. Ici, exit 127, `NON EXECUTE`. Docker absent. Les assertions SQL n'ont pas tourné. Ce n'est pas `real_infra`.
++
++La commande à rejouer sur le Docker local déjà autorisé est celle-ci, depuis la racine produit. Image `postgres:16.4-alpine`, loopback, volume nommé, nettoyage du run. Rôles locaux `anon`, `authenticated`, `service_role`, tous `nosuperuser nobypassrls`. Ce ne sont pas des sessions Supabase. Le script applique `0001`, `0005` et `0028`, refuse lecture et écriture client, refuse les 4 RPC aux rôles client, et attend l'exécution `service_role` sans ligne laissée. Une sonde de RLS ouvre un grant puis l'annule ; elle ne remplace pas les migrations.
++
++## Non couvert
++
++Pas de JWT Supabase réel, pas de clé service réelle, pas de VPS, pas de Hermes, pas de lancement OpenHands. Le commentaire de `0005` rappelle qu'une clé service Supabase réelle contourne RLS ; ce banc ne recrée pas ce privilège.
++
++## Commandes
++
++Node 22.14.0. Aucun modèle.
++
++- `node --test --test-concurrency=1 src/app/api/missions/development/route-owner-boundary.test.mjs proofs/admission-boundary-structure.test.mjs` — 10 tests, 0 échec, exit 0
++- `sh proofs/run-admission-rls-real-db.sh` — exit 127, `NON EXECUTE`
++- Typecheck, lint, build et smoke non relancés : le code produit de la barrière est inchangé.
++
++## Prochain prérequis réel
++
++Hermes reste non observé : pas d'accès VPS, pas de version, transport, capacités ni mode de compte. Après cette qualification, le raccordement existant est `POST /api/missions/development` par le propriétaire, puis `POST /api/orchestration/openhands` avec le flag déjà prévu. Pas une nouvelle architecture.
+diff --git a/proofs/admission-boundary-structure.test.mjs b/proofs/admission-boundary-structure.test.mjs
+new file mode 100644
+index 0000000..e51c65c
+--- /dev/null
++++ b/proofs/admission-boundary-structure.test.mjs
+@@ -0,0 +1,66 @@
++#!/usr/bin/env node
++// Structural checks that do not require Docker and do not claim real_infra.
++// The disposable PostgreSQL script is executed separately.
++
++import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
++import { readFileSync } from "node:fs";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++
++function text(relative) {
++  return readFileSync(path.join(root, relative), "utf8");
++}
++
++test("the development route keeps the owner boundary and ignores the test global", () => {
++  const route = text("src/app/api/missions/development/route.ts");
++  assert.match(route, /getCurrentAuthUser/);
++  assert.match(route, /isOwnerUser/);
++  assert.match(route, /getActiveWorkspaceContext/);
++  assert.doesNotMatch(route, /__ownerApiSessionTestResult/);
++  assert.doesNotMatch(route, /from\("missions"\)/);
++});
++
++test("mission and budget migrations do not grant client table access or bypassrls", () => {
++  const missions = text("db/migrations/0005_missions_rls.sql");
++  const budget = text("db/migrations/0028_call_reservation.sql");
++  const script = text("proofs/run-admission-rls-real-db.sh");
++  assert.match(missions, /missions_block_anon_select/);
++  assert.match(missions, /missions_block_authenticated_insert/);
++  assert.match(missions, /as restrictive/);
++  assert.match(budget, /revoke all on function public\.hq_reserve_call_attempt/);
++  assert.match(budget, /grant execute on function public\.hq_reserve_call_attempt\(text, text, text, text, text, text, integer, integer\) to service_role/);
++  assert.match(script, /create role anon noinherit nologin nosuperuser nobypassrls/);
++  assert.match(script, /create role authenticated noinherit nologin nosuperuser nobypassrls/);
++  assert.match(script, /create role service_role noinherit nologin nosuperuser nobypassrls/);
++  assert.doesNotMatch(script, /qualification_service/);
++  assert.match(script, /NON EXECUTE/);
++  assert.match(script, /exit 127/);
++});
++
++test("the admission SQL bench reports absence or a real run, never a renamed simulation", () => {
++  let stderr = "";
++  let stdout = "";
++  let code = 0;
++  try {
++    stdout = execFileSync("sh", ["proofs/run-admission-rls-real-db.sh"], {
++      cwd: root,
++      encoding: "utf8",
++      stdio: ["ignore", "pipe", "pipe"],
++    });
++  } catch (error) {
++    code = error.status;
++    stdout = error.stdout ?? "";
++    stderr = error.stderr ?? "";
++  }
++  if (code === 127) {
++    assert.match(stderr, /NON EXECUTE/);
++    assert.doesNotMatch(`${stdout}\n${stderr}`, /QUALIFIÉE/);
++    return;
++  }
++  assert.equal(code, 0, stderr);
++  assert.match(stdout, /ADMISSION RLS QUALIFIÉE/);
++});
+diff --git a/proofs/prove-admission-rls.sql b/proofs/prove-admission-rls.sql
+new file mode 100644
+index 0000000..3a3ca29
+--- /dev/null
++++ b/proofs/prove-admission-rls.sql
+@@ -0,0 +1,195 @@
++-- Effect of the existing mission and budget migrations on ordinary roles.
++-- anon, authenticated and service_role are local role names, not Supabase sessions.
++-- None of them is superuser and none bypasses row security.
++-- A rolled-back grant only makes the RLS predicate observable. It is not kept.
++
++\set ON_ERROR_STOP on
++
++do $$
++declare
++  v_super boolean;
++  v_bypass boolean;
++  v_role text;
++begin
++  foreach v_role in array array['anon', 'authenticated', 'service_role'] loop
++    select rolsuper, rolbypassrls into v_super, v_bypass
++    from pg_roles where rolname = v_role;
++    if v_super is null then
++      raise exception 'missing role %', v_role;
++    end if;
++    if v_super or v_bypass then
++      raise exception 'role % is superuser or bypassrls', v_role;
++    end if;
++    if has_table_privilege(v_role, 'public.missions', 'SELECT')
++       or has_table_privilege(v_role, 'public.missions', 'INSERT')
++       or has_table_privilege(v_role, 'public.hq_call_budget_ceiling', 'SELECT')
++       or has_table_privilege(v_role, 'public.hq_call_budget_quote', 'SELECT')
++       or has_table_privilege(v_role, 'public.hq_call_emit_right', 'SELECT')
++       or has_table_privilege(v_role, 'public.hq_call_reservation', 'SELECT') then
++      raise exception 'migration granted client table access to %', v_role;
++    end if;
++  end loop;
++end
++$$;
++
++do $$
++declare
++  v_role text;
++  v_statement text;
++begin
++  foreach v_role in array array['anon', 'authenticated'] loop
++    foreach v_statement in array array[
++      'select count(*) from public.missions',
++      'insert into public.missions (id, workspace_id, mode_id, title, objective, assigned_agent_id) values (''denied'', ''w'', ''hq'', ''t'', ''o'', ''a'')',
++      'update public.missions set title = ''denied''',
++      'delete from public.missions',
++      'select count(*) from public.hq_call_budget_ceiling',
++      'insert into public.hq_call_budget_ceiling (workspace_id, currency, max_amount_cents) values (''w'', ''USD'', 0)',
++      'select count(*) from public.hq_call_budget_quote',
++      'select count(*) from public.hq_call_emit_right',
++      'select count(*) from public.hq_call_reservation',
++      'select public.hq_reserve_call_attempt(''w'', ''s'', ''c'', ''openai'', ''m'', ''api'', 16, 16)',
++      'select public.hq_release_call_attempt(''w'', ''s'', ''c'', ''openai'')',
++      'select public.hq_mark_call_emitted(''w'', ''s'', ''c'', ''openai'')',
++      'select public.hq_consume_call_attempt(''w'', ''s'', ''c'', ''openai'')'
++    ] loop
++      begin
++        execute format('set role %I', v_role);
++        execute v_statement;
++        raise exception '% executed %', v_role, v_statement;
++      exception
++        when insufficient_privilege then
++          null;
++      end;
++      reset role;
++      if current_user <> session_user then
++        raise exception 'role % was not reset', v_role;
++      end if;
++    end loop;
++  end loop;
++end
++$$;
++
++do $$
++declare
++  v_result jsonb;
++  v_count bigint;
++begin
++  set role service_role;
++  if current_user <> 'service_role' then
++    raise exception 'service_role was not the effective role';
++  end if;
++  if (select rolsuper or rolbypassrls from pg_roles where rolname = current_user) then
++    raise exception 'effective service_role is privileged';
++  end if;
++  v_result := public.hq_reserve_call_attempt('w', 's', 'c', 'openai', 'm', 'api', 16, 16);
++  if v_result->>'status' is distinct from 'unavailable'
++     or v_result->>'reason' is distinct from 'ceiling_not_configured' then
++    raise exception 'reserve positive control returned %', v_result;
++  end if;
++  v_result := public.hq_release_call_attempt('w', 's', 'c', 'openai');
++  if v_result->>'status' is null then
++    raise exception 'release did not execute';
++  end if;
++  v_result := public.hq_mark_call_emitted('w', 's', 'c', 'openai');
++  if v_result->>'status' is null then
++    raise exception 'mark did not execute';
++  end if;
++  v_result := public.hq_consume_call_attempt('w', 's', 'c', 'openai');
++  if v_result->>'status' is null then
++    raise exception 'consume did not execute';
++  end if;
++  reset role;
++  select count(*) into v_count from public.hq_call_reservation;
++  if v_count <> 0 then
++    raise exception 'service_role calls persisted % reservation rows', v_count;
++  end if;
++  select count(*) into v_count from public.hq_call_budget_ceiling;
++  if v_count <> 0 then
++    raise exception 'service_role calls persisted a ceiling';
++  end if;
++end
++$$;
++
++-- RLS effect, visible only while a table grant exists. The grant is rolled back.
++begin;
++grant select, insert, update, delete on
++  public.missions,
++  public.hq_call_budget_ceiling,
++  public.hq_call_budget_quote,
++  public.hq_call_emit_right,
++  public.hq_call_reservation
++to anon, authenticated;
++
++insert into public.missions (
++  id, workspace_id, mode_id, title, objective, assigned_agent_id
++) values ('probe-mission', 'probe-ws', 'hq', 'probe', 'probe', 'none');
++insert into public.hq_call_budget_ceiling (workspace_id, currency, max_amount_cents)
++values ('probe-ws', 'USD', 0);
++insert into public.hq_call_budget_quote (
++  provider, model_id, currency, not_to_exceed_cents, quote_scope, quote_version,
++  valid_until, covers_input_bytes, covers_output_tokens, reliable
++) values (
++  'openai', 'probe-model', 'USD', 1, 'prompt_system_output', 'probe',
++  now() + interval '1 hour', 16, 16, false
++);
++insert into public.hq_call_emit_right (workspace_id, subject_id, caller_id)
++values ('probe-ws', 'probe-subject', 'probe-caller');
++insert into public.hq_call_reservation (
++  workspace_id, subject_id, provider, caller_id, access_class, currency,
++  reserved_cents, state, reconciliation_required, model_id, max_tokens, input_bytes, network_emitted
++) values (
++  'probe-ws', 'probe-subject', 'openai', 'probe-caller', 'api', 'USD',
++  1, 'held', false, 'probe-model', 16, 16, false
++);
++
++do $$
++declare
++  v_role text;
++  v_seen bigint;
++begin
++  foreach v_role in array array['anon', 'authenticated'] loop
++    execute format('set role %I', v_role);
++    if (select rolsuper or rolbypassrls from pg_roles where rolname = current_user) then
++      raise exception 'probe role % bypasses rls', v_role;
++    end if;
++    select count(*) into v_seen from public.missions;
++    if v_seen <> 0 then raise exception '% read % missions through rls', v_role, v_seen; end if;
++    select count(*) into v_seen from public.hq_call_budget_ceiling;
++    if v_seen <> 0 then raise exception '% read a ceiling through rls', v_role; end if;
++    select count(*) into v_seen from public.hq_call_budget_quote;
++    if v_seen <> 0 then raise exception '% read a quote through rls', v_role; end if;
++    select count(*) into v_seen from public.hq_call_emit_right;
++    if v_seen <> 0 then raise exception '% read an emit right through rls', v_role; end if;
++    select count(*) into v_seen from public.hq_call_reservation;
++    if v_seen <> 0 then raise exception '% read a reservation through rls', v_role; end if;
++    begin
++      insert into public.missions (id, workspace_id, mode_id, title, objective, assigned_agent_id)
++      values ('client-write', 'probe-ws', 'hq', 'no', 'no', 'none');
++      raise exception '% inserted a mission', v_role;
++    exception
++      when insufficient_privilege then null;
++    end;
++    reset role;
++  end loop;
++end
++$$;
++
++rollback;
++
++do $$
++begin
++  if has_table_privilege('anon', 'public.missions', 'SELECT')
++     or has_table_privilege('authenticated', 'public.hq_call_reservation', 'INSERT')
++     or has_table_privilege('service_role', 'public.hq_call_budget_quote', 'SELECT') then
++    raise exception 'rolled-back probe grant survived';
++  end if;
++  if (select count(*) from public.missions) <> 0
++     or (select count(*) from public.hq_call_budget_ceiling) <> 0
++     or (select count(*) from public.hq_call_budget_quote) <> 0
++     or (select count(*) from public.hq_call_emit_right) <> 0
++     or (select count(*) from public.hq_call_reservation) <> 0 then
++    raise exception 'probe rows survived rollback';
++  end if;
++end
++$$;
+diff --git a/proofs/run-admission-rls-real-db.sh b/proofs/run-admission-rls-real-db.sh
+new file mode 100755
+index 0000000..297c2ed
+--- /dev/null
++++ b/proofs/run-admission-rls-real-db.sh
+@@ -0,0 +1,79 @@
++#!/bin/sh
++# Disposable PostgreSQL proof for ordinary anon/authenticated roles.
++# Ordinary roles are created nobypassrls. No provider network and no model call.
++# If Docker is absent, exit 127 and print NON EXECUTE. That is not a passed proof.
++
++set -eu
++
++ROOT="${1:-$(pwd)}"
++
++if ! command -v docker >/dev/null 2>&1 || ! timeout -k 2 5 docker info >/dev/null 2>&1 < /dev/null; then
++  echo "NON EXECUTE: Docker est absent. Les migrations n'ont pas été appliquées et les assertions SQL n'ont pas tourné." >&2
++  exit 127
++fi
++
++RUN_ID="$(date +%s)_$$"
++PG_IMAGE="postgres:16.4-alpine"
++VOLUME="oria-admission-rls-$RUN_ID"
++NET="oria-admission-rls-net-$RUN_ID"
++PG_NAME="oria-admission-rls-pg-$RUN_ID"
++pg=""
++
++cleanup() {
++  echo "--- Nettoyage des ressources jetables du run $RUN_ID ---"
++  if [ -n "$pg" ]; then
++    timeout -k 2 10 docker rm -f "$pg" >/dev/null 2>&1 < /dev/null || true
++  fi
++  timeout -k 2 10 docker network rm "$NET" >/dev/null 2>&1 < /dev/null || true
++  timeout -k 2 10 docker volume rm "$VOLUME" >/dev/null 2>&1 < /dev/null || true
++}
++trap cleanup EXIT INT TERM
++
++timeout -k 2 15 docker network create "$NET" >/dev/null < /dev/null
++timeout -k 2 15 docker volume create "$VOLUME" >/dev/null < /dev/null
++pg=$(timeout -k 2 25 docker run -d \
++  --name "$PG_NAME" \
++  --network "$NET" \
++  --memory 256m --cpus 0.5 --pids-limit 128 \
++  --mount "type=volume,src=$VOLUME,dst=/var/lib/postgresql/data" \
++  -e POSTGRES_HOST_AUTH_METHOD=trust \
++  -e POSTGRES_DB=postgres \
++  -p 127.0.0.1:0:5432 \
++  "$PG_IMAGE" < /dev/null)
++
++i=0
++until timeout -k 2 3 docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 < /dev/null; do
++  i=$((i+1))
++  [ "$i" -lt 80 ] || { echo "PostgreSQL n'est pas devenu prêt" >&2; exit 1; }
++  sleep 0.25
++done
++
++timeout -k 2 15 docker exec -i "$pg" psql -h 127.0.0.1 -U postgres -X -q -v ON_ERROR_STOP=1 <<'SQL'
++do $$
++begin
++  if not exists (select 1 from pg_roles where rolname = 'anon') then
++    create role anon noinherit nologin nosuperuser nobypassrls;
++  end if;
++  if not exists (select 1 from pg_roles where rolname = 'authenticated') then
++    create role authenticated noinherit nologin nosuperuser nobypassrls;
++  end if;
++  if not exists (select 1 from pg_roles where rolname = 'service_role') then
++    create role service_role noinherit nologin nosuperuser nobypassrls;
++  end if;
++end
++$$;
++SQL
++
++for migration in \
++  db/migrations/0001_missions.sql \
++  db/migrations/0005_missions_rls.sql \
++  db/migrations/0028_call_reservation.sql
++do
++  timeout -k 2 20 docker exec -i "$pg" psql -h 127.0.0.1 -U postgres -X -q -v ON_ERROR_STOP=1 \
++    < "$ROOT/$migration"
++done
++
++timeout -k 2 20 docker exec -i "$pg" psql -h 127.0.0.1 -U postgres -X -q -v ON_ERROR_STOP=1 \
++  < "$ROOT/proofs/prove-admission-rls.sql"
++
++echo "ADMISSION RLS QUALIFIÉE $RUN_ID"
+diff --git a/src/app/api/missions/development/route-owner-admin-double.mjs b/src/app/api/missions/development/route-owner-admin-double.mjs
+new file mode 100644
+index 0000000..590d01d
+--- /dev/null
++++ b/src/app/api/missions/development/route-owner-admin-double.mjs
+@@ -0,0 +1,45 @@
++// Captures the privileged write the real development service would send.
++// No network client is constructed.
++
++const writes = [];
++let last = null;
++
++function table() {
++  return {
++    upsert(row) {
++      writes.push(row);
++      last = row;
++      return Promise.resolve({ error: null });
++    },
++    select() {
++      return this;
++    },
++    eq() {
++      return this;
++    },
++    single() {
++      return Promise.resolve({ data: last, error: last ? null : { message: "missing" } });
++    },
++  };
++}
++
++export function resetWrites() {
++  writes.length = 0;
++  last = null;
++}
++
++export function writtenRows() {
++  return writes;
++}
++
++export function createOptionalSupabaseAdminClient() {
++  return { from() { return table(); } };
++}
++
++export function createSupabaseAdminClient() {
++  return createOptionalSupabaseAdminClient();
++}
++
++export function hasSupabaseAdminConfig() {
++  return true;
++}
+diff --git a/src/app/api/missions/development/route-owner-auth-double.mjs b/src/app/api/missions/development/route-owner-auth-double.mjs
+new file mode 100644
+index 0000000..a9befd3
+--- /dev/null
++++ b/src/app/api/missions/development/route-owner-auth-double.mjs
+@@ -0,0 +1,18 @@
++// Synthetic session double for the development route boundary test.
++// This is not a Supabase project, not an OAuth session, and not a secret.
++
++let result = { user: null, error: null };
++
++export function setAuthResult(next) {
++  result = next;
++}
++
++export async function createServerSupabaseClient() {
++  return {
++    auth: {
++      async getUser() {
++        return { data: { user: result.user }, error: result.error };
++      },
++    },
++  };
++}
+diff --git a/src/app/api/missions/development/route-owner-boundary.test.mjs b/src/app/api/missions/development/route-owner-boundary.test.mjs
+new file mode 100644
+index 0000000..36784ec
+--- /dev/null
++++ b/src/app/api/missions/development/route-owner-boundary.test.mjs
+@@ -0,0 +1,164 @@
++#!/usr/bin/env node
++// Real development route + owner assembly.
++// External auth and admin clients are doubles. Identities are synthetic.
++// This is not an OAuth proof and not a Supabase session.
++
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++import { createJiti } from "jiti";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..", "..", "..");
++const authDoublePath = path.join(__dirname, "route-owner-auth-double.mjs");
++const adminDoublePath = path.join(__dirname, "route-owner-admin-double.mjs");
++const initialNodeEnv = process.env.NODE_ENV;
++
++process.env.MICHAEL_HQ_OWNER_ID = "synthetic-owner-id";
++process.env.MICHAEL_HQ_OWNER_EMAIL = "synthetic-owner@example.com";
++process.env.ORIA_HQ_PUBLIC_ORIGIN = "https://hq.test";
++process.env.MISSION_DURABLE_DRAFTS = "1";
++delete process.env.NEXT_PUBLIC_SUPABASE_URL;
++delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++delete process.env.SUPABASE_SERVICE_ROLE_KEY;
++delete process.env.ANTHROPIC_API_KEY;
++delete process.env.OPENAI_API_KEY;
++
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(projectRoot, "src"),
++    "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++    "@/lib/supabase/server": authDoublePath,
++    "@/server/supabase/admin": adminDoublePath,
++  },
++});
++
++const { setAuthResult } = await jiti.import(authDoublePath);
++const { resetWrites, writtenRows } = await jiti.import(adminDoublePath);
++const { POST, GET } = await jiti.import("./route.ts");
++
++const input = {
++  requestId: "12345678-1234-4234-8234-123456789abc",
++  title: "Task",
++  objective: "Goal",
++  scope: "Scope",
++  acceptanceCriteria: "Tests",
++};
++
++function post(body) {
++  return new Request("http://internal:3000/api/missions/development", {
++    method: "POST",
++    headers: { origin: "https://hq.test", "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++}
++
++test("development route owner boundary", async (t) => {
++  const originalFetch = globalThis.fetch;
++  globalThis.fetch = async () => {
++    throw new Error("admission boundary opened a network socket");
++  };
++
++  try {
++    await t.test("absent synthetic session is 401 and writes nothing", async () => {
++      resetWrites();
++      setAuthResult({ user: null, error: null });
++      const response = await POST(post(input));
++      assert.equal(response.status, 401);
++      assert.deepEqual(await response.json(), { status: "unauthenticated" });
++      assert.equal(writtenRows().length, 0);
++    });
++
++    await t.test("synthetic non-owner is 403 and writes nothing", async () => {
++      resetWrites();
++      setAuthResult({
++        user: { id: "synthetic-stranger", email: "stranger@example.com" },
++        error: null,
++      });
++      const response = await POST(post(input));
++      assert.equal(response.status, 403);
++      assert.deepEqual(await response.json(), { status: "forbidden" });
++      assert.equal(writtenRows().length, 0);
++    });
++
++    await t.test("owner id is the session id, and workspace comes from the server", async () => {
++      resetWrites();
++      setAuthResult({
++        user: { id: "synthetic-owner-id", email: "not-the-owner@example.com" },
++        error: null,
++      });
++      const response = await POST(post(input));
++      assert.equal(response.status, 200);
++      const body = await response.json();
++      assert.equal(body.status, "saved");
++      assert.equal(body.executionRequested, false);
++      assert.equal(body.missionStatus, "draft");
++      assert.equal(writtenRows().length, 1);
++      const row = writtenRows()[0];
++      assert.equal(row.workspace_id, "michael-hq");
++      assert.equal(row.mode_id, "hq");
++      assert.equal(row.status, "draft");
++      assert.equal(row.input.development.createdBy, "synthetic-owner-id");
++    });
++
++    await t.test("owner email still attributes createdBy to the session id", async () => {
++      resetWrites();
++      setAuthResult({
++        user: { id: "synthetic-session-email", email: "Synthetic-Owner@Example.com" },
++        error: null,
++      });
++      const response = await POST(post(input));
++      assert.equal(response.status, 200);
++      assert.equal(writtenRows().length, 1);
++      const createdBy = writtenRows()[0].input.development.createdBy;
++      assert.equal(createdBy, "synthetic-session-email");
++      assert.notEqual(createdBy, "synthetic-owner-id");
++      assert.equal(writtenRows()[0].workspace_id, "michael-hq");
++    });
++
++    await t.test("usurped actor and workspace fields are refused before any write", async () => {
++      resetWrites();
++      setAuthResult({
++        user: { id: "synthetic-owner-id", email: "synthetic-owner@example.com" },
++        error: null,
++      });
++      const response = await POST(post({
++        ...input,
++        createdBy: "synthetic-forged-actor",
++        workspaceId: "synthetic-foreign-workspace",
++        actorId: "synthetic-forged-actor",
++      }));
++      assert.equal(response.status, 400);
++      assert.deepEqual(await response.json(), { status: "invalid_request" });
++      assert.equal(writtenRows().length, 0);
++    });
++
++    await t.test("a production test global does not authorize the development route", async () => {
++      resetWrites();
++      setAuthResult({ user: null, error: null });
++      globalThis.__ownerApiSessionTestResult = null;
++      process.env.NODE_ENV = "production";
++      try {
++        const response = await POST(post(input));
++        assert.equal(response.status, 401);
++        assert.deepEqual(await response.json(), { status: "unauthenticated" });
++        assert.equal(writtenRows().length, 0);
++        const lookup = await GET(new Request(
++          "https://hq.test/api/missions/development?requestId=12345678-1234-4234-8234-123456789abc",
++        ));
++        assert.equal(lookup.status, 401);
++        assert.equal(writtenRows().length, 0);
++      } finally {
++        delete globalThis.__ownerApiSessionTestResult;
++        if (initialNodeEnv === undefined) delete process.env.NODE_ENV;
++        else process.env.NODE_ENV = initialNodeEnv;
++      }
++    });
++  } finally {
++    globalThis.fetch = originalFetch;
++    delete globalThis.__ownerApiSessionTestResult;
++    if (initialNodeEnv === undefined) delete process.env.NODE_ENV;
++    else process.env.NODE_ENV = initialNodeEnv;
++  }
++});
+-- 
+2.43.0
+
