@@ -1,6 +1,6 @@
 # ORIA HQ — orchestration et intégrations
 
-État courant : [contrat de livraison du 1 octobre 2026](docs/HQ-LIVRAISON-2026-10-01.md), avec responsabilités, dépendances et critères vérifiables. Hermes est l'orchestrateur cible; HQ conserve les missions; OpenHands exécute. La mission réelle complète et la validation de la maquette restent à obtenir.
+État courant : [contrat de livraison du 1 octobre 2026](docs/HQ-LIVRAISON-2026-10-01.md), avec responsabilités, dépendances et critères vérifiables. Hermes est identifié et mis à jour sur le VPS; [constats et limites](docs/HQ-HERMES-MISE-A-JOUR-2026-10-01.md). Le [raccordement backend et sa recette indépendante](docs/HQ-COORDINATION-HERMES-2026-10-01.md) constituent le lot suivant. HQ conserve les missions; OpenHands exécute. La mission réelle complète et la validation de la maquette restent à obtenir.
 
 Lot technique accepté dans le candidat `286a211` : 65 tests ciblés, banc PostgreSQL réel, sonde indépendante des erreurs du registre et quatre validations globales réussis. Les délais HTTP et la conservation des coûts incertains sont corrigés. Le budget reste désactivé; aucune mission modèle réelle n'est prouvée par ces tests. La maquette mobile `d821773` passe 33 tests et une recette navigateur; elle attend la validation visuelle de Michael. [Résultats et limites du lot](docs/HQ-BUDGET-ACCEPTATION-2026-10-01.md).
 
@@ -21,7 +21,7 @@ Sur mobile, ces vues se succèdent sans perdre le contexte ; sur ordinateur, ell
 
 ## Responsabilités et frontières
 
-- **Hermes, rôle cible** : recevoir la demande, organiser le travail, sélectionner les outils autorisés, déléguer et suivre le résultat. Ses capacités installées et son raccordement réel restent à qualifier ; le choix d'un modèle n'implique pas que tous les abonnements soient interchangeables.
+- **Hermes, rôle cible** : recevoir la demande, organiser le travail, sélectionner les outils autorisés, déléguer et suivre le résultat. L'installation Hostinger de Nous Research est identifiée et mise à jour en 0.21.5. Son raccordement effectif à HQ et une mission réelle restent à qualifier; le choix d'un modèle n'implique pas que tous les abonnements soient interchangeables.
 - **HQ dans ORIA** conserve l'état officiel des missions, leurs identités, autorisations, décisions et preuves. Hermes et l'interface s'appuient sur ce même registre, sans créer un second suivi concurrent. Les scripts de bridge raccordent les contrats durables au consommateur hôte ; l'entrée Hermes n'est pas encore raccordée de bout en bout.
 - **OpenHands SDK** exécute un dossier borné dans un environnement isolé. `integrations/openhands-runner` contient préparation, consommation, supervision, permissions, passerelle fournisseur et rapports de reprise.
 - **AgentMemory, appuyé ici sur Memex Core**, partage uniquement la mémoire locale de développement entre les agents : décisions, contraintes et transmissions. Ce branchement n'est pas la mémoire d'exploitation d'ORIA, de Hermes ou de HQ ; il ne doit pas contenir de secrets ni de données runtime de production.

@@ -19,7 +19,11 @@
 - [x] Cursor : corriger et qualifier le composant budgétaire désactivé. 65 tests, PostgreSQL réel, sonde indépendante et quatre validations globales passants. Voir `docs/HQ-BUDGET-ACCEPTATION-2026-10-01.md`; activation, devis réels et identité des appelants restent à qualifier.
 - [x] Claude puis Cursor : reproduire et corriger le délai HTTP après les en-têtes; Codex confirme 27 tests et une interruption du corps bloqué à 601–792 ms pour 600 ms demandés. Correctif intégré au candidat validé `286a211`.
 - [x] Faire passer typecheck, lint, build et smoke sur le candidat de code `286a211` (0 erreur lint, 5 avertissements hors lot).
-- [ ] Qualifier le vrai Hermes installé et l'accès modèle autorisé; réaliser la mission complète décrite ci-dessous.
+- [x] Identifier et mettre à jour Hermes Hostinger avec autorisation explicite : version 0.21.5, image épinglée, sauvegarde et ancienne image conservées, santé/auth et conservation des chemins contrôlées. Voir `docs/HQ-HERMES-MISE-A-JOUR-2026-10-01.md`.
+- [ ] Claude : corriger la sonde d'identité Hostinger sans confondre capacités déclarées et preuve fonctionnelle.
+- [ ] Antigravity : livrer le raccordement backend minimal en copie isolée; maquette toujours gelée avant validation.
+- [ ] Cursor : préparer la recette indépendante, puis vérifier le commit du raccordement. Voir `docs/HQ-COORDINATION-HERMES-2026-10-01.md`.
+- [ ] Qualifier les accès réels compte/modèle et exécuter la mission complète décrite ci-dessous.
 - [x] Cursor puis Codex : qualifier les frontières route/owner et les refus SQL avec rôles ordinaires. 10 tests sans exclusion, lint ciblé et banc PostgreSQL `1790843349_80260` réussis; lectures/écritures et lignes inchangées vérifiées. Candidat `cf4fc4a`, aucun code applicatif modifié. [Portée exacte](docs/HQ-FRONTIERES-ACCES-2026-10-01.md); compte réel et worker toujours à qualifier.
 
 ## Implémenté ou qualifié dans un périmètre borné

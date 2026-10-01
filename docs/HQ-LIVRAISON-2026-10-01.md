@@ -2,6 +2,8 @@
 
 ## Pilotage courant — prime sur les états historiques
 
+**Actualisation après mise à jour Hermes :** l'inspection SSH et la mise à jour ont été autorisées puis effectuées. Hermes Hostinger 0.21.5 est identifié, épinglé et contrôlé; [constats et limites](HQ-HERMES-MISE-A-JOUR-2026-10-01.md). Les nouveaux mandats sont dans [la coordination du raccordement](HQ-COORDINATION-HERMES-2026-10-01.md) : Antigravity construit le chaînon backend, Cursor prépare la recette indépendante, Claude corrige la sonde. La maquette reste gelée jusqu'à validation visuelle. Le backend isolé peut avancer dès maintenant.
+
 L'objectif reste une application quotidienne dans ORIA : Hermes comme interlocuteur et orchestrateur, HQ comme registre canonique des missions et autorisations, OpenHands comme exécutant. Discuter et Atelier présentent le même travail. AgentMemory partage seulement le contexte local de développement.
 
 ### Résultat et limites du lot actuel
@@ -18,7 +20,7 @@ La migration budget reste désactivée dans l'application active. Aucun tarif, p
 **Qualification locale complémentaire terminée :** candidat `cf4fc4a`, arbre `73f9985`. Cursor a livré les bancs, Codex les a revus et exécutés : 10 tests ciblés sans exclusion, lint ciblé et PostgreSQL réel `1790843349_80260` réussis. Assemblage route/owner avec identités synthétiques; refus de lecture/écriture sous rôles PostgreSQL ordinaires, contrôle du rôle effectif et absence de mutation des lignes complètes. Aucune migration ni logique applicative changée. [Résultats et limites](HQ-FRONTIERES-ACCES-2026-10-01.md). Le lot est clos; la prochaine étape dépend de l'accès autorisé à Hermes et de la validation visuelle, pas d'un nouvel audit.
 
 1. **Lot courant clos techniquement.** Cursor a remis son dernier patch, base, arbre, empreinte et tests; Codex a contrôlé puis exécuté `npm run typecheck`, `npm run lint`, `npm run build`, `npm run smoke:joris` sur l'arbre assemblé. Publication sur la branche de travail; aucune fusion principale implicite. Cursor a terminé cette remise.
-2. **Qualifier Hermes avec l'accès autorisé.** Claude réutilise sa sonde existante. Livrer version/source réellement installée, transport disponible, schéma des capacités, mode de compte et prérequis. Pas de secret dans le rapport, pas de requête modèle pour identifier le service. L'accès SSH en lecture seule reste en attente après refus automatique : aucun contournement ni relance sans autorisation. La disponibilité d'un abonnement ne prouve pas celle d'une API.
+2. **Identification et mise à jour Hermes terminées.** Codex a inspecté et mis à jour le runtime avec autorisation explicite. Claude adapte sa sonde au conditionnement Hostinger réellement observé. Les capacités authentifiées de l'instance active et le compte/modèle nécessaire à une mission restent à qualifier; les capacités annoncées par une instance jetable ne les démontrent pas. La disponibilité d'un abonnement ne prouve pas celle d'une API.
 3. **Raccorder une seule chaîne.** Après ce constat, Antigravity reprend le bridge existant vers le service HQ et le worker OpenHands. Une identité de mission, admission distincte de l'autorisation, pas de second orchestrateur. Construire en copie isolée avec un sous-agent de revue en lecture seule. La maquette ne rejoint le produit qu'après validation visuelle. Cursor revoit les contrats et preuves, sans modifier les fichiers du constructeur.
 4. **Livrer une mission observable.** Directive depuis HQ authentifié → mission unique → autorisation bornée → modification isolée par le vrai modèle → tests → revue indépendante → aperçu accessible. Prouver refus sans émission, seconde demande identique sans second lancement, reconnexion et reprise sans perte du résultat. Aucun `PASS` métier tiré d'une fixture ou d'un simple conteneur terminé.
 5. **Achever l'usage quotidien.** Une fois cette mission réussie : brancher les vues Aujourd'hui/Discuter/Atelier aux événements réels, rendre les indisponibilités explicites, vérifier mobile et clavier, puis mesurer durée, usage disponible et interventions. Finaliser README, tâches et mémoire à partir de ces preuves.
@@ -30,7 +32,7 @@ Un rapport court : dépôt, base, commit/arbre, fichiers changés, commandes ré
 ### Prérequis encore ouverts
 
 - Validation visuelle de Michael avant intégration de la maquette.
-- Autorisation d'inspection VPS et identification du véritable runtime Hermes.
+- Capacités authentifiées de l'instance active Hermes et branchement effectif au service HQ; identification et mise à jour du runtime terminées.
 - Profil/compte, modèle et enveloppe de la mission réelle confirmés; aucun passage silencieux vers une API payante.
 - Qualification de l'identité HTTP/RLS et du worker sur le parcours réellement raccordé.
 

@@ -8,10 +8,12 @@ Une seule expérience : Discuter et Atelier, même contexte de projet et même m
 
 Mise à jour du 1 octobre 2026 : [contrat de livraison](HQ-LIVRAISON-2026-10-01.md). Cette répartition est la seule utilisée pour attribuer le travail courant.
 
-- Claude Code : `owner.ts`, formulaire de mission et tests directs, pour les accès et la reprise. Session `38383533`. Sonde Hermes déjà livrée; ne pas relancer cette recherche ni reprendre le backend.
-- Cursor : AI/router, `brain.ts`, `mission-draft-control.ts` et tests directement affectés, pour le modèle exécuté et les coûts. Corriger les appelants affectés sans nouveau consentement payant implicite. Ne touche pas à l'admission ou à la maquette.
-- Antigravity : CLI/service/handlers d'admission, harnais PostgreSQL/PostgREST et preuves. Sous-agent frontend sur la maquette séparée, sous-agent de revue sans modification concurrente des mêmes fichiers. Aucun changement UI canonique avant validation Michael.
+- Claude Code : correction de la sonde `integrations/hermes-runtime-probe/` dans son worktree Orchestrator, pour reconnaître l'installation Hostinger observée et distinguer identité, capacités déclarées et qualification. Aucun fichier produit HQ.
+- Cursor : recette indépendante du raccordement, tests et rapport dans `handoffs/cursor-hermes-acceptance/`. Aucun changement au backend du constructeur, au routeur ou à la maquette. Revue finale sur le commit remis par Antigravity.
+- Antigravity : raccordement minimal Hermes vers les services HQ existants en copie backend isolée. Un sous-agent de revue en lecture seule au besoin. La maquette `d821773` et ses previews restent gelés; aucun changement UI canonique avant validation Michael.
 - Codex : vérification indépendante, cohérence des contrats, préparation de l'assemblage et documentation. Une suite verte isolée ne vaut pas acceptation du parcours complet.
+
+Mandat courant détaillé : [coordination après mise à jour Hermes](HQ-COORDINATION-HERMES-2026-10-01.md). Le constat VPS est disponible dans [le rapport de mise à jour](HQ-HERMES-MISE-A-JOUR-2026-10-01.md). Les anciens lots d'accès, de routage et de base de données restent clos dans leur périmètre qualifié.
 
 Résultats et limites : [revue de livraison](HQ-REVUE-LIVRAISON-2026-10-01.md). Les anciens mandats ci-dessous sont conservés uniquement pour l'historique.
 
