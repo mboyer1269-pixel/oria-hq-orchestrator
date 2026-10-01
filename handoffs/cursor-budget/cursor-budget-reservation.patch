@@ -1,0 +1,2110 @@
+From 4412af09ea1dca2b0610c5ae0106d7b4cd4e0f9a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 07:20:48 +0000
+Subject: [PATCH 1/2] Reserve HQ calls from a server USD-cent quote before the
+ socket opens.
+
+Routing weights stay on the ladder. A missing quote or ceiling sends nothing.
+One caller owns the emit right, and an unknown emission is not released by time.
+---
+ db/migrations/0028_call_reservation.sql       | 427 ++++++++++++++
+ .../0028_call_reservation_revert.sql          |  14 +
+ .../0028_call_reservation_verify.sql          |  71 +++
+ proofs/prove-call-reservation-real-db.mjs     | 124 ++++
+ proofs/run-call-reservation-real-db.sh        |  82 +++
+ src/server/ai/call-accounting.ts              |  14 +-
+ src/server/ai/call-reservation.test.mjs       | 551 ++++++++++++++++++
+ src/server/ai/call-reservation.ts             | 338 +++++++++++
+ src/server/ai/llm-json-provider.ts            | 119 +++-
+ src/server/db/types.ts                        |  95 ++-
+ 10 files changed, 1819 insertions(+), 16 deletions(-)
+ create mode 100644 db/migrations/0028_call_reservation.sql
+ create mode 100644 db/migrations/0028_call_reservation_revert.sql
+ create mode 100644 db/migrations/0028_call_reservation_verify.sql
+ create mode 100644 proofs/prove-call-reservation-real-db.mjs
+ create mode 100644 proofs/run-call-reservation-real-db.sh
+ create mode 100644 src/server/ai/call-reservation.test.mjs
+ create mode 100644 src/server/ai/call-reservation.ts
+
+diff --git a/db/migrations/0028_call_reservation.sql b/db/migrations/0028_call_reservation.sql
+new file mode 100644
+index 0000000..8a9d9d4
+--- /dev/null
++++ b/db/migrations/0028_call_reservation.sql
+@@ -0,0 +1,427 @@
++-- 0028_call_reservation.sql
++--
++-- Durable USD-cent reservation for one HQ provider attempt.
++-- Qualification / staging only. Do not apply to production without a separate
++-- written GO. Applying this file inserts no ceiling, no quote, and does not
++-- turn HQ_CALL_RESERVATION on.
++--
++-- Contract:
++--   * Unit is integer USD cents. Routing weights are not stored and are not
++--     converted into cents.
++--   * A send requires a server ceiling row and a reliable server quote that
++--     covers the max tokens of that attempt. The function takes no amount
++--     argument. The client cannot name a price or a cap.
++--   * One caller wins hq_call_emit_right for (workspace, subject) while the
++--     ceiling row is locked. A unique key is not the mutex. Another caller
++--     is lost and cannot emit any provider, including a fallback.
++--   * Only the winning caller can reserve an already-authorized fallback,
++--     and that fallback repeats the quote and ceiling check.
++--   * held may be released before the socket. emitted_unknown stays until
++--     an explicit consume. There is no expiry column and no TTL release.
++--   * Consumed and emitted rows keep reserved_cents. Nothing writes zero.
++--   * The ledger caps reserved quotes. It does not cap a provider invoice.
++--
++-- Revert: 0028_call_reservation_revert.sql
++-- Read-only check: 0028_call_reservation_verify.sql
++
++create table if not exists public.hq_call_budget_ceiling (
++  workspace_id text primary key,
++  currency text not null
++    constraint hq_call_budget_ceiling_currency_check
++    check (currency = 'USD'),
++  max_amount_cents bigint not null
++    constraint hq_call_budget_ceiling_amount_check
++    check (max_amount_cents >= 0 and max_amount_cents <= 9007199254740991),
++  created_at timestamptz not null default now()
++);
++
++create table if not exists public.hq_call_budget_quote (
++  provider text not null
++    constraint hq_call_budget_quote_provider_check
++    check (provider in ('anthropic', 'openai')),
++  model_id text not null,
++  currency text not null
++    constraint hq_call_budget_quote_currency_check
++    check (currency = 'USD'),
++  not_to_exceed_cents bigint not null
++    constraint hq_call_budget_quote_amount_check
++    check (not_to_exceed_cents > 0 and not_to_exceed_cents <= 9007199254740991),
++  covers_max_tokens integer not null
++    constraint hq_call_budget_quote_tokens_check
++    check (covers_max_tokens > 0),
++  reliable boolean not null,
++  created_at timestamptz not null default now(),
++  primary key (provider, model_id)
++);
++
++-- Winner of the right to emit for one call, including its fallbacks.
++-- The ceiling lock below is the mutex. This primary key is the backstop.
++create table if not exists public.hq_call_emit_right (
++  workspace_id text not null,
++  subject_id text not null,
++  caller_id text not null,
++  created_at timestamptz not null default now(),
++  primary key (workspace_id, subject_id)
++);
++
++create table if not exists public.hq_call_reservation (
++  workspace_id text not null,
++  subject_id text not null,
++  provider text not null
++    constraint hq_call_reservation_provider_check
++    check (provider in ('anthropic', 'openai')),
++  caller_id text not null,
++  access_class text not null
++    constraint hq_call_reservation_access_class_check
++    check (access_class = 'api'),
++  currency text not null
++    constraint hq_call_reservation_currency_check
++    check (currency = 'USD'),
++  reserved_cents bigint not null
++    constraint hq_call_reservation_cents_check
++    check (reserved_cents > 0 and reserved_cents <= 9007199254740991),
++  state text not null
++    constraint hq_call_reservation_state_check
++    check (state in ('held', 'released', 'emitted_unknown', 'consumed')),
++  reconciliation_required boolean not null default false,
++  model_id text not null,
++  max_tokens integer not null
++    constraint hq_call_reservation_max_tokens_check
++    check (max_tokens > 0),
++  network_emitted boolean not null default false,
++  created_at timestamptz not null default now(),
++  updated_at timestamptz not null default now(),
++  primary key (workspace_id, subject_id, provider),
++  constraint hq_call_reservation_state_flags_check
++    check (
++      (state = 'held' and network_emitted = false and reconciliation_required = false)
++      or (state = 'released' and network_emitted = false and reconciliation_required = false)
++      or (state = 'emitted_unknown' and network_emitted = true and reconciliation_required = true)
++      or (state = 'consumed' and network_emitted = true and reconciliation_required = false)
++    )
++);
++
++alter table public.hq_call_budget_ceiling enable row level security;
++alter table public.hq_call_budget_quote enable row level security;
++alter table public.hq_call_emit_right enable row level security;
++alter table public.hq_call_reservation enable row level security;
++
++create index if not exists hq_call_reservation_workspace_state_idx
++  on public.hq_call_reservation (workspace_id, state);
++
++create or replace function public.hq_reserve_call_attempt(
++  p_workspace_id text,
++  p_subject_id text,
++  p_caller_id text,
++  p_provider text,
++  p_model_id text,
++  p_access_class text,
++  p_max_tokens integer
++) returns jsonb
++language plpgsql
++security definer
++set search_path = public
++as $$
++declare
++  v_ceiling bigint;
++  v_quote bigint;
++  v_owner text;
++  v_active boolean;
++  v_used bigint;
++  v_existing public.hq_call_reservation%rowtype;
++  v_had_existing boolean := false;
++begin
++  if p_workspace_id is null or char_length(btrim(p_workspace_id)) not between 1 and 160
++     or p_subject_id is null or char_length(btrim(p_subject_id)) not between 1 and 200
++     or p_caller_id is null or char_length(btrim(p_caller_id)) not between 1 and 80
++     or p_provider is null or p_provider not in ('anthropic', 'openai')
++     or p_model_id is null or char_length(btrim(p_model_id)) not between 1 and 160 then
++    return jsonb_build_object('status', 'refused', 'reason', 'identity', 'currency', null, 'reservedCents', null);
++  end if;
++
++  if p_access_class is distinct from 'api' then
++    return jsonb_build_object(
++      'status', 'refused',
++      'reason', 'access_class',
++      'accessClass', p_access_class,
++      'currency', null,
++      'reservedCents', null
++    );
++  end if;
++
++  if p_max_tokens is null or p_max_tokens < 1 or p_max_tokens > 200000 then
++    return jsonb_build_object('status', 'refused', 'reason', 'estimate_insufficient', 'currency', null, 'reservedCents', null);
++  end if;
++
++  select max_amount_cents into v_ceiling
++  from public.hq_call_budget_ceiling
++  where workspace_id = p_workspace_id
++    and currency = 'USD'
++  for update;
++
++  if not found then
++    return jsonb_build_object('status', 'unavailable', 'reason', 'ceiling_not_configured', 'currency', null, 'reservedCents', null);
++  end if;
++
++  select not_to_exceed_cents into v_quote
++  from public.hq_call_budget_quote
++  where provider = p_provider
++    and model_id = p_model_id
++    and currency = 'USD'
++    and reliable = true
++    and covers_max_tokens >= p_max_tokens;
++
++  if not found then
++    return jsonb_build_object('status', 'refused', 'reason', 'estimate_insufficient', 'currency', null, 'reservedCents', null);
++  end if;
++
++  select caller_id into v_owner
++  from public.hq_call_emit_right
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++  for update;
++
++  select exists (
++    select 1
++    from public.hq_call_reservation
++    where workspace_id = p_workspace_id
++      and subject_id = p_subject_id
++      and state in ('held', 'emitted_unknown', 'consumed')
++  ) into v_active;
++
++  if v_owner is not null and v_owner is distinct from p_caller_id and v_active then
++    return jsonb_build_object('status', 'lost', 'reason', 'emit_right_held', 'currency', null, 'reservedCents', null);
++  end if;
++
++  if v_owner is null then
++    insert into public.hq_call_emit_right (workspace_id, subject_id, caller_id)
++    values (p_workspace_id, p_subject_id, p_caller_id);
++  elsif v_owner is distinct from p_caller_id then
++    update public.hq_call_emit_right
++    set caller_id = p_caller_id
++    where workspace_id = p_workspace_id
++      and subject_id = p_subject_id;
++  end if;
++
++  select * into v_existing
++  from public.hq_call_reservation
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++    and provider = p_provider
++  for update;
++  v_had_existing := found;
++
++  if v_had_existing and v_existing.state <> 'released' then
++    return jsonb_build_object(
++      'status', 'duplicate',
++      'currency', 'USD',
++      'reservedCents', v_existing.reserved_cents,
++      'networkEmitted', v_existing.network_emitted,
++      'reconciliationRequired', v_existing.reconciliation_required
++    );
++  end if;
++
++  select coalesce(sum(reserved_cents), 0) into v_used
++  from public.hq_call_reservation
++  where workspace_id = p_workspace_id
++    and state in ('held', 'emitted_unknown', 'consumed');
++
++  if v_used + v_quote > v_ceiling then
++    return jsonb_build_object('status', 'refused', 'reason', 'ceiling_exhausted', 'currency', null, 'reservedCents', null);
++  end if;
++
++  if v_had_existing then
++    update public.hq_call_reservation
++    set caller_id = p_caller_id,
++        access_class = 'api',
++        currency = 'USD',
++        reserved_cents = v_quote,
++        state = 'held',
++        reconciliation_required = false,
++        model_id = p_model_id,
++        max_tokens = p_max_tokens,
++        network_emitted = false,
++        updated_at = now()
++    where workspace_id = p_workspace_id
++      and subject_id = p_subject_id
++      and provider = p_provider;
++  else
++    insert into public.hq_call_reservation (
++      workspace_id, subject_id, provider, caller_id, access_class, currency,
++      reserved_cents, state, reconciliation_required, model_id, max_tokens, network_emitted
++    ) values (
++      p_workspace_id, p_subject_id, p_provider, p_caller_id, 'api', 'USD',
++      v_quote, 'held', false, p_model_id, p_max_tokens, false
++    );
++  end if;
++
++  return jsonb_build_object(
++    'status', 'held',
++    'currency', 'USD',
++    'reservedCents', v_quote,
++    'networkEmitted', false,
++    'reconciliationRequired', false
++  );
++end;
++$$;
++
++create or replace function public.hq_release_call_attempt(
++  p_workspace_id text,
++  p_subject_id text,
++  p_caller_id text,
++  p_provider text
++) returns jsonb
++language plpgsql
++security definer
++set search_path = public
++as $$
++declare
++  v_existing public.hq_call_reservation%rowtype;
++begin
++  select * into v_existing
++  from public.hq_call_reservation
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++    and provider = p_provider
++  for update;
++
++  if not found then
++    return jsonb_build_object('status', 'unavailable', 'reason', 'not_found', 'currency', null, 'reservedCents', null);
++  end if;
++
++  if v_existing.caller_id is distinct from p_caller_id
++     or v_existing.network_emitted
++     or v_existing.state <> 'held' then
++    return jsonb_build_object(
++      'status', v_existing.state,
++      'reason', 'release_refused',
++      'currency', case when v_existing.network_emitted then 'USD' else null end,
++      'reservedCents', case when v_existing.network_emitted then v_existing.reserved_cents else null end,
++      'networkEmitted', v_existing.network_emitted,
++      'reconciliationRequired', v_existing.reconciliation_required
++    );
++  end if;
++
++  update public.hq_call_reservation
++  set state = 'released',
++      updated_at = now()
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++    and provider = p_provider;
++
++  return jsonb_build_object(
++    'status', 'released',
++    'currency', null,
++    'reservedCents', null,
++    'networkEmitted', false,
++    'reconciliationRequired', false
++  );
++end;
++$$;
++
++create or replace function public.hq_mark_call_emitted(
++  p_workspace_id text,
++  p_subject_id text,
++  p_caller_id text,
++  p_provider text
++) returns jsonb
++language plpgsql
++security definer
++set search_path = public
++as $$
++declare
++  v_existing public.hq_call_reservation%rowtype;
++begin
++  select * into v_existing
++  from public.hq_call_reservation
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++    and provider = p_provider
++  for update;
++
++  if not found
++     or v_existing.caller_id is distinct from p_caller_id
++     or v_existing.state <> 'held'
++     or v_existing.network_emitted then
++    return jsonb_build_object('status', 'refused', 'reason', 'not_held', 'currency', null, 'reservedCents', null);
++  end if;
++
++  update public.hq_call_reservation
++  set state = 'emitted_unknown',
++      network_emitted = true,
++      reconciliation_required = true,
++      updated_at = now()
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++    and provider = p_provider;
++
++  return jsonb_build_object(
++    'status', 'emitted_unknown',
++    'currency', 'USD',
++    'reservedCents', v_existing.reserved_cents,
++    'networkEmitted', true,
++    'reconciliationRequired', true
++  );
++end;
++$$;
++
++create or replace function public.hq_consume_call_attempt(
++  p_workspace_id text,
++  p_subject_id text,
++  p_caller_id text,
++  p_provider text
++) returns jsonb
++language plpgsql
++security definer
++set search_path = public
++as $$
++declare
++  v_existing public.hq_call_reservation%rowtype;
++begin
++  select * into v_existing
++  from public.hq_call_reservation
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++    and provider = p_provider
++  for update;
++
++  if not found
++     or v_existing.caller_id is distinct from p_caller_id
++     or v_existing.state <> 'emitted_unknown'
++     or not v_existing.network_emitted then
++    return jsonb_build_object('status', 'refused', 'reason', 'not_emitted', 'currency', null, 'reservedCents', null);
++  end if;
++
++  update public.hq_call_reservation
++  set state = 'consumed',
++      reconciliation_required = false,
++      updated_at = now()
++  where workspace_id = p_workspace_id
++    and subject_id = p_subject_id
++    and provider = p_provider;
++
++  return jsonb_build_object(
++    'status', 'consumed',
++    'currency', 'USD',
++    'reservedCents', v_existing.reserved_cents,
++    'networkEmitted', true,
++    'reconciliationRequired', false
++  );
++end;
++$$;
++
++revoke all on function public.hq_reserve_call_attempt(text, text, text, text, text, text, integer) from public;
++revoke all on function public.hq_release_call_attempt(text, text, text, text) from public;
++revoke all on function public.hq_mark_call_emitted(text, text, text, text) from public;
++revoke all on function public.hq_consume_call_attempt(text, text, text, text) from public;
++
++do $$
++begin
++  if exists (select 1 from pg_roles where rolname = 'service_role') then
++    grant execute on function public.hq_reserve_call_attempt(text, text, text, text, text, text, integer) to service_role;
++    grant execute on function public.hq_release_call_attempt(text, text, text, text) to service_role;
++    grant execute on function public.hq_mark_call_emitted(text, text, text, text) to service_role;
++    grant execute on function public.hq_consume_call_attempt(text, text, text, text) to service_role;
++  end if;
++end
++$$;
+diff --git a/db/migrations/0028_call_reservation_revert.sql b/db/migrations/0028_call_reservation_revert.sql
+new file mode 100644
+index 0000000..0be3003
+--- /dev/null
++++ b/db/migrations/0028_call_reservation_revert.sql
+@@ -0,0 +1,14 @@
++-- 0028_call_reservation_revert.sql
++-- Drops the USD-cent reservation ledger. Rows still marked emitted_unknown
++-- are deleted with the tables. Do not run this while a hold still needs
++-- reconciliation unless that loss is accepted in writing.
++
++drop function if exists public.hq_consume_call_attempt(text, text, text, text);
++drop function if exists public.hq_mark_call_emitted(text, text, text, text);
++drop function if exists public.hq_release_call_attempt(text, text, text, text);
++drop function if exists public.hq_reserve_call_attempt(text, text, text, text, text, text, integer);
++
++drop table if exists public.hq_call_reservation;
++drop table if exists public.hq_call_emit_right;
++drop table if exists public.hq_call_budget_quote;
++drop table if exists public.hq_call_budget_ceiling;
+diff --git a/db/migrations/0028_call_reservation_verify.sql b/db/migrations/0028_call_reservation_verify.sql
+new file mode 100644
+index 0000000..5ba683f
+--- /dev/null
++++ b/db/migrations/0028_call_reservation_verify.sql
+@@ -0,0 +1,71 @@
++-- 0028_call_reservation_verify.sql — READ-ONLY post-apply check.
++-- Expected notes are comments. This file does not insert a ceiling or a quote.
++
++-- Expected: the four ledger tables.
++select table_name
++from information_schema.tables
++where table_schema = 'public'
++  and table_name in (
++    'hq_call_budget_ceiling',
++    'hq_call_budget_quote',
++    'hq_call_emit_right',
++    'hq_call_reservation'
++  )
++order by table_name;
++
++-- Expected: 0. No routing weight, no USD-null column, no TTL column.
++select count(*) as forbidden_columns
++from information_schema.columns
++where table_schema = 'public'
++  and table_name in (
++    'hq_call_budget_ceiling',
++    'hq_call_budget_quote',
++    'hq_call_emit_right',
++    'hq_call_reservation'
++  )
++  and (
++    column_name = 'relative_weight'
++    or column_name = 'monetary_usd'
++    or column_name = 'expires_at'
++    or column_name like '%ttl%'
++  );
++
++-- Expected: currency constrained to USD, cents strictly positive on a hold.
++select conname
++from pg_constraint
++where conname in (
++  'hq_call_budget_ceiling_currency_check',
++  'hq_call_budget_quote_currency_check',
++  'hq_call_reservation_currency_check',
++  'hq_call_reservation_cents_check',
++  'hq_call_reservation_state_flags_check'
++)
++order by conname;
++
++-- Expected: both rowsecurity values true on every ledger table.
++select relname, relrowsecurity
++from pg_class
++where relname in (
++  'hq_call_budget_ceiling',
++  'hq_call_budget_quote',
++  'hq_call_emit_right',
++  'hq_call_reservation'
++)
++order by relname;
++
++-- Expected: 4 functions. None of them expires a hold.
++select proname
++from pg_proc
++where pronamespace = 'public'::regnamespace
++  and proname in (
++    'hq_reserve_call_attempt',
++    'hq_release_call_attempt',
++    'hq_mark_call_emitted',
++    'hq_consume_call_attempt'
++  )
++order by proname;
++
++-- Expected: 0 and 0. Migration does not seed a ceiling or a quote.
++select
++  (select count(*) from public.hq_call_budget_ceiling) as ceiling_rows,
++  (select count(*) from public.hq_call_budget_quote) as quote_rows;
+diff --git a/proofs/prove-call-reservation-real-db.mjs b/proofs/prove-call-reservation-real-db.mjs
+new file mode 100644
+index 0000000..6786402
+--- /dev/null
++++ b/proofs/prove-call-reservation-real-db.mjs
+@@ -0,0 +1,124 @@
++/**
++ * Assertions against the disposable PostgreSQL started by
++ * proofs/run-call-reservation-real-db.sh. No model and no provider network.
++ * The 40 and 80 cent rows are fixtures for this process, not a tariff.
++ */
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++
++const container = process.env.PG_CONTAINER;
++if (!container) {
++  console.error("PG_CONTAINER manquant");
++  process.exit(1);
++}
++
++const RESTART_SQL = "select (select coalesce(string_agg(line, ',' order by line), '') from (select state || '|' || reconciliation_required::text || '|' || reserved_cents::text || '|' || count(*)::text as line from public.hq_call_reservation group by state, reconciliation_required, reserved_cents) s) || ';' || (select count(*)::text from public.hq_call_emit_right);";
++
++function psql(sql) {
++  return new Promise((resolve, reject) => {
++    const child = spawn(
++      "docker",
++      ["exec", container, "psql", "-h", "127.0.0.1", "-U", "postgres", "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql],
++      { stdio: ["ignore", "pipe", "pipe"] },
++    );
++    let stdout = "";
++    let stderr = "";
++    const timer = setTimeout(() => {
++      child.kill("SIGKILL");
++      reject(new Error(`psql timeout: ${sql.slice(0, 80)}`));
++    }, 8000);
++    child.stdout.on("data", (chunk) => { stdout += chunk; });
++    child.stderr.on("data", (chunk) => { stderr += chunk; });
++    child.on("error", (error) => {
++      clearTimeout(timer);
++      reject(error);
++    });
++    child.on("close", (code) => {
++      clearTimeout(timer);
++      if (code !== 0) reject(new Error(stderr || stdout || `psql ${code}`));
++      else resolve(stdout.trim());
++    });
++  });
++}
++
++function quote(value) {
++  return `'${String(value).replaceAll("'", "''")}'`;
++}
++
++function field(jsonText, name) {
++  return JSON.parse(jsonText)[name];
++}
++
++function reserve(workspaceId, subjectId, callerId, provider, modelId, maxTokens = 2048, accessClass = "api") {
++  return psql(
++    `select public.hq_reserve_call_attempt(${quote(workspaceId)}, ${quote(subjectId)}, ${quote(callerId)}, ${quote(provider)}, ${quote(modelId)}, ${quote(accessClass)}, ${Number(maxTokens)});`,
++  );
++}
++
++await psql("insert into public.hq_call_budget_ceiling (workspace_id, currency, max_amount_cents) values ('ws-a', 'USD', 100), ('ws-b', 'USD', 500);");
++await psql(`insert into public.hq_call_budget_quote (provider, model_id, currency, not_to_exceed_cents, covers_max_tokens, reliable) values
++  ('openai', 'gpt-4o-mini', 'USD', 40, 2048, true),
++  ('anthropic', 'claude-haiku-4-5-20251001', 'USD', 80, 2048, true),
++  ('openai', 'gpt-4o', 'USD', 50, 2048, false);`);
++
++const forbidden = await psql("select count(*) from information_schema.columns where table_schema = 'public' and table_name in ('hq_call_budget_ceiling', 'hq_call_budget_quote', 'hq_call_emit_right', 'hq_call_reservation') and (column_name = 'relative_weight' or column_name = 'monetary_usd' or column_name = 'expires_at' or column_name like '%ttl%');");
++assert.equal(forbidden, "0");
++
++const [first, second] = await Promise.all([
++  reserve("ws-a", "mission-1", "caller-a", "openai", "gpt-4o-mini"),
++  reserve("ws-a", "mission-1", "caller-b", "openai", "gpt-4o-mini"),
++]);
++const statuses = [field(first, "status"), field(second, "status")].sort();
++assert.deepEqual(statuses, ["held", "lost"], `concurrence ${statuses.join(",")}`);
++const winner = field(first, "status") === "held" ? first : second;
++const loser = winner === first ? second : first;
++assert.equal(field(winner, "currency"), "USD");
++assert.equal(field(winner, "reservedCents"), 40);
++assert.equal(field(loser, "reason"), "emit_right_held");
++assert.equal(field(loser, "reservedCents"), null);
++assert.equal(Object.hasOwn(JSON.parse(winner), "relativeWeight"), false);
++
++const stolenFallback = await reserve("ws-a", "mission-1", "caller-b", "anthropic", "claude-haiku-4-5-20251001");
++assert.equal(field(stolenFallback, "status"), "lost");
++assert.equal(field(stolenFallback, "reason"), "emit_right_held");
++
++const winnerFallback = await reserve("ws-a", "mission-1", "caller-a", "anthropic", "claude-haiku-4-5-20251001");
++assert.equal(field(winnerFallback, "status"), "refused");
++assert.equal(field(winnerFallback, "reason"), "ceiling_exhausted");
++assert.equal(await psql("select count(*) from public.hq_call_reservation where workspace_id = 'ws-a';"), "1");
++
++const marked = await psql("select public.hq_mark_call_emitted('ws-a', 'mission-1', 'caller-a', 'openai');");
++assert.equal(field(marked, "status"), "emitted_unknown");
++assert.equal(field(marked, "reconciliationRequired"), true);
++assert.equal(field(marked, "currency"), "USD");
++assert.equal(field(marked, "reservedCents"), 40);
++
++const released = await psql("select public.hq_release_call_attempt('ws-a', 'mission-1', 'caller-a', 'openai');");
++assert.equal(field(released, "reason"), "release_refused");
++assert.equal(field(released, "status"), "emitted_unknown");
++assert.equal(field(released, "reservedCents"), 40);
++assert.notEqual(field(released, "reservedCents"), 0);
++assert.equal(await psql("select reserved_cents::text || '|' || state from public.hq_call_reservation where workspace_id = 'ws-a';"), "40|emitted_unknown");
++
++const isolated = await reserve("ws-b", "mission-1", "caller-c", "openai", "gpt-4o-mini");
++assert.equal(field(isolated, "status"), "held");
++assert.equal(field(isolated, "reservedCents"), 40);
++const isolatedFallback = await reserve("ws-b", "mission-1", "caller-c", "anthropic", "claude-haiku-4-5-20251001");
++assert.equal(field(isolatedFallback, "status"), "held");
++assert.equal(field(isolatedFallback, "reservedCents"), 80);
++
++const notApi = await reserve("ws-b", "mission-2", "caller-c", "openai", "gpt-4o-mini", 2048, "local");
++assert.equal(field(notApi, "status"), "refused");
++assert.equal(field(notApi, "reason"), "access_class");
++
++const unreliable = await reserve("ws-b", "mission-3", "caller-c", "openai", "gpt-4o");
++assert.equal(field(unreliable, "status"), "refused");
++assert.equal(field(unreliable, "reason"), "estimate_insufficient");
++
++const uncovered = await reserve("ws-b", "mission-4", "caller-c", "openai", "gpt-4o-mini", 2049);
++assert.equal(field(uncovered, "status"), "refused");
++assert.equal(field(uncovered, "reason"), "estimate_insufficient");
++
++const before = await psql(RESTART_SQL);
++assert.equal(before, "emitted_unknown|true|40|1,held|false|40|1,held|false|80|1;2");
++process.stdout.write(`BEFORE_RESTART ${before}\n`);
+diff --git a/proofs/run-call-reservation-real-db.sh b/proofs/run-call-reservation-real-db.sh
+new file mode 100644
+index 0000000..8fecb02
+--- /dev/null
++++ b/proofs/run-call-reservation-real-db.sh
+@@ -0,0 +1,82 @@
++#!/bin/sh
++# Disposable PostgreSQL qualification for the call-reservation ledger.
++# No provider network and no model call. If Docker is absent, exit 127
++# and print NON EXECUTE. Do not treat that exit as a passed proof.
++
++set -eu
++
++ROOT="${1:-$(pwd)}"
++
++if ! command -v docker >/dev/null 2>&1 || ! timeout -k 2 5 docker info >/dev/null 2>&1 < /dev/null; then
++  echo "NON EXECUTE: Docker est absent. Le script n'a pas appliqué la migration et n'a pas exécuté les assertions PostgreSQL." >&2
++  exit 127
++fi
++
++NODE_BIN=$(command -v node || true)
++if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
++  echo "Node.js introuvable" >&2
++  exit 1
++fi
++
++RUN_ID="$(date +%s)_$$"
++PG_IMAGE="postgres:16.4-alpine"
++VOLUME="oria-reservation-$RUN_ID"
++NET="oria-reservation-net-$RUN_ID"
++PG_NAME="oria-reservation-pg-$RUN_ID"
++pg=""
++
++cleanup() {
++  echo "--- Nettoyage des ressources jetables du run $RUN_ID ---"
++  if [ -n "$pg" ]; then
++    timeout -k 2 10 docker rm -f "$pg" >/dev/null 2>&1 < /dev/null || true
++  fi
++  timeout -k 2 10 docker network rm "$NET" >/dev/null 2>&1 < /dev/null || true
++  timeout -k 2 10 docker volume rm "$VOLUME" >/dev/null 2>&1 < /dev/null || true
++}
++trap cleanup EXIT INT TERM
++
++timeout -k 2 15 docker network create "$NET" >/dev/null < /dev/null
++timeout -k 2 15 docker volume create "$VOLUME" >/dev/null < /dev/null
++pg=$(timeout -k 2 25 docker run -d \
++  --name "$PG_NAME" \
++  --network "$NET" \
++  --memory 256m --cpus 0.5 --pids-limit 128 \
++  --mount "type=volume,src=$VOLUME,dst=/var/lib/postgresql/data" \
++  -e POSTGRES_HOST_AUTH_METHOD=trust \
++  -e POSTGRES_DB=postgres \
++  -p 127.0.0.1:0:5432 \
++  "$PG_IMAGE" < /dev/null)
++
++i=0
++until timeout -k 2 3 docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 < /dev/null; do
++  i=$((i+1))
++  [ "$i" -lt 80 ] || { echo "PostgreSQL n'est pas devenu prêt" >&2; exit 1; }
++  sleep 0.25
++done
++
++timeout -k 2 15 docker exec -i "$pg" psql -h 127.0.0.1 -U postgres -X -q -v ON_ERROR_STOP=1 \
++  < "$ROOT/db/migrations/0028_call_reservation.sql"
++
++before=$(PG_CONTAINER="$pg" "$NODE_BIN" "$ROOT/proofs/prove-call-reservation-real-db.mjs" | sed -n 's/^BEFORE_RESTART //p')
++[ -n "$before" ] || { echo "Assertion avant redémarrage absente" >&2; exit 1; }
++
++timeout -k 2 15 docker stop "$pg" >/dev/null < /dev/null
++timeout -k 2 15 docker start "$pg" >/dev/null < /dev/null
++i=0
++until timeout -k 2 3 docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 < /dev/null; do
++  i=$((i+1))
++  [ "$i" -lt 80 ] || { echo "PostgreSQL n'a pas redémarré" >&2; exit 1; }
++  sleep 0.25
++done
++
++after=$(timeout -k 2 10 docker exec "$pg" psql -h 127.0.0.1 -U postgres -X -A -t -q -c \
++  "select (select coalesce(string_agg(line, ',' order by line), '') from (select state || '|' || reconciliation_required::text || '|' || reserved_cents::text || '|' || count(*)::text as line from public.hq_call_reservation group by state, reconciliation_required, reserved_cents) s) || ';' || (select count(*)::text from public.hq_call_emit_right);" < /dev/null)
++after=$(printf '%s' "$after" | tr -d '\r')
++before=$(printf '%s' "$before" | tr -d '\r')
++[ "$before" = "$after" ] || {
++  echo "ÉCHEC REPRISE: avant [$before] après [$after]" >&2
++  exit 1
++}
++
++echo "✔ Reprise après redémarrage du conteneur: $after"
++echo "QUALIFICATION RÉSERVATION TERMINÉE"
+diff --git a/src/server/ai/call-accounting.ts b/src/server/ai/call-accounting.ts
+index 660a3ba..27229a2 100644
+--- a/src/server/ai/call-accounting.ts
++++ b/src/server/ai/call-accounting.ts
+@@ -5,14 +5,12 @@ import type { RoutingCostKind } from "@/core/types";
+  * It is not a budget, not a reservation ledger, and not durable.
+  * `chooseModel` may append an estimation. It must not add that weight to a spend store.
+  *
+- * Durable budget is not implemented. A shared HQ migration would be required
+- * before any claim of a persisted budget. Proposed contract, not a table:
+- *   hq_model_call_cost (
+- *     workspace_id, attempt_id, kind, chosen_model_id, executed_model_id,
+- *     input_tokens, output_tokens, monetary_usd null, provider_request_reached,
+- *     created_at
+- *   )
+- * monetary_usd null means unknown, not zero. No row is written by this module.
++ * Durable monetary budget is not implemented in this journal. Relative weights
++ * are routing metrics, not a reserve and not dollars. The provider ledger in
++ * db/migrations/0028_call_reservation.sql holds integer USD cents from a
++ * server quote only when HQ_CALL_RESERVATION=1 and both a ceiling row and a
++ * reliable quote exist. It does not convert weights and it does not cap a
++ * provider invoice. This module still writes no row.
+  */
+ 
+ export const DURABLE_BUDGET_IMPLEMENTED = false;
+diff --git a/src/server/ai/call-reservation.test.mjs b/src/server/ai/call-reservation.test.mjs
+new file mode 100644
+index 0000000..ec8006f
+--- /dev/null
++++ b/src/server/ai/call-reservation.test.mjs
+@@ -0,0 +1,551 @@
++#!/usr/bin/env node
++// USD-cent reservation contract. Injected gate and injected fetch only.
++// The gate below is not production. The SQL race is proofs/prove-call-reservation-real-db.mjs.
++// No provider network.
++
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..");
++const { createJiti } = await import("jiti");
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(projectRoot, "src"),
++    "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++  },
++});
++
++const { accessClassForModel, callReservationConfigured } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/call-reservation.ts"),
++);
++const { generateStructuredJson } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/llm-json-provider.ts"),
++);
++const { DURABLE_BUDGET_IMPLEMENTED } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/call-accounting.ts"),
++);
++const { RUNG_COST_WEIGHT } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/cost-ladder.ts"),
++);
++const { ANTHROPIC_JSON_DEFAULT_MAX_TOKENS, ANTHROPIC_JSON_DEFAULT_MODEL } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/anthropic-json-client.ts"),
++);
++const { OPENAI_JSON_DEFAULT_MAX_TOKENS, OPENAI_JSON_DEFAULT_MODEL } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/openai-json-client.ts"),
++);
++
++const HAIKU = "claude-haiku-4-5-20251001";
++const SONNET = "claude-sonnet-4-6";
++const MINI = "gpt-4o-mini";
++
++function standardQuotes() {
++  return new Map([
++    [`anthropic|${ANTHROPIC_JSON_DEFAULT_MODEL}`, { cents: 80, coversMaxTokens: ANTHROPIC_JSON_DEFAULT_MAX_TOKENS, reliable: true }],
++    [`openai|${OPENAI_JSON_DEFAULT_MODEL}`, { cents: 40, coversMaxTokens: OPENAI_JSON_DEFAULT_MAX_TOKENS, reliable: true }],
++    [`anthropic|${HAIKU}`, { cents: 80, coversMaxTokens: 2048, reliable: true }],
++    [`openai|${MINI}`, { cents: 40, coversMaxTokens: 2048, reliable: true }],
++    [`anthropic|${SONNET}`, { cents: 200, coversMaxTokens: 2048, reliable: true }],
++    ["openai|gpt-4o", { cents: 200, coversMaxTokens: 2048, reliable: false }],
++  ]);
++}
++
++/** Synchronous stand-in for hq_reserve_call_attempt. Not the production store. */
++function memoryGate(ceilings, quotes) {
++  const rights = new Map();
++  const rows = new Map();
++  const rightKey = (workspaceId, subjectId) => `${workspaceId}|${subjectId}`;
++  const rowKey = (input) => `${input.workspaceId}|${input.subjectId}|${input.provider}`;
++  const used = (workspaceId) => [...rows.values()]
++    .filter((row) => row.workspaceId === workspaceId && row.state !== "released")
++    .reduce((sum, row) => sum + row.reservedCents, 0);
++  const active = (workspaceId, subjectId) => [...rows.values()].some((row) =>
++    row.workspaceId === workspaceId && row.subjectId === subjectId && row.state !== "released");
++  const snap = (status, extra = {}) => ({
++    configured: true,
++    status,
++    currency: null,
++    reservedCents: null,
++    networkEmitted: false,
++    reconciliationRequired: false,
++    ...extra,
++  });
++  return {
++    rows,
++    rights,
++    async reserve(input) {
++      if ("relativeWeight" in input || "reservedCents" in input || "amountCents" in input || "monetaryUsd" in input) {
++        throw new Error("amount must come from the server quote");
++      }
++      if (!ceilings.has(input.workspaceId)) return snap("unavailable", { reason: "ceiling_not_configured" });
++      const quote = quotes.get(`${input.provider}|${input.modelId}`);
++      if (!quote || quote.reliable !== true || quote.cents <= 0 || quote.coversMaxTokens < input.maxTokens) {
++        return snap("refused", { reason: "estimate_insufficient" });
++      }
++      const owner = rights.get(rightKey(input.workspaceId, input.subjectId));
++      if (owner && owner !== input.callerId && active(input.workspaceId, input.subjectId)) {
++        return snap("lost", { reason: "emit_right_held" });
++      }
++      rights.set(rightKey(input.workspaceId, input.subjectId), input.callerId);
++      const existing = rows.get(rowKey(input));
++      if (existing && existing.state !== "released") {
++        return snap("duplicate", {
++          currency: "USD",
++          reservedCents: existing.reservedCents,
++          networkEmitted: existing.networkEmitted,
++          reconciliationRequired: existing.reconciliationRequired,
++        });
++      }
++      if (used(input.workspaceId) + quote.cents > ceilings.get(input.workspaceId)) {
++        return snap("refused", { reason: "ceiling_exhausted" });
++      }
++      rows.set(rowKey(input), {
++        ...input,
++        state: "held",
++        currency: "USD",
++        reservedCents: quote.cents,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      });
++      return snap("held", { currency: "USD", reservedCents: quote.cents });
++    },
++    async release(input) {
++      const row = rows.get(rowKey(input));
++      if (!row) return snap("unavailable", { reason: "not_found" });
++      if (row.callerId !== input.callerId || row.networkEmitted || row.state !== "held") {
++        return snap(row.state, {
++          reason: "release_refused",
++          currency: row.networkEmitted ? "USD" : null,
++          reservedCents: row.networkEmitted ? row.reservedCents : null,
++          networkEmitted: row.networkEmitted,
++          reconciliationRequired: row.reconciliationRequired,
++        });
++      }
++      row.state = "released";
++      return snap("released");
++    },
++    async markEmitted(input) {
++      const row = rows.get(rowKey(input));
++      if (!row || row.callerId !== input.callerId || row.state !== "held" || row.networkEmitted) {
++        return snap("refused", { reason: "not_held" });
++      }
++      row.state = "emitted_unknown";
++      row.networkEmitted = true;
++      row.reconciliationRequired = true;
++      return snap("emitted_unknown", {
++        currency: "USD",
++        reservedCents: row.reservedCents,
++        networkEmitted: true,
++        reconciliationRequired: true,
++      });
++    },
++    async consume(input) {
++      const row = rows.get(rowKey(input));
++      if (!row || row.callerId !== input.callerId || row.state !== "emitted_unknown") {
++        return snap("refused", { reason: "not_emitted" });
++      }
++      row.state = "consumed";
++      row.reconciliationRequired = false;
++      return snap("consumed", {
++        currency: "USD",
++        reservedCents: row.reservedCents,
++        networkEmitted: true,
++        reconciliationRequired: false,
++      });
++    },
++  };
++}
++
++function okFetch(payload) {
++  return async () => ({
++    ok: true,
++    status: 200,
++    json: async () => ({
++      content: [{ type: "text", text: JSON.stringify(payload) }],
++      usage: { input_tokens: 2, output_tokens: 3 },
++    }),
++  });
++}
++
++test("access classes stay distinct and weights are not a monetary reserve", () => {
++  assert.equal(accessClassForModel("gpt-4o-mini"), "api");
++  assert.equal(accessClassForModel("claude-sonnet-4-6"), "api");
++  assert.equal(accessClassForModel("local-runtime"), "local");
++  assert.equal(accessClassForModel("subscription-plan"), "subscription");
++  assert.equal(accessClassForModel("gemini-flash"), "unknown");
++  assert.equal(accessClassForModel("constructor"), "unknown");
++  assert.equal(RUNG_COST_WEIGHT.premium, 5);
++  assert.equal(RUNG_COST_WEIGHT.economy, 1);
++  assert.equal(callReservationConfigured({}), false);
++  assert.equal(callReservationConfigured({ HQ_CALL_RESERVATION: "true" }), false);
++  assert.equal(callReservationConfigured({ HQ_CALL_RESERVATION: "1" }), true);
++  assert.equal(DURABLE_BUDGET_IMPLEMENTED, false);
++});
++
++test("an unconfigured ledger does not block and does not claim a ceiling", async () => {
++  delete process.env.HQ_CALL_RESERVATION;
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  let calls = 0;
++  try {
++    const result = await generateStructuredJson({
++      providerPreference: "anthropic",
++      modelId: HAIKU,
++      workspaceId: "ws-a",
++      callSubjectId: "call-unconfigured",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      fetchFns: {
++        anthropic: async () => {
++          calls += 1;
++          return okFetch({ reply: "ok" })();
++        },
++      },
++    });
++    assert.equal(calls, 1);
++    assert.equal(result.ok, true);
++    assert.equal(result.reservation.configured, false);
++    assert.equal(result.reservation.status, "unavailable");
++    assert.equal(result.reservation.currency, null);
++    assert.equal(result.reservation.reservedCents, null);
++    assert.equal(result.cost.monetaryUsd, null);
++    assert.equal(result.cost.relativeWeight, undefined);
++  } finally {
++    delete process.env.ANTHROPIC_API_KEY;
++  }
++});
++
++test("budgeted mode without a subject, ceiling, or reliable quote does not emit", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  const gate = memoryGate(new Map([["ws-a", 1000]]), standardQuotes());
++  let calls = 0;
++  const fetchFn = async () => {
++    calls += 1;
++    throw new Error("network must not be used");
++  };
++  try {
++    const missingSubject = await generateStructuredJson({
++      providerPreference: "auto",
++      modelId: MINI,
++      workspaceId: "ws-a",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { anthropic: fetchFn, openai: fetchFn },
++    });
++    assert.equal(calls, 0);
++    assert.equal(missingSubject.ok, false);
++    assert.equal(missingSubject.errorCode, "reservation_blocked");
++    assert.equal(missingSubject.reservation.reason, "identity");
++    assert.equal(missingSubject.cost.networkRequestSent, false);
++    assert.equal(missingSubject.cost.monetaryUsd, null);
++
++    const missingCeiling = await generateStructuredJson({
++      providerPreference: "openai",
++      modelId: MINI,
++      workspaceId: "ws-missing",
++      callSubjectId: "call-no-ceiling",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { anthropic: fetchFn, openai: fetchFn },
++    });
++    assert.equal(calls, 0);
++    assert.equal(missingCeiling.reservation.status, "unavailable");
++    assert.equal(missingCeiling.reservation.reason, "ceiling_not_configured");
++    assert.equal(gate.rows.size, 0);
++
++    const missingQuote = await generateStructuredJson({
++      providerPreference: "openai",
++      modelId: "gpt-4o",
++      workspaceId: "ws-a",
++      callSubjectId: "call-no-quote",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { anthropic: fetchFn, openai: fetchFn },
++    });
++    assert.equal(calls, 0);
++    assert.equal(missingQuote.reservation.reason, "estimate_insufficient");
++    assert.equal(missingQuote.reservation.reservedCents, null);
++    assert.equal(gate.rows.size, 0);
++
++    const uncovered = await generateStructuredJson({
++      providerPreference: "openai",
++      modelId: MINI,
++      maxTokens: OPENAI_JSON_DEFAULT_MAX_TOKENS + 1,
++      workspaceId: "ws-a",
++      callSubjectId: "call-uncovered",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: { anthropic: fetchFn, openai: fetchFn },
++    });
++    assert.equal(calls, 0);
++    assert.equal(uncovered.reservation.reason, "estimate_insufficient");
++    assert.equal(gate.rows.size, 0);
++  } finally {
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.ANTHROPIC_API_KEY;
++    delete process.env.OPENAI_API_KEY;
++  }
++});
++
++test("a ceiling the size of a routing weight does not authorize a send", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const gate = memoryGate(new Map([["ws-a", RUNG_COST_WEIGHT.premium]]), standardQuotes());
++  let calls = 0;
++  try {
++    const result = await generateStructuredJson({
++      providerPreference: "anthropic",
++      modelId: SONNET,
++      workspaceId: "ws-a",
++      callSubjectId: "call-weight",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: {
++        anthropic: async () => {
++          calls += 1;
++          throw new Error("weight must not buy a send");
++        },
++      },
++    });
++    assert.equal(calls, 0);
++    assert.equal(result.reservation.reason, "ceiling_exhausted");
++    assert.equal(result.reservation.reservedCents, null);
++    assert.equal(result.cost.monetaryUsd, null);
++    assert.equal(result.cost.relativeWeight, undefined);
++    assert.equal(gate.rows.size, 0);
++    assert.notEqual(standardQuotes().get(`anthropic|${SONNET}`).cents, RUNG_COST_WEIGHT.premium);
++  } finally {
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.ANTHROPIC_API_KEY;
++  }
++});
++
++test("one caller wins the emit right, and the loser cannot take the fallback", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  const gate = memoryGate(new Map([["ws-a", 1000], ["ws-b", 1000]]), standardQuotes());
++  let releaseAnthropic;
++  let winnerFetches = 0;
++  let loserFetches = 0;
++  const entered = new Promise((resolve) => {
++    releaseAnthropic = { resolveEntered: resolve };
++  });
++  try {
++    const winner = generateStructuredJson({
++      providerPreference: "auto",
++      workspaceId: "ws-a",
++      callSubjectId: "mission-1",
++      paidFallback: { authorized: true, workspaceId: "ws-a" },
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: {
++        anthropic: async () => {
++          winnerFetches += 1;
++          let release;
++          const hold = new Promise((resolve) => {
++            release = resolve;
++          });
++          releaseAnthropic.release = release;
++          releaseAnthropic.resolveEntered();
++          await hold;
++          return { ok: false, status: 503, json: async () => ({}) };
++        },
++        openai: async () => {
++          winnerFetches += 1;
++          return {
++            ok: true,
++            status: 200,
++            json: async () => ({
++              choices: [{ message: { content: JSON.stringify({ reply: "ok" }) } }],
++              usage: { prompt_tokens: 2, completion_tokens: 3 },
++            }),
++          };
++        },
++      },
++    });
++    await entered;
++    const loser = await generateStructuredJson({
++      providerPreference: "auto",
++      workspaceId: "ws-a",
++      callSubjectId: "mission-1",
++      paidFallback: { authorized: true, workspaceId: "ws-a" },
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: {
++        anthropic: async () => {
++          loserFetches += 1;
++          throw new Error("loser must not emit");
++        },
++        openai: async () => {
++          loserFetches += 1;
++          throw new Error("loser must not emit the fallback");
++        },
++      },
++    });
++    assert.equal(loserFetches, 0);
++    assert.equal(loser.ok, false);
++    assert.equal(loser.reservation.status, "lost");
++    assert.equal(loser.reservation.reason, "emit_right_held");
++    assert.equal(loser.cost.networkRequestSent, false);
++    releaseAnthropic.release();
++    const won = await winner;
++    assert.equal(won.ok, true);
++    assert.equal(won.fallbackUsed, true);
++    assert.equal(winnerFetches, 2);
++    assert.equal(won.reservation.currency, "USD");
++    assert.equal(won.reservation.reservedCents, 40);
++    assert.equal(won.reservation.status, "consumed");
++    assert.equal(won.cost.kind, "unknown_cost");
++    assert.equal(won.cost.monetaryUsd, null);
++    assert.notEqual(won.reservation.reservedCents, 0);
++    const states = [...gate.rows.values()]
++      .filter((row) => row.workspaceId === "ws-a")
++      .map((row) => `${row.provider}:${row.state}:${row.reservedCents}`)
++      .sort();
++    assert.deepEqual(states, ["anthropic:emitted_unknown:80", "openai:consumed:40"]);
++    assert.equal(gate.rights.size, 1);
++
++    let otherCalls = 0;
++    const other = await generateStructuredJson({
++      providerPreference: "openai",
++      modelId: MINI,
++      workspaceId: "ws-b",
++      callSubjectId: "mission-1",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: {
++        openai: async () => {
++          otherCalls += 1;
++          return {
++            ok: true,
++            status: 200,
++            json: async () => ({
++              choices: [{ message: { content: JSON.stringify({ reply: "ok" }) } }],
++              usage: { prompt_tokens: 1, completion_tokens: 1 },
++            }),
++          };
++        },
++      },
++    });
++    assert.equal(other.ok, true);
++    assert.equal(otherCalls, 1);
++    assert.equal(other.reservation.reservedCents, 40);
++  } finally {
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.ANTHROPIC_API_KEY;
++    delete process.env.OPENAI_API_KEY;
++  }
++});
++
++test("a missing key reserves nothing, and a timeout after emission is not released", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  delete process.env.ANTHROPIC_API_KEY;
++  process.env.OPENAI_API_KEY = "synthetic";
++  const gate = memoryGate(new Map([["ws-a", 1000]]), standardQuotes());
++  let calls = 0;
++  try {
++    const missingKey = await generateStructuredJson({
++      providerPreference: "anthropic",
++      modelId: HAIKU,
++      workspaceId: "ws-a",
++      callSubjectId: "call-nokey",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: {
++        anthropic: async () => {
++          calls += 1;
++          throw new Error("must not fetch");
++        },
++      },
++    });
++    assert.equal(calls, 0);
++    assert.equal(missingKey.reservation.reason, "no_api_key");
++    assert.equal(missingKey.cost.networkRequestSent, false);
++    assert.equal(gate.rows.size, 0);
++
++    const timedOut = await generateStructuredJson({
++      providerPreference: "openai",
++      modelId: MINI,
++      workspaceId: "ws-a",
++      callSubjectId: "call-timeout",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: gate,
++      fetchFns: {
++        openai: async () => {
++          calls += 1;
++          const error = new Error("aborted");
++          error.name = "AbortError";
++          throw error;
++        },
++      },
++    });
++    assert.equal(calls, 1);
++    assert.equal(timedOut.ok, false);
++    assert.equal(timedOut.cost.kind, "failed_maybe_billed");
++    assert.equal(timedOut.cost.monetaryUsd, null);
++    assert.notEqual(timedOut.cost.monetaryUsd, 0);
++    const row = [...gate.rows.values()][0];
++    assert.equal(row.state, "emitted_unknown");
++    assert.equal(row.reconciliationRequired, true);
++    assert.equal(row.networkEmitted, true);
++    assert.equal(row.reservedCents, 40);
++    assert.notEqual(row.reservedCents, 0);
++    assert.equal(Object.hasOwn(gate, "expire"), false);
++  } finally {
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.OPENAI_API_KEY;
++  }
++});
++
++test("an exhausted quote ceiling blocks the authorized fallback without releasing the first hold", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  const narrow = memoryGate(new Map([["ws-a", 80]]), standardQuotes());
++  let openaiCalls = 0;
++  try {
++    const blocked = await generateStructuredJson({
++      providerPreference: "auto",
++      workspaceId: "ws-a",
++      callSubjectId: "call-fallback-tight",
++      paidFallback: { authorized: true, workspaceId: "ws-a" },
++      systemPrompt: "sys",
++      userPrompt: "user",
++      reservationGate: narrow,
++      fetchFns: {
++        anthropic: async () => ({ ok: false, status: 503, json: async () => ({}) }),
++        openai: async () => {
++          openaiCalls += 1;
++          throw new Error("second provider must not emit");
++        },
++      },
++    });
++    assert.equal(openaiCalls, 0);
++    assert.equal(blocked.ok, false);
++    assert.equal(blocked.reservation.reason, "ceiling_exhausted");
++    assert.equal([...narrow.rows.values()].filter((row) => row.provider === "openai").length, 0);
++    const held = [...narrow.rows.values()][0];
++    assert.equal(held.provider, "anthropic");
++    assert.equal(held.state, "emitted_unknown");
++    assert.equal(held.reservedCents, 80);
++    assert.equal(held.reconciliationRequired, true);
++  } finally {
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.ANTHROPIC_API_KEY;
++    delete process.env.OPENAI_API_KEY;
++  }
++});
+diff --git a/src/server/ai/call-reservation.ts b/src/server/ai/call-reservation.ts
+new file mode 100644
+index 0000000..18ec71f
+--- /dev/null
++++ b/src/server/ai/call-reservation.ts
+@@ -0,0 +1,338 @@
++import "server-only";
++
++import type { Json } from "@/server/db/types";
++import { createOptionalSupabaseAdminClient } from "@/server/supabase/admin";
++import { executionTargetForModel } from "@/server/ai/execution-models";
++
++/**
++ * Budget contract for one HQ provider attempt. Routing weights are not part of it.
++ *
++ * Unit: integer USD cents. `relativeWeight` (0, 1, 5) stays a routing metric on
++ * `chooseModel` and is never stored, summed, or converted here.
++ *
++ * A budgeted send needs both of these server rows, never a client field:
++ *   - `hq_call_budget_ceiling`: workspace cap in USD cents
++ *   - `hq_call_budget_quote`: reliable not-to-exceed USD cents for that
++ *     provider and model id, covering the max tokens actually sent
++ * Missing ceiling → unavailable. Missing or unreliable quote, or a quote that
++ * does not cover max tokens → no send. No price is invented by this module.
++ *
++ * Emit right: under the ceiling row lock, one caller id owns
++ * `hq_call_emit_right` for (workspace, subject). The unique key is only a
++ * backstop. Any other caller is `lost` and must not open a socket, including
++ * on an already-authorized fallback provider. Only the winner may reserve
++ * that fallback, and the fallback repeats this same quote and ceiling check.
++ *
++ * States: `held` may be released before the socket. `mark` before the socket
++ * moves the row to `emitted_unknown` and requires reconciliation. That hold
++ * has no TTL and release refuses it. Success consumes the row without setting
++ * the cents to zero. This caps reserved quotes, not a provider invoice.
++ *
++ * `HQ_CALL_RESERVATION` must be exactly `1`. Any other value leaves the
++ * control explicitly unavailable and does not change the send path.
++ */
++
++export type CallAccessClass = "subscription" | "api" | "local" | "unknown";
++
++export type CallReservationStatus =
++  | "held"
++  | "released"
++  | "emitted_unknown"
++  | "consumed"
++  | "duplicate"
++  | "lost"
++  | "refused"
++  | "unavailable";
++
++export type CallReservationSnapshot = {
++  configured: boolean;
++  status: CallReservationStatus;
++  /** USD only when a server quote was reserved. Never a routing weight. */
++  currency: "USD" | null;
++  /** Integer cents from the server quote. Null when this attempt holds nothing. */
++  reservedCents: number | null;
++  accessClass?: CallAccessClass;
++  networkEmitted: boolean;
++  reconciliationRequired: boolean;
++  reason?: string;
++};
++
++export type CallReservationIdentity = {
++  workspaceId: string;
++  subjectId: string;
++  callerId: string;
++  provider: "anthropic" | "openai";
++};
++
++export type CallReservationGate = {
++  reserve(input: CallReservationIdentity & {
++    accessClass: CallAccessClass;
++    modelId: string;
++    maxTokens: number;
++  }): Promise<CallReservationSnapshot>;
++  release(input: CallReservationIdentity): Promise<CallReservationSnapshot>;
++  markEmitted(input: CallReservationIdentity): Promise<CallReservationSnapshot>;
++  consume(input: CallReservationIdentity): Promise<CallReservationSnapshot>;
++};
++
++/** Server flag. Absent or any other value means the ledger is not in force. */
++export function callReservationConfigured(
++  env: Record<string, string | undefined> = process.env,
++): boolean {
++  return env.HQ_CALL_RESERVATION === "1";
++}
++
++export function accessClassForModel(modelId: string): CallAccessClass {
++  if (executionTargetForModel(modelId).callable) return "api";
++  const id = modelId.toLowerCase();
++  if (id.includes("subscription")) return "subscription";
++  if (id.includes("local")) return "local";
++  return "unknown";
++}
++
++export function unavailableReservation(reason?: string): CallReservationSnapshot {
++  return {
++    configured: false,
++    status: "unavailable",
++    currency: null,
++    reservedCents: null,
++    networkEmitted: false,
++    reconciliationRequired: false,
++    ...(reason ? { reason } : {}),
++  };
++}
++
++function emptyHold(status: CallReservationStatus, configured: boolean, reason?: string): CallReservationSnapshot {
++  return {
++    configured,
++    status,
++    currency: null,
++    reservedCents: null,
++    networkEmitted: false,
++    reconciliationRequired: false,
++    ...(reason ? { reason } : {}),
++  };
++}
++
++function readCents(value: Json | undefined): number | null {
++  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
++  return value;
++}
++
++function snapshotFromRpc(value: Json, configured: boolean): CallReservationSnapshot {
++  if (!value || typeof value !== "object" || Array.isArray(value)) {
++    return emptyHold("unavailable", configured, "malformed");
++  }
++  const record = value as Record<string, Json | undefined>;
++  const status = record.status;
++  if (
++    status !== "held" &&
++    status !== "released" &&
++    status !== "emitted_unknown" &&
++    status !== "consumed" &&
++    status !== "duplicate" &&
++    status !== "lost" &&
++    status !== "refused" &&
++    status !== "unavailable"
++  ) {
++    return emptyHold("unavailable", configured, "malformed");
++  }
++  const reservedCents = readCents(record.reservedCents);
++  const currency = record.currency === "USD" && reservedCents !== null ? "USD" : null;
++  const holdsMoney = status === "held" || status === "emitted_unknown" || status === "consumed" || status === "duplicate";
++  if (holdsMoney && (currency !== "USD" || reservedCents === null)) {
++    return emptyHold("unavailable", configured, "malformed");
++  }
++  return {
++    configured,
++    status,
++    currency: holdsMoney ? "USD" : null,
++    reservedCents: holdsMoney ? reservedCents : null,
++    networkEmitted: record.networkEmitted === true,
++    reconciliationRequired: record.reconciliationRequired === true,
++    ...(typeof record.reason === "string" ? { reason: record.reason } : {}),
++    ...(typeof record.accessClass === "string" &&
++    (record.accessClass === "subscription" ||
++      record.accessClass === "api" ||
++      record.accessClass === "local" ||
++      record.accessClass === "unknown")
++      ? { accessClass: record.accessClass }
++      : {}),
++  };
++}
++
++export function createDurableCallReservationGate(
++  client = createOptionalSupabaseAdminClient(),
++): CallReservationGate {
++  const fail = async (reason: string): Promise<CallReservationSnapshot> => emptyHold("unavailable", true, reason);
++
++  if (!client) {
++    return {
++      reserve: () => fail("store_unavailable"),
++      release: () => fail("store_unavailable"),
++      markEmitted: () => fail("store_unavailable"),
++      consume: () => fail("store_unavailable"),
++    };
++  }
++
++  return {
++    async reserve(input) {
++      const { data, error } = await client.rpc("hq_reserve_call_attempt", {
++        p_workspace_id: input.workspaceId,
++        p_subject_id: input.subjectId,
++        p_caller_id: input.callerId,
++        p_provider: input.provider,
++        p_model_id: input.modelId,
++        p_access_class: input.accessClass,
++        p_max_tokens: input.maxTokens,
++      });
++      if (error) return fail("store_unavailable");
++      return snapshotFromRpc(data, true);
++    },
++    async release(input) {
++      const { data, error } = await client.rpc("hq_release_call_attempt", {
++        p_workspace_id: input.workspaceId,
++        p_subject_id: input.subjectId,
++        p_caller_id: input.callerId,
++        p_provider: input.provider,
++      });
++      if (error) return fail("store_unavailable");
++      return snapshotFromRpc(data, true);
++    },
++    async markEmitted(input) {
++      const { data, error } = await client.rpc("hq_mark_call_emitted", {
++        p_workspace_id: input.workspaceId,
++        p_subject_id: input.subjectId,
++        p_caller_id: input.callerId,
++        p_provider: input.provider,
++      });
++      if (error) return fail("store_unavailable");
++      return snapshotFromRpc(data, true);
++    },
++    async consume(input) {
++      const { data, error } = await client.rpc("hq_consume_call_attempt", {
++        p_workspace_id: input.workspaceId,
++        p_subject_id: input.subjectId,
++        p_caller_id: input.callerId,
++        p_provider: input.provider,
++      });
++      if (error) return fail("store_unavailable");
++      return snapshotFromRpc(data, true);
++    },
++  };
++}
++
++export type AttemptAuthorization =
++  | { emit: true; reservation: CallReservationSnapshot; identity: CallReservationIdentity }
++  | { emit: false; reservation: CallReservationSnapshot };
++
++/**
++ * Decides whether this caller may open one provider socket.
++ * The cents and the currency come from the server quote row inside the gate.
++ * The caller cannot pass a ceiling, a price, or a routing weight.
++ */
++export async function authorizeCallAttempt(input: {
++  configured: boolean;
++  gate: CallReservationGate | null;
++  workspaceId?: string;
++  callSubjectId?: string;
++  callerId?: string;
++  provider: "anthropic" | "openai";
++  modelId: string;
++  maxTokens: number;
++  hasApiKey: boolean;
++}): Promise<AttemptAuthorization> {
++  if (!input.configured) {
++    return {
++      emit: true,
++      reservation: unavailableReservation(),
++      identity: {
++        workspaceId: input.workspaceId ?? "",
++        subjectId: input.callSubjectId ?? "",
++        callerId: input.callerId ?? "",
++        provider: input.provider,
++      },
++    };
++  }
++
++  const accessClass = accessClassForModel(input.modelId);
++  if (!input.workspaceId || !input.callSubjectId || !input.callerId) {
++    return {
++      emit: false,
++      reservation: {
++        ...emptyHold("unavailable", true, "identity"),
++        accessClass,
++      },
++    };
++  }
++
++  const identity: CallReservationIdentity = {
++    workspaceId: input.workspaceId,
++    subjectId: input.callSubjectId,
++    callerId: input.callerId,
++    provider: input.provider,
++  };
++
++  if (accessClass !== "api") {
++    return {
++      emit: false,
++      reservation: {
++        ...emptyHold("refused", true, "access_class"),
++        accessClass,
++      },
++    };
++  }
++
++  if (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1 || input.maxTokens > 200_000) {
++    return {
++      emit: false,
++      reservation: {
++        ...emptyHold("refused", true, "estimate_insufficient"),
++        accessClass,
++      },
++    };
++  }
++
++  if (!input.hasApiKey || !input.gate) {
++    return {
++      emit: false,
++      reservation: {
++        ...emptyHold(input.gate ? "refused" : "unavailable", true, input.gate ? "no_api_key" : "store_unavailable"),
++        accessClass,
++      },
++    };
++  }
++
++  const reserved = await input.gate.reserve({
++    ...identity,
++    accessClass,
++    modelId: input.modelId,
++    maxTokens: input.maxTokens,
++  });
++  if (reserved.status !== "held" || reserved.currency !== "USD" || reserved.reservedCents === null) {
++    return { emit: false, reservation: { ...reserved, configured: true } };
++  }
++
++  const emitted = await input.gate.markEmitted(identity);
++  if (
++    emitted.status !== "emitted_unknown" ||
++    emitted.currency !== "USD" ||
++    emitted.reservedCents === null ||
++    emitted.reservedCents !== reserved.reservedCents
++  ) {
++    await input.gate.release(identity);
++    return {
++      emit: false,
++      reservation: {
++        ...emptyHold("released", true, "mark_failed"),
++        accessClass,
++      },
++    };
++  }
++
++  return {
++    emit: true,
++    reservation: { ...emitted, configured: true, accessClass },
++    identity,
++  };
++}
+diff --git a/src/server/ai/llm-json-provider.ts b/src/server/ai/llm-json-provider.ts
+index 2ff9f41..0f7207f 100644
+--- a/src/server/ai/llm-json-provider.ts
++++ b/src/server/ai/llm-json-provider.ts
+@@ -15,15 +15,28 @@
+ //   - Never throws toward the caller.
+ //   - Individual fetchFns per provider so tests can inject mocks independently.
+ //
+-// No persistence. Monetary amount stays null: tokens are not dollars,
+-// and a failed request is not recorded as zero.
++// No observed price is copied onto the cost: tokens are not dollars, a
++// routing weight is not a reserve, and a failed request is not zero.
++// When HQ_CALL_RESERVATION=1, a separate USD-cent hold is taken from the
++// server quote before the socket. That hold is not the cost assessment.
+ 
+ import "server-only";
+ 
++import { randomUUID } from "node:crypto";
++
+ import type { RoutingCostAssessment } from "@/core/types";
++import {
++  accessClassForModel,
++  authorizeCallAttempt,
++  callReservationConfigured,
++  createDurableCallReservationGate,
++  unavailableReservation,
++  type CallReservationGate,
++  type CallReservationSnapshot,
++} from "@/server/ai/call-reservation";
+ import { executionTargetForModel } from "@/server/ai/execution-models";
+-import { generateJsonWithAnthropic } from "./anthropic-json-client";
+-import { generateJsonWithOpenAI } from "./openai-json-client";
++import { generateJsonWithAnthropic, ANTHROPIC_JSON_DEFAULT_MAX_TOKENS, ANTHROPIC_JSON_DEFAULT_MODEL } from "./anthropic-json-client";
++import { generateJsonWithOpenAI, OPENAI_JSON_DEFAULT_MAX_TOKENS, OPENAI_JSON_DEFAULT_MODEL } from "./openai-json-client";
+ 
+ // ---------------------------------------------------------------------------
+ // Types
+@@ -50,6 +63,13 @@ export type LlmJsonProviderInput = {
+   workspaceId?: string;
+   /** Absent by default. A mismatching workspace does not authorize a second provider. */
+   paidFallback?: PaidFallbackAuthorization;
++  /**
++   * Server identity of this call or mission. Not a price and not a ceiling.
++   * Required only when HQ_CALL_RESERVATION=1. Never taken from a client budget field.
++   */
++  callSubjectId?: string;
++  /** Test double. Production uses the durable SQL ledger. */
++  reservationGate?: CallReservationGate;
+   // Per-provider fetch overrides for test injection.
+   fetchFns?: {
+     anthropic?: typeof fetch;
+@@ -78,6 +98,11 @@ export type LlmJsonProviderSuccess = {
+   tokenUsage?: { input: number; output: number };
+   /** Every attempt, including one that may have been billed before a later success. */
+   attempts: LlmAttemptCost[];
++  /**
++   * Last reservation decision. USD cents come from a server quote when status
++   * holds money. This is not a routing weight and not a provider invoice cap.
++   */
++  reservation: CallReservationSnapshot;
+   /**
+    * Aggregate. `unknown_cost` when an earlier attempt may have been billed or
+    * returned no usage: the successful tokens are not the whole cost.
+@@ -89,7 +114,8 @@ export type LlmJsonProviderSuccess = {
+ export type LlmJsonProviderErrorCode =
+   | "no_provider_available"
+   | "all_providers_failed"
+-  | "model_unsupported";
++  | "model_unsupported"
++  | "reservation_blocked";
+ 
+ export type LlmJsonProviderFailure = {
+   ok: false;
+@@ -100,6 +126,7 @@ export type LlmJsonProviderFailure = {
+   chosenModelId?: string;
+   executedModelId: null;
+   attempts: LlmAttemptCost[];
++  reservation: CallReservationSnapshot;
+   cost: RoutingCostAssessment;
+ };
+ 
+@@ -197,12 +224,44 @@ function costFromClient(result: {
+ // Main export
+ // ---------------------------------------------------------------------------
+ 
++function providerHasApiKey(provider: LlmProvider): boolean {
++  return provider === "anthropic"
++    ? Boolean(process.env.ANTHROPIC_API_KEY)
++    : Boolean(process.env.OPENAI_API_KEY);
++}
++
++function defaultModelFor(provider: LlmProvider): string {
++  return provider === "anthropic" ? ANTHROPIC_JSON_DEFAULT_MODEL : OPENAI_JSON_DEFAULT_MODEL;
++}
++
++function maxTokensFor(provider: LlmProvider, requested: number | undefined): number {
++  if (requested !== undefined) return requested;
++  return provider === "anthropic" ? ANTHROPIC_JSON_DEFAULT_MAX_TOKENS : OPENAI_JSON_DEFAULT_MAX_TOKENS;
++}
++
+ export async function generateStructuredJson(
+   input: LlmJsonProviderInput,
+ ): Promise<LlmJsonProviderResult> {
++  const configured = callReservationConfigured();
++  const gate = configured ? (input.reservationGate ?? createDurableCallReservationGate()) : null;
++  const callerId = randomUUID();
++  let reservation: CallReservationSnapshot = unavailableReservation();
++
+   if (input.modelId) {
+     const target = executionTargetForModel(input.modelId);
+     if (!target.callable) {
++      if (configured) {
++        reservation = {
++          configured: true,
++          status: "refused",
++          currency: null,
++          reservedCents: null,
++          accessClass: accessClassForModel(input.modelId),
++          networkEmitted: false,
++          reconciliationRequired: false,
++          reason: "access_class",
++        };
++      }
+       return {
+         ok: false,
+         errorCode: "model_unsupported",
+@@ -211,6 +270,7 @@ export async function generateStructuredJson(
+         chosenModelId: input.modelId,
+         executedModelId: null,
+         attempts: [],
++        reservation,
+         cost: refused(),
+       };
+     }
+@@ -231,11 +291,50 @@ export async function generateStructuredJson(
+         ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+         executedModelId: null,
+         attempts,
++        reservation,
+         cost: refused(),
+       };
+     }
+     attemptCount++;
+     const isFirstAttempt = attemptCount === 1;
++    const modelId = input.modelId ?? defaultModelFor(provider);
++    const maxTokens = maxTokensFor(provider, input.maxTokens);
++    const decision = await authorizeCallAttempt({
++      configured,
++      gate,
++      workspaceId: input.workspaceId,
++      callSubjectId: input.callSubjectId,
++      callerId,
++      provider,
++      modelId,
++      maxTokens,
++      hasApiKey: providerHasApiKey(provider),
++    });
++    reservation = decision.reservation;
++    if (!decision.emit) {
++      const blocking =
++        decision.reservation.reason === "identity" ||
++        decision.reservation.reason === "store_unavailable" ||
++        decision.reservation.reason === "access_class" ||
++        decision.reservation.reason === "emit_right_held" ||
++        decision.reservation.status === "lost";
++      failureChain.push(`${provider}: reservation ${decision.reservation.reason ?? decision.reservation.status}`);
++      attempts.push({ provider, cost: refused() });
++      if (blocking) {
++        return {
++          ok: false,
++          errorCode: "reservation_blocked",
++          fallbackReason: failureChain[failureChain.length - 1],
++          failureChain,
++          ...(input.modelId ? { chosenModelId: input.modelId } : {}),
++          executedModelId: null,
++          attempts,
++          reservation,
++          cost: refused(),
++        };
++      }
++      continue;
++    }
+ 
+     let result:
+       | Awaited<ReturnType<typeof generateJsonWithAnthropic>>
+@@ -247,7 +346,7 @@ export async function generateStructuredJson(
+           {
+             systemPrompt: input.systemPrompt,
+             userPrompt: input.userPrompt,
+-            maxTokens: input.maxTokens,
++            maxTokens,
+             temperature: input.temperature,
+             timeoutMs: input.timeoutMs,
+             ...(input.modelId ? { modelId: input.modelId } : {}),
+@@ -259,7 +358,7 @@ export async function generateStructuredJson(
+           {
+             systemPrompt: input.systemPrompt,
+             userPrompt: input.userPrompt,
+-            maxTokens: input.maxTokens,
++            maxTokens,
+             temperature: input.temperature,
+             timeoutMs: input.timeoutMs,
+             ...(input.modelId ? { modelId: input.modelId } : {}),
+@@ -277,6 +376,10 @@ export async function generateStructuredJson(
+       continue;
+     }
+ 
++    if (configured && gate && decision.reservation.status === "emitted_unknown" && result.ok) {
++      reservation = await gate.consume(decision.identity);
++    }
++
+     const attemptCost = costFromClient(result);
+     attempts.push({ provider, cost: attemptCost });
+ 
+@@ -293,6 +396,7 @@ export async function generateStructuredJson(
+         failureChain,
+         tokenUsage: result.tokenUsage,
+         attempts,
++        reservation,
+         cost: aggregateCost(attempts),
+       };
+     }
+@@ -311,6 +415,7 @@ export async function generateStructuredJson(
+     ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+     executedModelId: null,
+     attempts,
++    reservation,
+     cost: aggregateCost(attempts),
+   };
+ }
+diff --git a/src/server/db/types.ts b/src/server/db/types.ts
+index 5a57a6a..ac5bf98 100644
+--- a/src/server/db/types.ts
++++ b/src/server/db/types.ts
+@@ -338,6 +338,47 @@ export type AgentExecutionIntentInsert = Omit<AgentExecutionIntentRow, "id" | "c
+   created_at?: string;
+ };
+ 
++export type HqCallBudgetCeilingRow = {
++  workspace_id: string;
++  currency: "USD";
++  max_amount_cents: number;
++  created_at: string;
++};
++
++export type HqCallBudgetQuoteRow = {
++  provider: "anthropic" | "openai";
++  model_id: string;
++  currency: "USD";
++  not_to_exceed_cents: number;
++  covers_max_tokens: number;
++  reliable: boolean;
++  created_at: string;
++};
++
++export type HqCallEmitRightRow = {
++  workspace_id: string;
++  subject_id: string;
++  caller_id: string;
++  created_at: string;
++};
++
++export type HqCallReservationRow = {
++  workspace_id: string;
++  subject_id: string;
++  provider: "anthropic" | "openai";
++  caller_id: string;
++  access_class: "api";
++  currency: "USD";
++  reserved_cents: number;
++  state: "held" | "released" | "emitted_unknown" | "consumed";
++  reconciliation_required: boolean;
++  model_id: string;
++  max_tokens: number;
++  network_emitted: boolean;
++  created_at: string;
++  updated_at: string;
++};
++
+ export type MichaelHqDatabase = {
+   public: {
+     Tables: {
+@@ -425,9 +466,61 @@ export type MichaelHqDatabase = {
+         Update: Partial<AgentExecutionIntentInsert>;
+         Relationships: [];
+       };
++      hq_call_budget_ceiling: {
++        Row: HqCallBudgetCeilingRow;
++        Insert: Omit<HqCallBudgetCeilingRow, "created_at"> & { created_at?: string };
++        Update: Partial<Pick<HqCallBudgetCeilingRow, "max_amount_cents">>;
++        Relationships: [];
++      };
++      hq_call_budget_quote: {
++        Row: HqCallBudgetQuoteRow;
++        Insert: Omit<HqCallBudgetQuoteRow, "created_at"> & { created_at?: string };
++        Update: Partial<Pick<HqCallBudgetQuoteRow, "not_to_exceed_cents" | "covers_max_tokens" | "reliable">>;
++        Relationships: [];
++      };
++      hq_call_emit_right: {
++        Row: HqCallEmitRightRow;
++        Insert: Omit<HqCallEmitRightRow, "created_at"> & { created_at?: string };
++        Update: Partial<Pick<HqCallEmitRightRow, "caller_id">>;
++        Relationships: [];
++      };
++      hq_call_reservation: {
++        Row: HqCallReservationRow;
++        Insert: Omit<HqCallReservationRow, "created_at" | "updated_at"> & {
++          created_at?: string;
++          updated_at?: string;
++        };
++        Update: Partial<Pick<HqCallReservationRow, "state" | "reconciliation_required" | "network_emitted" | "updated_at" | "caller_id" | "reserved_cents" | "model_id" | "max_tokens">>;
++        Relationships: [];
++      };
+     };
+     Views: Record<string, never>;
+-    Functions: Record<string, never>;
++    Functions: {
++      hq_reserve_call_attempt: {
++        Args: {
++          p_workspace_id: string;
++          p_subject_id: string;
++          p_caller_id: string;
++          p_provider: string;
++          p_model_id: string;
++          p_access_class: string;
++          p_max_tokens: number;
++        };
++        Returns: Json;
++      };
++      hq_release_call_attempt: {
++        Args: { p_workspace_id: string; p_subject_id: string; p_caller_id: string; p_provider: string };
++        Returns: Json;
++      };
++      hq_mark_call_emitted: {
++        Args: { p_workspace_id: string; p_subject_id: string; p_caller_id: string; p_provider: string };
++        Returns: Json;
++      };
++      hq_consume_call_attempt: {
++        Args: { p_workspace_id: string; p_subject_id: string; p_caller_id: string; p_provider: string };
++        Returns: Json;
++      };
++    };
+     Enums: Record<string, never>;
+     CompositeTypes: Record<string, never>;
+   };
+-- 
+2.43.0
+
+
+From 1ff9da576788d39ec9df6e8ee4b2c5b4b7f59431 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 07:21:12 +0000
+Subject: [PATCH 2/2] Record the USD-cent reservation contract and its limits.
+
+The note cites the ledger commit, the targeted checks, and the unrun PostgreSQL proof.
+---
+ docs/CURSOR-BUDGET-RESERVATION-RESULTAT.md | 39 ++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+ create mode 100644 docs/CURSOR-BUDGET-RESERVATION-RESULTAT.md
+
+diff --git a/docs/CURSOR-BUDGET-RESERVATION-RESULTAT.md b/docs/CURSOR-BUDGET-RESERVATION-RESULTAT.md
+new file mode 100644
+index 0000000..0dc1883
+--- /dev/null
++++ b/docs/CURSOR-BUDGET-RESERVATION-RESULTAT.md
+@@ -0,0 +1,39 @@
++# Contrat — réservation budgétaire à l'appel, 1 octobre 2026
++
++Base produit `codex/hq-delivery-integration` `58712d08ace9477e6ba0e86ac39242d287f9d1de`. Code `4412af09ea1dca2b0610c5ae0106d7b4cd4e0f9a`. Le lot routage n'est pas repris. `relativeWeight` reste la métrique de routage de `chooseModel` (0, 1 ou 5). Il n'est pas stocké, sommé, ni converti en argent.
++
++## Contrat
++
++Unité : cents USD entiers. Une émission en mode budgété exige les deux lignes serveur suivantes, jamais un champ client :
++
++- `hq_call_budget_ceiling` : plafond du workspace, `currency = USD`, `max_amount_cents`.
++- `hq_call_budget_quote` : devis du couple fournisseur + modèle, `reliable = true`, `not_to_exceed_cents > 0`, `covers_max_tokens` au moins égal au `maxTokens` réellement envoyé.
++
++La fonction `hq_reserve_call_attempt` n'a pas d'argument montant. Sans plafond, statut `unavailable` / `ceiling_not_configured`, aucun envoi. Sans devis fiable, ou si le devis ne couvre pas les jetons, statut `refused` / `estimate_insufficient`, aucun envoi. La migration n'insère ni plafond ni devis et n'allume pas le flag.
++
++Droit d'émettre : sous `FOR UPDATE` de la ligne de plafond, un seul `caller_id` possède `hq_call_emit_right` pour `(workspace_id, subject_id)`. La clé unique est un filet, pas le mutex. Un autre appelant reçoit `lost` / `emit_right_held` et n'ouvre aucun socket, y compris sur un fallback déjà autorisé. Seul le gagnant peut réserver ce fallback, qui repasse par le même devis et le même plafond.
++
++États d'une tentative : `held` peut être libéré avant le socket. `hq_mark_call_emitted`, juste avant l'envoi, passe à `emitted_unknown` avec `reconciliation_required`. Cette retenue n'a pas de colonne d'expiration et `hq_release_call_attempt` la refuse. Un succès appelle `hq_consume_call_attempt` sans mettre les cents à zéro. Un échec, un timeout ou une exception après la marque laisse la retenue. Le registre borne des devis réservés. Il ne borne pas la facture fournisseur.
++
++Classes : seul `api` (identifiant appelable de l'allowlist) peut réserver. `subscription`, `local` et `unknown` sont refusés, sans devis inventé. `HQ_CALL_RESERVATION` doit valoir exactement `1`. Toute autre valeur laisse le contrôle explicitement indisponible et ne change pas l'envoi. `DURABLE_BUDGET_IMPLEMENTED` reste `false` : le journal mémoire n'est pas ce registre, et aucune politique de dépense n'est activée.
++
++## Branchement
++
++Le seul point d'émission de ce lot est `generateStructuredJson`. Le `caller_id` est un UUID créé dans ce processus, pas un champ de la requête. `callSubjectId` est une identité d'appel ou de mission déjà détenue par le serveur. Les appelants qui ne le passent pas — `runJorisCommand` dans `brain.ts`, `generateDailyDirection`, `generateLlmCashActionPacketsFromVentures`, `runShadowProposalForVenture` — ne sont pas élargis. Flag éteint, leur comportement est inchangé. Flag allumé, l'absence de sujet refuse avant `fetch` (`identity`). `chooseModel` enregistre encore une estimation et ne réserve pas.
++
++Contrat proposé, non codé, pour la frontière partagée : l'entrée serveur du chat doit fournir un `callSubjectId` émis par le serveur, jamais un plafond ni un prix venus du client, avant que `HQ_CALL_RESERVATION=1` puisse s'appliquer à la conversation. Pas de formulaire, d'auth, de maquette, ni d'admission OpenHands dans ce lot.
++
++## Commandes
++
++Répertoire du clone isolé, Node 22.14.0.
++
++- `npx tsc --noEmit` — exit 0
++- `npx eslint` sur `call-reservation.ts`, `call-reservation.test.mjs`, `llm-json-provider.ts`, `call-accounting.ts`, `types.ts` — exit 0
++- `node --test --test-concurrency=1` sur `call-reservation.test.mjs`, `llm-json-provider.test.mjs`, `routing-execution.test.mjs` — 34 tests, 0 échec, exit 0
++- `sh proofs/run-call-reservation-real-db.sh` — `NON EXECUTE`, exit 127. Docker est absent. La migration n'a pas été appliquée et les assertions PostgreSQL n'ont pas tourné.
++
++Les quatre portes produit (typecheck complet du dépôt, lint, build, smoke) ne sont pas relancées ici. Codex les fait sur le candidat assemblé. Les cents 40 et 80 du script de preuve sont des fixtures de ce processus, pas un tarif.
++
++## Limites
++
++Pas d'activation prod, pas de seed, pas de nouvelle politique de dépenses. Hors flag, rien n'est retenu. Avec le flag, sans devis serveur fiable et sans plafond, aucun envoi. Une retenue après émission inconnue attend une réconciliation explicite ; aucun TTL ne la libère. Le coût agrégé du provider garde `monetaryUsd: null`. Ce n'est pas un plafond de facture.
+-- 
+2.43.0
+

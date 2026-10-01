@@ -1,0 +1,51 @@
+Transfer artifact only. This is not a product integration into oria-hq-orchestrator.
+Do not merge these files into the orchestrator runtime. Apply the patch in a clone of the product repository.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_base_branch: codex/hq-delivery-integration
+product_base: 58712d08ace9477e6ba0e86ac39242d287f9d1de
+product_head: 1ff9da576788d39ec9df6e8ee4b2c5b4b7f59431
+product_tree: d93acb1b81912da5cbe8d655a9ce0f9780ed2e4c
+ledger_commit: 4412af09ea1dca2b0610c5ae0106d7b4cd4e0f9a
+patch_range: 58712d08ace9477e6ba0e86ac39242d287f9d1de..1ff9da576788d39ec9df6e8ee4b2c5b4b7f59431
+patch_commits: 2
+patch_path: handoffs/cursor-budget/cursor-budget-reservation.patch
+report_path: handoffs/cursor-budget/CURSOR-BUDGET-RESERVATION-RESULTAT.md
+sha256: 5105873bc9d143c7a4ada14468cc29e09391b71e791e64fe89b02a3fec46ee92
+size_bytes: 82610
+
+files:
+db/migrations/0028_call_reservation.sql
+db/migrations/0028_call_reservation_revert.sql
+db/migrations/0028_call_reservation_verify.sql
+docs/CURSOR-BUDGET-RESERVATION-RESULTAT.md
+proofs/prove-call-reservation-real-db.mjs
+proofs/run-call-reservation-real-db.sh
+src/server/ai/call-accounting.ts
+src/server/ai/call-reservation.test.mjs
+src/server/ai/call-reservation.ts
+src/server/ai/llm-json-provider.ts
+src/server/db/types.ts
+
+apply:
+git checkout 58712d08ace9477e6ba0e86ac39242d287f9d1de
+git am handoffs/cursor-budget/cursor-budget-reservation.patch
+git rev-parse HEAD^{tree}
+expected_tree: d93acb1b81912da5cbe8d655a9ce0f9780ed2e4c
+
+verified:
+git am on a detached worktree at 58712d08 produced commit 4d7f0e741e0028d14f7f60b19fdb0c828c23d8b4
+and tree d93acb1b81912da5cbe8d655a9ce0f9780ed2e4c, equal to product HEAD^{tree}.
+The applied commit hash differs. The tree does not.
+Product push was denied: cursor[bot] received 403. It was not retried.
+
+contract:
+USD integer cents from hq_call_budget_quote under hq_call_budget_ceiling.
+relativeWeight is not stored and is not converted.
+One caller_id owns hq_call_emit_right for the workspace and subject, including fallback.
+emitted_unknown has no TTL. The ledger caps reserved quotes, not a provider invoice.
+HQ_CALL_RESERVATION is not set. No ceiling and no quote are seeded.
+
+postgres:
+proofs/run-call-reservation-real-db.sh printed NON EXECUTE and exited 127.
+Docker is absent here. The migration was not applied. Codex runs that script locally.
