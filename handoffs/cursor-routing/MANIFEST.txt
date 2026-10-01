@@ -1,0 +1,47 @@
+Transfer artifact only. This is not a product integration into oria-hq-orchestrator.
+Do not merge these files into the orchestrator runtime. Apply the patch in a clone of the product repository.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_base_branch: codex/hq-mission-dossier
+product_base: e9ff840a38b4532b687bb29f3e2371afeeb3024e
+product_head: 79b0568bd9b8ae9a3d2b2d992330c94add2e7671
+product_tree: 558037ddc80cbcd58a001bb59c5244d79c98e8fa
+review_fix: a8413508d48bd7776931f33292e4febc918f9b07
+patch_range: e9ff840a38b4532b687bb29f3e2371afeeb3024e..79b0568bd9b8ae9a3d2b2d992330c94add2e7671
+patch_commits: 7
+patch_path: handoffs/cursor-routing/cursor-routage-couts-execution.patch
+report_path: handoffs/cursor-routing/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+sha256: 24d9d5ca1e2fea6ba480e5fed7bf866f0599b8c970a9e3456e8233c4c02e7210
+size_bytes: 119184
+
+files:
+docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+src/core/types.ts
+src/features/ventures/llm-cash-action-packet-generator.test.mjs
+src/server/ai/call-accounting.ts
+src/server/ai/cost-ladder.ts
+src/server/ai/execution-models.ts
+src/server/ai/llm-json-provider.test.mjs
+src/server/ai/llm-json-provider.ts
+src/server/ai/model-config.ts
+src/server/ai/model-router.test.mjs
+src/server/ai/model-router.ts
+src/server/ai/routing-execution.test.mjs
+src/server/joris/brain-cost-ladder-tagging.test.mjs
+src/server/joris/brain-llm-reply.test.mjs
+src/server/joris/brain.ts
+src/server/joris/joris-reply-generator.ts
+src/server/missions/mission-draft-control.test.mjs
+src/server/missions/mission-draft-control.ts
+
+apply:
+git checkout e9ff840a38b4532b687bb29f3e2371afeeb3024e
+git am handoffs/cursor-routing/cursor-routage-couts-execution.patch
+git rev-parse HEAD^{tree}
+expected_tree: 558037ddc80cbcd58a001bb59c5244d79c98e8fa
+
+verified:
+git am on a detached worktree at e9ff840 produced commit 6dc048251516629751dbde8724407a5f32a41783
+and tree 558037ddc80cbcd58a001bb59c5244d79c98e8fa, equal to product HEAD^{tree}.
+The applied commit hash differs. The tree does not.
+Product push was not retried.
