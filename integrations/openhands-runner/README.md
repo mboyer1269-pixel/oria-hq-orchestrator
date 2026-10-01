@@ -1,4 +1,30 @@
-# Preparation-only dossier receiver
+# OpenHands runner — entrées hôte et qualification
+
+## État courant — 1 octobre 2026
+
+Le code contient désormais les entrées de préparation (`project_sources.py`),
+d'exécution explicite (`run_host_job.py`), de consommation (`consume_pending.py`)
+et de réconciliation (`reconcile_launch.py`). Elles réutilisent les contrats HQ;
+le récepteur de dossier n'est plus le seul point d'entrée disponible.
+
+Pour le fonctionnement actuel, lire [HOST-ENTRY.md](HOST-ENTRY.md),
+[HOST-CONSUMER.md](HOST-CONSUMER.md) et le point courant de
+[PROVIDER-INTEGRATION-GAPS.md](PROVIDER-INTEGRATION-GAPS.md).
+Le [contrat de livraison](../../docs/HQ-LIVRAISON-2026-10-01.md) fixe la
+répartition des agents et les preuves encore manquantes.
+
+Ces fichiers ne prouvent ni une installation active, ni l'authentification du
+fournisseur dans un conteneur de mission, ni une tâche de développement réussie.
+La qualification locale PostgreSQL de l'admission HQ a passé; elle ne
+qualifie pas à elle seule le worker. Aucun service de production n'est activé
+par cette mise à jour documentaire.
+
+Les sections suivantes conservent les étapes historiques de construction.
+Leurs mentions « not connected yet » décrivent leur étape, pas l'état courant
+de tous les modules. Les limites non levées restent indiquées dans les documents
+de référence ci-dessus.
+
+## Historique — dossier receiver
 
 ## Container mission entry point (not connected to HQ launch yet)
 

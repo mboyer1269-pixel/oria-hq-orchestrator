@@ -9,7 +9,9 @@
 - [x] Assembler le runtime d'admission et le routage dans une copie isolée; 18 tests d'admission réussis dans cette copie.
 - [x] Revoir et assembler les corrections d'accès et de reprise de Claude (`13930e1`, `abe4b81` → candidat `2f08e96`); 110 tests ciblés/dépendants passés chez Codex. La recette navigateur reste à faire.
 - [x] Corriger et vérifier la syntaxe du banc PostgreSQL d'Antigravity (`720d513`); ne pas confondre préparation et exécution.
-- [ ] Exécuter ce banc réel avec concurrence, réponse perdue et contenu préservé après redémarrage, sur un hôte Docker autorisé.
+- [x] Rétablir le moteur Docker local sans réinitialisation ni suppression des volumes; clients Windows et WSL vérifiés, moteur 29.4.0.
+- [x] Exécuter le banc réel avec concurrence, réponse perdue et contenu préservé après redémarrage : run `1790836047_67270`, code 0; journal, assertions et nettoyage revus par Codex. Correctif de blocage stdin du banc intégré dans `ad549d7`.
+- [ ] Terminer la recette navigateur du formulaire réel; le sous-agent Antigravity `browser_recette` est lancé, résultat à contrôler.
 - [x] Corriger et vérifier dans le navigateur la continuité Aujourd'hui → Discuter → Atelier de la maquette et l'état après GO (`87c00df`).
 - [ ] Obtenir la validation visuelle de Michael puis raccorder l'interface aux événements réels.
 - [x] Faire passer typecheck, lint, build et smoke sur le candidat de code `2f08e96` (0 erreur lint, 5 avertissements hors lot).

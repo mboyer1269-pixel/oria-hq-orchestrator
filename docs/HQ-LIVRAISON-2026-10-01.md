@@ -4,20 +4,20 @@
 
 Le candidat produit est assemblé dans la branche isolée `codex/hq-delivery-integration`, commit de code `2f08e96`. Les trois agents ont livré leur lot courant; Codex a repris le correctif Claude `abe4b81` et terminé les quatre validations globales. Les 61 tests de routage, 18 tests d'admission et 110 tests d'accès/reprise couvrent des périmètres distincts; ils ne remplacent pas une mission réelle.
 
-Branche produit publiée : [codex/hq-delivery-integration](https://github.com/mboyer1269-pixel/Oria.HQ.Michael.HQ-APP/tree/codex/hq-delivery-integration), tête documentaire `e56d713`. Le checkout canonique reste à `e9ff840`; ni fusion ni déploiement. Les agents repartent de ce candidat pour la qualification suivante, en préservant leurs autres travaux locaux.
+Branche produit publiée : [codex/hq-delivery-integration](https://github.com/mboyer1269-pixel/Oria.HQ.Michael.HQ-APP/tree/codex/hq-delivery-integration), tête `b0752d3`. Depuis `2f08e96`, seules la documentation et la correction du banc `ad549d7` ont changé; les sources applicatives sont identiques. Le checkout canonique reste à `e9ff840`; ni fusion ni déploiement. Les agents repartent de ce candidat pour la qualification suivante, en préservant leurs autres travaux locaux.
 
 | Responsable | Action immédiate | Sortie attendue |
 | --- | --- | --- |
-| Claude Code | Lot accès/reprise terminé. À la levée du prérequis d'accès, qualifier le runtime Hermes avec sa sonde existante, sans reprendre l'admission. | Version, capacités et limites observées; pas de conclusion tirée du seul nom Hermes. Recette navigateur du formulaire avant activation. |
-| Cursor | Lot routage terminé et revérifié; attendre la preuve backend pour sa revue indépendante. | Pas de recherche ou nouvelle couche en attendant; revue des tentatives, modèles et coûts sur le futur parcours réel. |
-| Antigravity | Lots admission/harnais et maquette livrés; attendre hôte Docker autorisé et retour visuel de Michael. | Exécuter le banc réel dès que le prérequis existe; conserver les quatre niveaux de preuve séparés. |
+| Claude Code | Lot accès/reprise terminé; reste propriétaire des corrections de ce formulaire. À la levée du prérequis d'accès, qualifier le runtime Hermes avec sa sonde existante. | Version, capacités et limites observées; pas de conclusion tirée du seul nom Hermes. |
+| Cursor | Lot routage terminé et revérifié; revue indépendante de la qualification PostgreSQL à transmettre avec les références publiées. | Vérifier la portée des assertions et les prérequis du branchement; aucun chantier produit parallèle ni appel modèle. |
+| Antigravity | Banc réel terminé; correctif stdin `78df517` accepté et intégré dans `ad549d7`. Le sous-agent `browser_recette` est effectivement lancé. La maquette attend toujours Michael. | Recette du composant réel rendu avec transport de test, revue des interactions et limites explicites. Aucun succès modèle déduit de ces preuves. |
 | Codex | Candidat validé; organiser l'hôte de qualification autorisé et contrôler les preuves du parcours complet. | Chaîne directive → mission unique → autorisation → OpenHands → tests → revue → aperçu, puis reprise sans doublon. |
 
 Les agents exécutent leurs tests ciblés; Codex centralise les quatre validations globales. Rapports concis avec liens vers les journaux, pas de répétition des mêmes sorties. Une fois ce lot accepté, la priorité est la qualification réelle du stockage et du lanceur, puis Hermes et une mission OpenHands complète. Aucune nouvelle plateforme n'est nécessaire pour ce jalon.
 
 Contrôles centraux du candidat : TypeScript 15 s, lint 29 s (0 erreur, 5 avertissements préexistants), build 37 s, smoke local 1 s, tous réussis. Copie de validation Linux native, code du correctif vérifié par empreintes. Aucune performance d'une mission réelle ne peut être déduite de ces temps.
 
-Pré-requis non satisfaits : Docker opérationnel, observation autorisée du runtime Hermes et de son compte, validation visuelle de Michael. L'inspection SSH demandée reste en attente après un refus automatique; ne pas la contourner. Aucun accès ou modèle payant nouveau n'est autorisé implicitement.
+Docker local est maintenant opérationnel (moteur 29.4.0); voir [l'intervention réversible](HQ-DOCKER-RECOVERY-2026-10-01.md). La qualification PostgreSQL réelle du run `1790836047_67270` a terminé code 0 : journal, contenu après redémarrage et nettoyage contrôlés par Codex. Cela ne qualifie ni l'identité utilisateur/RLS, ni le worker. Pré-requis encore non satisfaits : observation autorisée du runtime Hermes et de son compte, validation visuelle de Michael. L'inspection SSH demandée reste en attente après un refus automatique; ne pas la contourner. Aucun accès ou modèle payant nouveau n'est autorisé implicitement.
 
 ## Contexte et objectif
 Ce document précise l'exécution du plan existant et remplace les attributions contradictoires. HQ quotidien dans ORIA, Hermes interlocuteur/orchestrateur, HQ autorité des missions, OpenHands exécutant. Aucun achèvement du projet n'est déclaré.
@@ -82,7 +82,7 @@ Réutilise deux sous-agents séparés: construction backend et revue indépendan
 
 ## Informations manquantes
 - Capacités actuelles du Hermes déployé et accès modèle autorisé pour la mission.
-- Moteur Docker actif et banc de qualification exécuté.
+- Qualification du lanceur privilégié et de l'identité utilisateur; le stockage CLI/service est maintenant qualifié sur base réelle jetable.
 - Validation visuelle finale par Michael.
 - Coûts et limites des accès réellement disponibles; aucun tarif déduit d'un nom de forfait.
 - Délai fiable avant levée des prérequis. Aucun objectif « zéro bug » prétendu.

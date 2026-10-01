@@ -1,0 +1,31 @@
+=== CRÉATION DE L'ENVIRONNEMENT DOCKER JETABLE ===
+Attente de PostgreSQL...
+✔ PostgreSQL jetable opérationnel.
+--- Application des migrations réelles (0001_missions.sql) ---
+✔ Schéma et rôle de qualification appliqués en base.
+--- Démarrage de PostgREST ---
+Attente de PostgREST sur port dynamique 32771...
+✔ PostgREST opérationnel sur http://127.0.0.1:32771.
+=== EXÉCUTION DU HARNAIS CLI (ADMISSION, CONCURRENCE DIVERGENTE, MÊME PAYLOAD, COUPURE RÉSEAU) ===
+=== EXÉCUTION DU HARNAIS RÉEL CLI → VRAI SERVICE → POSTGRESQL/POSTGREST ===
+✔ Preuve 1 : Admission initiale réussie en base réelle (status=saved, draft, executionRequested=false, contenu PostgREST validé)
+✔ Preuve 2 : Concurrence simultanée sur payload divergent gérée avec succès (1 gagnant saved avec contenu/hash persistés vérifiés, 1 conflit code 3)
+✔ Preuve 2-bis : Deux créations simultanées avec le même payload dédupliquées à l'identique (même missionId, status=saved, contenu persisté vérifié)
+✔ Preuve 3 : Workspace falsifié rejeté (code 3, invalid_request) et étanchéité inter-workspace garantie (lookup not_found)
+✔ Preuve 4 : Perte réelle de réponse post-commit récupérée par lookup CLI sans duplication (contenu persisté PostgREST vérifié)
+
+=== ÉPREUVES CLI RÉELLES TERMINÉES AVEC SUCCÈS ===
+=== ASSERTIONS SQL STRICTES HORS DU SCRIPT ===
+synthetic-ws-a|4|draft|t|0
+Total missions en base : 4
+✔ Assertions SQL strictes validées (exactement 4 missions, toutes en draft, requires_approval=true, autonomy=0, unicités garanties).
+=== ÉPREUVE DE PERSISTANCE : ARRÊT ET REDÉMARRAGE DU CONTENEUR ===
+PostgreSQL arrêté.
+PostgreSQL redémarré. Attente de disponibilité...
+--- Relecture par client neuf (--verify-restart) ---
+=== VÉRIFICATION DE LA PERSISTANCE APRÈS REDÉMARRAGE (CLIENT NEUF) ===
+✔ Succès : Les 4 missions créées avant redémarrage sont intactes avec leur contenu exact (vérifié via PostgREST/SQL) et immédiatement lisibles par un client neuf.
+Total missions après redémarrage : 4
+✔ Données intactes après redémarrage complet (exactement 4 missions, contenu exact du gagnant préservé).
+=== QUALIFICATION RÉELLE TERMINÉE AVEC SUCCÈS ===
+--- Nettoyage des ressources jetables du run 1790836047_67270 ---
