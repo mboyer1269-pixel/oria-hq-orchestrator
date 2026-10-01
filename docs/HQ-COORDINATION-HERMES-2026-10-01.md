@@ -2,6 +2,8 @@
 
 Ce mandat courant remplace les anciennes attributions. Hermes est identifié et mis à jour; voir HQ-HERMES-MISE-A-JOUR-2026-10-01.md. Le gel de la maquette demeure. Il n'empêche pas le travail backend isolé autorisé par Michael.
 
+**Retour visuel suivant :** Michael demande une V2 isolée, mobile en priorité, Discuter/Atelier et artefacts; sa construction est autorisée, son intégration ne l'est pas. La V1 reste préservée. Voir [brief V2](HQ-MAQUETTE-V2-DISCUTER-ATELIER.md). Antigravity délègue la construction UI séparément du backend; Claude vérifie le contrat modèles/accès; Cursor revoit les états et parcours sur le routeur existant. Les livrables backend antérieurs restent conservés pour revue, sans recommencer leurs tests.
+
 Base produit publiée : `codex/hq-delivery-integration`, `f0e42a531c1a1e2d47726f870d15f0f905f367d8`, dépôt `mboyer1269-pixel/Oria.HQ.Michael.HQ-APP`. La base de code qualifiée est `cf4fc4a`; la tête suivante ne change que la documentation. Ne pas repartir d'un ancien patch isolé. Préserver tous les travaux et les previews existants.
 
 ## Propriétaires et sorties
