@@ -19,7 +19,7 @@ Constats de lecture : le dépôt HQ contient déjà le service `src/server/missi
 
 ### Responsabilités et maîtrise du périmètre
 
-Claude possède actuellement accès propriétaire et reprise du formulaire; sa sonde Hermes est livrée. Antigravity possède admission, qualification et maquette isolée; Cursor routage, modèle exécuté et coûts; Codex cohérence et acceptation indépendante. Voir `docs/HQ-DIRECTION-COMMUNE-HERMES.md`. Les étapes ultérieures dépendent des preuves précédentes. Chaque nouvelle idée va dans un backlog tant qu’elle ne lève pas un blocage du parcours. Pas de nouvelle plateforme ou routeur sans manque démontré.
+La répartition courante est maintenue dans [le contrat de livraison](docs/HQ-LIVRAISON-2026-10-01.md), pour ne pas multiplier les mandats contradictoires. Les correctifs d'accès et de reprise de Claude sont assemblés; sa revue ciblée des délais fournisseur est livrée. Cursor corrige les clients et le contrôle budgétaire; Antigravity termine la maquette isolée; Codex vérifie les lots et centralise les validations. La sonde Hermes attend un accès autorisé. Les étapes ultérieures dépendent des preuves précédentes. Chaque nouvelle idée va dans un backlog tant qu’elle ne lève pas un blocage du parcours. Pas de nouvelle plateforme ou routeur sans manque démontré.
 
 ### Références UX ciblées
 

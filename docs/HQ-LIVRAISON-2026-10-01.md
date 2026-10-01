@@ -2,6 +2,42 @@
 
 ## Pilotage courant — prime sur les états historiques
 
+L'objectif reste une application quotidienne dans ORIA : Hermes comme interlocuteur et orchestrateur, HQ comme registre canonique des missions et autorisations, OpenHands comme exécutant. Discuter et Atelier présentent le même travail. AgentMemory partage seulement le contexte local de développement.
+
+### Résultat et limites du lot actuel
+
+- **Cursor** : registre monétaire en cents USD, devis bornés côté serveur et délais HTTP corrigés. Le banc PostgreSQL réel `1790840244_77530` passe : concurrence dans les deux ordres et conservation des identités, montants et états après redémarrage. Le rôle SQL est privilégié; cette preuve ne qualifie pas l'authentification HTTP/RLS. Les erreurs du registre et le coût agrégé du fallback sont corrigés et vérifiés; voir [la revue budgétaire](HQ-REVUE-BUDGET-2026-10-01.md).
+- **Claude Code** : revue indépendante terminée. Deux défauts reproduits : corps HTTP échappant au délai et exceptions du registre pouvant faire perdre un résultat modèle déjà reçu. Rapports [délais](CLAUDE-PROVIDER-DEADLINE-REVIEW.md) et [registre](CLAUDE-RESERVATION-EXCEPTIONS.md). Aucun code produit modifié dans ce mandat de revue.
+- **Antigravity** : maquette `d821773` gelée. Codex confirme 33 tests sans exclusion et la continuité de mission/brouillon sur mobile. Les actions principales sont visibles à 390 × 844; données, modèles et outils simulés identifiés. [Recette visuelle](HQ-MAQUETTE-MOBILE-2026-10-01.md). La validation de Michael est demandée, pas obtenue.
+- **Codex** : assemblage dans `codex/hq-delivery-integration`, revue indépendante et validations centrales. Les 65 tests ciblés, la sonde indépendante et les quatre validations globales passent sur l'arbre final `f7151f6`, candidat `286a211`. Voir [l'acceptation technique](HQ-BUDGET-ACCEPTATION-2026-10-01.md).
+
+La migration budget reste désactivée dans l'application active. Aucun tarif, plafond réel, compte, modèle payant ou déploiement n'est ajouté. La preuve de mission réelle complète manque encore. Les résultats de base de données et de navigateur ne la remplacent pas.
+
+### Séquence suivante et responsabilités exclusives
+
+1. **Lot courant clos techniquement.** Cursor a remis son dernier patch, base, arbre, empreinte et tests; Codex a contrôlé puis exécuté `npm run typecheck`, `npm run lint`, `npm run build`, `npm run smoke:joris` sur l'arbre assemblé. Publication sur la branche de travail; aucune fusion principale implicite. Cursor a terminé cette remise.
+2. **Qualifier Hermes avec l'accès autorisé.** Claude réutilise sa sonde existante. Livrer version/source réellement installée, transport disponible, schéma des capacités, mode de compte et prérequis. Pas de secret dans le rapport, pas de requête modèle pour identifier le service. L'accès SSH en lecture seule reste en attente après refus automatique : aucun contournement ni relance sans autorisation. La disponibilité d'un abonnement ne prouve pas celle d'une API.
+3. **Raccorder une seule chaîne.** Après ce constat, Antigravity reprend le bridge existant vers le service HQ et le worker OpenHands. Une identité de mission, admission distincte de l'autorisation, pas de second orchestrateur. Construire en copie isolée avec un sous-agent de revue en lecture seule. La maquette ne rejoint le produit qu'après validation visuelle. Cursor revoit les contrats et preuves, sans modifier les fichiers du constructeur.
+4. **Livrer une mission observable.** Directive depuis HQ authentifié → mission unique → autorisation bornée → modification isolée par le vrai modèle → tests → revue indépendante → aperçu accessible. Prouver refus sans émission, seconde demande identique sans second lancement, reconnexion et reprise sans perte du résultat. Aucun `PASS` métier tiré d'une fixture ou d'un simple conteneur terminé.
+5. **Achever l'usage quotidien.** Une fois cette mission réussie : brancher les vues Aujourd'hui/Discuter/Atelier aux événements réels, rendre les indisponibilités explicites, vérifier mobile et clavier, puis mesurer durée, usage disponible et interventions. Finaliser README, tâches et mémoire à partir de ces preuves.
+
+### Format obligatoire de chaque remise
+
+Un rapport court : dépôt, base, commit/arbre, fichiers changés, commandes réellement exécutées, résultat et exclusions, type de preuve (contrat simulé / infrastructure réelle / modèle réel / validation utilisateur), défauts restants et prochaine action. Un responsable d'écriture par fichier. Réutiliser les scripts et recherches existants; recherche officielle ciblée seulement si une inconnue précise la justifie. Aucun nouveau modèle, plateforme ou audit général sans besoin démontré.
+
+### Prérequis encore ouverts
+
+- Validation visuelle de Michael avant intégration de la maquette.
+- Autorisation d'inspection VPS et identification du véritable runtime Hermes.
+- Profil/compte, modèle et enveloppe de la mission réelle confirmés; aucun passage silencieux vers une API payante.
+- Qualification de l'identité HTTP/RLS et du worker sur le parcours réellement raccordé.
+
+Le silence ne vaut aucune approbation. Les mandats conditionnels ci-dessus constituent le prochain plan d'exécution; ils ne signifient pas que les agents ont déjà exécuté ces étapes.
+
+## Historique des lots précédents — ne pas reprendre comme mandat courant
+
+### Bilan du lot précédent
+
 Le candidat produit est assemblé dans la branche isolée `codex/hq-delivery-integration`, commit de code `2f08e96`. Les trois agents ont livré leur lot courant; Codex a repris le correctif Claude `abe4b81` et terminé les quatre validations globales. Les 61 tests de routage, 18 tests d'admission et 110 tests d'accès/reprise couvrent des périmètres distincts; ils ne remplacent pas une mission réelle.
 
 Branche produit publiée : [codex/hq-delivery-integration](https://github.com/mboyer1269-pixel/Oria.HQ.Michael.HQ-APP/tree/codex/hq-delivery-integration), tête `e0d80e5`. Depuis `2f08e96`, changements limités à la documentation, au banc `ad549d7` et au texte du formulaire décrivant OpenHands (`e0d80e5`). La logique applicative est identique. Le checkout canonique reste à `e9ff840`; ni fusion ni déploiement.

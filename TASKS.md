@@ -7,7 +7,7 @@
 - [x] Attribuer chaque périmètre à un seul agent et transmettre les directives.
 - [x] Récupérer le patch Cursor sans étendre ses droits GitHub; vérifier le contenu transféré et le correctif avec 61 tests ciblés.
 - [x] Assembler le runtime d'admission et le routage dans une copie isolée; 18 tests d'admission réussis dans cette copie.
-- [x] Revoir et assembler les corrections d'accès et de reprise de Claude (`13930e1`, `abe4b81` → candidat `2f08e96`); 110 tests ciblés/dépendants passés chez Codex. La recette navigateur reste à faire.
+- [x] Revoir et assembler les corrections d'accès et de reprise de Claude (`13930e1`, `abe4b81` → candidat `2f08e96`); 110 tests ciblés/dépendants passés chez Codex. Recette navigateur réalisée ci-dessous, avec transport simulé.
 - [x] Corriger et vérifier la syntaxe du banc PostgreSQL d'Antigravity (`720d513`); ne pas confondre préparation et exécution.
 - [x] Rétablir le moteur Docker local sans réinitialisation ni suppression des volumes; clients Windows et WSL vérifiés, moteur 29.4.0.
 - [x] Exécuter le banc réel avec concurrence, réponse perdue et contenu préservé après redémarrage : run `1790836047_67270`, code 0; journal, assertions et nettoyage revus par Codex. Correctif de blocage stdin du banc intégré dans `ad549d7`.
@@ -15,7 +15,10 @@
 - [x] Revue indépendante Cursor du banc réel (`a279100` repris dans `78d2d89`) : preuve de persistance maintenue; auth/RLS/Hermes explicitement non qualifiés.
 - [x] Corriger et vérifier dans le navigateur la continuité Aujourd'hui → Discuter → Atelier de la maquette et l'état après GO (`87c00df`).
 - [ ] Obtenir la validation visuelle de Michael puis raccorder l'interface aux événements réels.
-- [x] Faire passer typecheck, lint, build et smoke sur le candidat de code `2f08e96` (0 erreur lint, 5 avertissements hors lot).
+- [x] Corrections de maquette `d821773` : séparation assistant/modèle/accès, continuité de mission et usage mobile vérifiés; 33 tests et recette CUA. Validation visuelle toujours requise.
+- [x] Cursor : corriger et qualifier le composant budgétaire désactivé. 65 tests, PostgreSQL réel, sonde indépendante et quatre validations globales passants. Voir `docs/HQ-BUDGET-ACCEPTATION-2026-10-01.md`; activation, devis réels et identité des appelants restent à qualifier.
+- [x] Claude puis Cursor : reproduire et corriger le délai HTTP après les en-têtes; Codex confirme 27 tests et une interruption du corps bloqué à 601–792 ms pour 600 ms demandés. Correctif intégré au candidat validé `286a211`.
+- [x] Faire passer typecheck, lint, build et smoke sur le candidat de code `286a211` (0 erreur lint, 5 avertissements hors lot).
 - [ ] Qualifier le vrai Hermes installé et l'accès modèle autorisé; réaliser la mission complète décrite ci-dessous.
 
 ## Implémenté ou qualifié dans un périmètre borné
