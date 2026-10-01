@@ -1,5 +1,37 @@
 # HQ constructeur : choix des briques et plan de qualification
 
+Exécution du 1 octobre 2026 : [contrat de livraison et mandats courants](docs/HQ-LIVRAISON-2026-10-01.md). Cette répartition remplace les anciens propriétaires ci-dessous; les six critères de sortie restent applicables.
+
+## Plan de consolidation actuel — priorité sur les sections historiques
+
+Objectif produit : HQ dans ORIA, assistant quotidien Hermes, espaces Discuter et Atelier partageant les mêmes missions. OpenHands réalise les tâches de développement. Cette version du plan organise les composants existants, sans autoriser une refonte globale ou supprimer les fonctions métier ORIA.
+
+Constats de lecture : le dépôt HQ contient déjà le service `src/server/missions/development-mission.ts`, un routeur `src/server/ai/model-router.ts`, ses tests et une échelle de coût. La classification est heuristique et le stockage budgétaire par défaut est en mémoire : ce ne sont pas encore un routage optimal démontré ni une comptabilité durable en dollars. Les 12 tests du pont et 17 tests du validateur ont été rejoués avec succès dans leurs périmètres respectifs. Le parcours réel complet reste non démontré. Cette revue ciblée ne constitue pas un audit exhaustif des 15 domaines du produit.
+
+### Séquence de livraison et critères de sortie
+
+1. **Consolider les sources.** Répertorier pour chaque lot dépôt, base, commit, propriétaire, tests et dépendances. Distinguer actif, expérimental et historique. Garder les modifications locales ; aucune suppression avant vérification des appelants. Une seule référence de mission et un responsable d’écriture par fichier.
+2. **Fermer le backend.** Utiliser la sonde Hermes livrée par Claude pour qualifier l'installation via un accès autorisé, qualifier admission/concurrence/réponse perdue/redémarrage sur PostgreSQL/PostgREST réels (Antigravity), et faire contrôler les preuves par Codex. Claude corrige les accès et la reprise; Cursor traite le routage puis la revue prévue. Authentification et workspace imposés côté serveur ; admission, autorisation et exécution distinctes. Aucun faux vert avec simulation.
+3. **Relier la conversation au travail.** Directive depuis Discuter, mission canonique, autorisation, worker OpenHands existant, événements persistants, diff, tests indépendants et aperçu. Une question seule ne lance rien. Reconnexion et double clic ne recréent pas la mission. L’issue inconnue reste visible et bloque la relance aveugle.
+4. **Finaliser la maquette puis le frontend.** Aujourd’hui : reprise, décisions, idées rapides. Discuter : Hermes, projet et accès/modèle visibles. Atelier : plan, activité, résultat, preuves. Mobile : une vue principale à la fois ; desktop : panneaux complémentaires. Chaque contrôle a effet, état chargé/vide/erreur/indisponible et retour observable. Explications au clic sur décisions et impacts, pas raisonnement interne. Maquette validée par Michael avant intégration ; tests navigateur mobile/clavier et parcours réel après intégration.
+5. **Maîtriser modèles et coûts.** Réutiliser et qualifier le routeur existant avant d’ajouter RouteLLM. Séparer abonnement, API et modèle local. Estimation avant mission, consommation observée après, inconnue explicitement affichée. Aucun basculement silencieux payant. Budget durable et contrôle au point d’appel à qualifier ; ne pas présenter les unités internes comme dollars. Comparer qualité/coût/latence sur les mêmes missions avant sélection automatique.
+6. **Recette de livraison.** Une vraie modification utile avec compte autorisé, tests, revue et aperçu ; refus hors projet ; interruption/reprise sans double effet ; sauvegarde/restauration et rollback éprouvés en qualification ; journal expurgé ; aucun bug critique connu sur ce parcours. Déployer seulement après revue et autorisations applicables. Les autres fonctions ORIA restent conservées et leurs régressions sont contrôlées.
+
+### Responsabilités et maîtrise du périmètre
+
+Claude possède actuellement accès propriétaire et reprise du formulaire; sa sonde Hermes est livrée. Antigravity possède admission, qualification et maquette isolée; Cursor routage, modèle exécuté et coûts; Codex cohérence et acceptation indépendante. Voir `docs/HQ-DIRECTION-COMMUNE-HERMES.md`. Les étapes ultérieures dépendent des preuves précédentes. Chaque nouvelle idée va dans un backlog tant qu’elle ne lève pas un blocage du parcours. Pas de nouvelle plateforme ou routeur sans manque démontré.
+
+### Références UX ciblées
+
+- Devin, parcours de réalisation depuis une spécification : https://docs.devin.ai/use-cases/gallery/implement-feature-from-spec
+- Linear, aperçu de projet et jalons : https://linear.app/docs/project-overview
+
+Inspiration proposée : continuité demande/travail/résultat et progression lisible. Aucun avantage concurrentiel ni qualité « zéro bug » déclaré sans essai comparatif. Les horaires seront estimés après levée des prérequis réels, pas à partir du nombre de tests.
+
+---
+
+Les sections suivantes conservent l’historique des décisions ; en cas de conflit, le plan de consolidation et la direction commune actuels priment.
+
 Nomenclature corrigée suivant l'épellation utilisateur : **ORIA HQ**. Les chemins historiques de dépôts ne sont pas renommés par cette correction documentaire.
 
 ## Mandat opérationnel — priorité actuelle, 30 septembre 2026

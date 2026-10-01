@@ -1,0 +1,106 @@
+# HQ — contrat de livraison du 1 octobre 2026
+
+## Pilotage courant — prime sur les états historiques
+
+Le candidat produit est assemblé dans la branche isolée `codex/hq-delivery-integration`, commit `c4659f1`. Cursor et Antigravity ont livré leur lot courant. Claude traite un dernier correctif React trouvé par le lint central. Les 61 tests de routage, 18 tests d'admission et 107 tests d'accès/reprise couvrent des périmètres distincts; ils ne remplacent pas une mission réelle.
+
+| Responsable | Action immédiate | Sortie attendue |
+| --- | --- | --- |
+| Claude Code | Corriger le reset d'état et la lecture de ref au rendu du formulaire, sans désactiver le lint. | Commit minimal, lint ciblé et tests de reprise réussis. |
+| Cursor | Lot routage terminé et revérifié; attendre la preuve backend pour sa revue indépendante. | Pas de recherche ou nouvelle couche en attendant; revue des tentatives, modèles et coûts sur le futur parcours réel. |
+| Antigravity | Lots admission/harnais et maquette livrés; attendre hôte Docker autorisé et retour visuel de Michael. | Exécuter le banc réel dès que le prérequis existe; conserver les quatre niveaux de preuve séparés. |
+| Codex | Reprendre le correctif Claude, valider le candidat, conserver provenance et limites. | Typecheck, lint, build et smoke sur le même candidat; bilan exploitable et documentation exacte. |
+
+Les agents exécutent leurs tests ciblés; Codex centralise les quatre validations globales. Rapports concis avec liens vers les journaux, pas de répétition des mêmes sorties. Une fois ce lot accepté, la priorité est la qualification réelle du stockage et du lanceur, puis Hermes et une mission OpenHands complète. Aucune nouvelle plateforme n'est nécessaire pour ce jalon.
+
+Pré-requis non satisfaits : Docker opérationnel, observation autorisée du runtime Hermes et de son compte, validation visuelle de Michael. L'inspection SSH demandée reste en attente après un refus automatique; ne pas la contourner. Aucun accès ou modèle payant nouveau n'est autorisé implicitement.
+
+## Contexte et objectif
+Ce document précise l'exécution du plan existant et remplace les attributions contradictoires. HQ quotidien dans ORIA, Hermes interlocuteur/orchestrateur, HQ autorité des missions, OpenHands exécutant. Aucun achèvement du projet n'est déclaré.
+
+## Faits contrôlés avant délégation
+- Produit C:/Users/micha/Dev/Oria.HQ HEAD e9ff840, arbre propre.
+- Claude audit 3fc400d: rapport .claude/worktrees/claude-audit-coherence-finalisation/docs/CLAUDE-AUDIT-COHERENCE-FINALISATION.md. Constats owner.ts et formulaire vérifiés par lecture Codex; aucune exploitation distante démontrée.
+- Sonde Hermes b91b218: classifie des fichiers d'observation, ne prouve pas le VPS. Accès SSH refusé dans sa session.
+- Antigravity backend d4ce3d7. Script du commit eb48ffa: Map, identité présumée, reçu figé, succès sans worker. Refusé comme preuve réelle. UI 8e09522 reste maquette.
+- Cursor validateur: 17 tests précédemment rejoués. Rapport coûts livré; implémentation non faite à cet instant. Lecture provider confirme repli multi-fournisseur automatique.
+- Docker Windows installé mais daemon indisponible au contrôle; WSL sans moteur utilisable précédemment.
+- Zapier MCP: UNAUTHORIZED, reconnexion requise; aucun accès ajouté.
+
+## Répartition exclusive
+| Agent | Écriture autorisée | Livrable suivant |
+| --- | --- | --- |
+| Claude Code | owner.ts, formulaire mission, tests directs | Correction accès/reprise |
+| Cursor | AI/router, brain, mission-draft-control, tests | Modèles réellement appelés et coûts honnêtes |
+| Antigravity | admission CLI/service/handlers, harness; UI isolée | Preuves corrigées puis qualification réelle |
+| Codex | coordination, docs, revue intégration | Acceptation sur diff et preuves |
+
+## Directive Claude Code
+Mission de livraison ORIA HQ, 1 octobre 2026. ORIA héberge HQ; Hermes interlocuteur et orchestrateur; HQ seul registre des missions, identités, autorisations et preuves; OpenHands exécutant. AgentMemory est mémoire locale de développement, jamais mémoire runtime. Réutiliser le code existant. Une question n'exécute rien; admission, autorisation et exécution restent distinctes. Maquette à valider par Michael avant intégration UI. Branche isolée, un propriétaire par fichier, pas reset/force push/main/prod/secrets/nouveaux accès ou appel modèle payant. Livrer commit+base, fichiers, commandes réellement exécutées, résultats et limites. Les fixtures prouvent un contrat, jamais une exécution réelle. Contexte ciblé; pas de nouvelle recherche générale; une question technique non résolue justifie une recherche officielle ciblée. Typecheck/lint/build/smoke du produit et tests ciblés avant livraison. Sous-agent de revue lecture seule autorisé, pas de multiplication sans besoin. Un blocage doit donner sa cause et une action précise; poursuivre le travail indépendant.
+
+Ton mandat exclusif est de corriger deux défauts établis, sans reprendre le backend d'Antigravity ni le routage Cursor. Source produit C:/Users/micha/Dev/Oria.HQ HEAD e9ff840, utiliser copie isolée de ce contenu et consigner base effective. Lire AGENTS.md, SOUL.md et docs/REPO_CONSOLIDATION.md. Rapport de départ C:/Users/micha/Documents/ChatGPT/Orchestrator/.claude/worktrees/claude-audit-coherence-finalisation/docs/CLAUDE-AUDIT-COHERENCE-FINALISATION.md.
+Phase 1: reproduire constat 1 dans src/server/auth/owner.ts: le global __ownerApiSessionTestResult est actuellement honoré sans garde production. Corriger en conservant les tests utiles, prouver qu'en production ce global ne court-circuite pas la vraie barrière. Ne pas présenter cela comme une exploitation distante démontrée.
+Phase 2: src/features/missions/components/development-mission-form.tsx: après reload une saisie nouvelle est transformée en GET par un requestId résiduel et annoncée enregistrée. Rendre reprise vs nouvelle mission explicites; réhydrater sans ignorer la saisie; conserver même id/payload pour retry sûr, distinguer reçu relu et création. Cas sessionStorage absent/corrompu, double clic, reload, workspace différent, tentative réseau à issue inconnue. Pas de refonte esthétique ni de nouveau contrat serveur sans coordination.
+Phase 3: tests comportementaux sur ces risques, puis npm run typecheck, npm run lint, npm run build, npm run smoke:joris. Rapporter skips/failures honnêtement. Fournir docs/CLAUDE-ACCES-REPRISE-RESULTAT.md et patch/commit isolé, pas de push/merge. Périmètre autorisé owner.ts, formulaire et leurs tests directs, rapport. Au-delà proposer un contrat au coordinateur.
+L'identification Hermes reste livrée b91b218 en lecture seule, pas besoin de relancer sa recherche. Le backend et la vraie DB appartiennent à Antigravity. Les tests passent uniquement pour le commit exact livré. Termine la correction; ne te contente pas d'un nouveau plan.
+
+## Directive Cursor
+Mission de livraison ORIA HQ, 1 octobre 2026. ORIA héberge HQ; Hermes interlocuteur et orchestrateur; HQ seul registre des missions, identités, autorisations et preuves; OpenHands exécutant. AgentMemory est mémoire locale de développement, jamais mémoire runtime. Réutiliser le code existant. Une question n'exécute rien; admission, autorisation et exécution restent distinctes. Maquette à valider par Michael avant intégration UI. Branche isolée, un propriétaire par fichier, pas reset/force push/main/prod/secrets/nouveaux accès ou appel modèle payant. Livrer commit+base, fichiers, commandes réellement exécutées, résultats et limites. Les fixtures prouvent un contrat, jamais une exécution réelle. Contexte ciblé; pas de nouvelle recherche générale; une question technique non résolue justifie une recherche officielle ciblée. Typecheck/lint/build/smoke du produit et tests ciblés avant livraison. Sous-agent de revue lecture seule autorisé, pas de multiplication sans besoin. Un blocage doit donner sa cause et une action précise; poursuivre le travail indépendant.
+
+Ton rapport CURSOR-ROUTAGE-COUTS-ECARTS.md est maintenant une entrée d'implémentation. Périmètre exclusif produit: src/server/ai/* et leurs appelants directs src/server/joris/brain.ts, src/server/missions/mission-draft-control.ts, tests et rapport. Base Oria.HQ.Michael.HQ-APP branche codex/hq-mission-dossier e9ff840, clone/branche isolée du bon dépôt; si accès écriture absent, livrer patch vérifiable, ne pas coder dans le dépôt orchestrator en prétendant avoir corrigé le produit.
+Phase 1: reproduire débits sur chooseModel sans appel, message gratuit alors que modèle payant, auto-fallback Anthropic/OpenAI. Rendre la sélection sans effet de comptabilité. Ne pas déplacer simplement le faux débit au premier succès: distinguer estimation, réservation éventuelle, usage observé, coût inconnu et appel échoué possiblement facturé. Unités 0/1/5 ne sont pas des dollars.
+Phase 2: appliquer au point d'appel le modèle réellement supporté et la politique d'accès; aucun second fournisseur payant sans autorisation explicite et scoped workspace. Refuser un modèle indisponible/non pris en charge, ne pas annoncer abonnement ou local opérationnel. Résultat template sans appel: aucun faux modèle exécuté. Champs choisis/exécutés distingués de façon compatible avec appelants.
+Phase 3: tests zéro requête réseau sur refus, aucun débit de routage, pas de fallback payant implicite, coût inconnu distinct de zéro, deux workspaces séparés, modèle réel renvoyé. Réutiliser stockage/journal existant si possible; pas de nouvelle plateforme de facturation. Si durable budget demande migration commune, livrer contrat proposé et bloquer l'affirmation de budget durable, sans empiéter sur Antigravity.
+Phase 4: quatre validations produit, diff/base/SHA et docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md. Les changements dans auth, formulaire missions, CLI admission et cockpit sont exclus. Révise ensuite en lecture seule la preuve réelle backend quand disponible. Ne relance pas une étude générale. Utilise seulement les réglages de forfait actuels; pas d'activation on-demand ou d'ajout d'abonnement.
+
+## Directive Antigravity
+Mission de livraison ORIA HQ, 1 octobre 2026. ORIA héberge HQ; Hermes interlocuteur et orchestrateur; HQ seul registre des missions, identités, autorisations et preuves; OpenHands exécutant. AgentMemory est mémoire locale de développement, jamais mémoire runtime. Réutiliser le code existant. Une question n'exécute rien; admission, autorisation et exécution restent distinctes. Maquette à valider par Michael avant intégration UI. Branche isolée, un propriétaire par fichier, pas reset/force push/main/prod/secrets/nouveaux accès ou appel modèle payant. Livrer commit+base, fichiers, commandes réellement exécutées, résultats et limites. Les fixtures prouvent un contrat, jamais une exécution réelle. Contexte ciblé; pas de nouvelle recherche générale; une question technique non résolue justifie une recherche officielle ciblée. Typecheck/lint/build/smoke du produit et tests ciblés avant livraison. Sous-agent de revue lecture seule autorisé, pas de multiplication sans besoin. Un blocage doit donner sa cause et une action précise; poursuivre le travail indépendant.
+
+Reprise depuis tes commits backend d4ce3d7 / eb48ffa et UI 8e09522, pas repartir de zéro. Périmètre exclusif backend admission src/scripts/development-mission.mjs, src/server/missions/development-mission.ts, src/app/api/missions/development/handlers.ts et preuves; maquette isolée conservée. Claude corrige owner.ts et development-mission-form.tsx; Cursor AI/router/brain/mission-draft-control. Ne touche pas leurs fichiers.
+
+Phase 0 obligatoire: corriger preuves/prove-hermes-intake-openhands-chain.mjs. Revue Codex vérifiée: Map() comme base, NOUS_HERMES_IDENTIFICATION mêle poids Ollama et agent sans observation, arbitrage=mutation directe Map, ledgerEntryId et SHA écrits en dur, executionFinished:true sans worker lancé, séquence dite concurrente mais await séquentiels, lookup sans perte de réponse injectée. Conserver test de contrat clairement simulated; aucun PASS durable/worker/ledger/fin réelle. Corriger les rapports dérivés. Ce n'est pas une preuve complète acceptée.
+
+Phase 1: conclure banc PostgreSQL/PostgREST réel, réutiliser ton harness af89754. Docker Windows existe mais daemon absent au dernier contrôle; ne rejoue pas des simulations pour contourner. Définir prérequis et commande exacte avec images/ports loopback, réseau et données jetables nommés, nettoyage limité aux ressources créées. Ne touche ni Supabase réelle ni prod. Fournir script relançable depuis hôte Docker autorisé. Assertions: deux appels réellement simultanés même payload -> même mission; divergence -> conflit; perte réponse injectée après commit -> lookup sans réécriture; restart DB conserve contenu; cross-workspace refus. Absence Docker = blocked, pas passed.
+
+Phase 2: corriger erreurs avant écriture => invalid_request/unavailable; réserver outcome_unknown à une tentative dont l'effet ne peut être établi. HTTP reste autorité utilisateur; CLI adaptateur service de confiance réutilise le service canonique, jamais un chemin public qui choisit librement actor/workspace. Documenter qui protège config et qui autorise son lancement; fichier 0600 seul ne prouve pas délégation.
+
+Phase 3 dépend des capacités Hermes observées et d'un compte autorisé: brancher les événements/admission au worker EXISTANT, ne pas inventer API/provenance. Rapport Claude b91b218 disponible C:/Users/micha/Documents/ChatGPT/Orchestrator/.claude/worktrees/claude-hermes-runtime-probe/docs/CLAUDE-HERMES-RUNTIME-RESULTAT.md (WSL /mnt/c/...); sonde documentaire n'identifie PAS encore le VPS. Rendre liste de capacités manquantes et une action opérateur exacte. Mission réelle seulement avec identité/profil/budget confirmés.
+Phase 4: garder maquette Aujourd'hui/Discuter/Atelier et fournir URL locale, captures mobile/desktop, clics/clavier testés, matrice action->handler->événement->état->preuve. Pas d'intégration avant validation Michael. Sans capacité backend, désactivé explicite.
+Réutilise deux sous-agents séparés: construction backend et revue indépendante des assertions; UI seulement si indépendant. Livrer rapport court avec commit et verdicts contract_mock / real_infra / real_model / user_preview séparés.
+
+## Séquence complète et critères de sortie
+1. Corriger les défauts constatés; inventorier base/commit/contrat et vérifier chaque lot.
+2. Admission durable et permissions réellement testées, observations distinguées des commandes, issues inconnues explicites.
+3. Hermes identifié et accès autorisé qualifié, puis demande HQ -> OpenHands -> modification -> tests indépendants -> aperçu.
+4. Présenter la maquette mobile/desktop; intégrer après validation utilisateur.
+5. Modèles/coûts: appels conformes à la politique, aucune facturation implicite; budgets durables qualifiés avant d'être annoncés.
+6. Recette interruption/reprise, aucun doublon, refus hors périmètre, restauration/retour arrière testés. README et mémoire décrivent l'état vérifié. Fusion/déploiement sont distincts.
+
+## Informations manquantes
+- Capacités actuelles du Hermes déployé et accès modèle autorisé pour la mission.
+- Moteur Docker actif et banc de qualification exécuté.
+- Validation visuelle finale par Michael.
+- Coûts et limites des accès réellement disponibles; aucun tarif déduit d'un nom de forfait.
+- Délai fiable avant levée des prérequis. Aucun objectif « zéro bug » prétendu.
+
+## Méthode
+Contexte ciblé, environnement reproductible, résultat vérifiable, revue sur commit exact. Sources officielles consultées: https://support.claude.com/en/articles/14554000-claude-code-power-user-tips et https://prod.cursor.com/docs/cloud-agent/best-practices . La documentation ne démontre pas les capacités de notre installation.
+
+## État d'envoi
+Claude Code : session `38383533-19f3-41a3-aab0-63f59472610f`, lecture du mandat et démarrage confirmés (`busy/working`), correction isolée en cours. Suivi : `claude attach 38383533`.
+
+Cursor : message transmis dans le fil existant, état `Planning next moves` constaté. Antigravity : message transmis, rapport Hermes lu après permission ponctuelle, état `Working` constaté. Les résultats de ces nouveaux lots ne sont pas encore acceptés.
+
+Codex a rejoué les 64 tests de la sonde Hermes : 64 réussis, 0 exclus. Docker Desktop échoue au démarrage sur le socket Windows `dockerInference`; aucun moteur disponible confirmé. Zapier nécessite une reconnexion et n'est pas une dépendance de cette livraison.
+
+## Revue et assemblage en cours
+
+La [revue indépendante](HQ-REVUE-LIVRAISON-2026-10-01.md) consigne les écarts, les mesures et les consignes de correction. Antigravity `537545e` : 18 tests ciblés rejoués, 18 réussis sans exclusion; base réelle non qualifiée. La maquette reste en correction, avec un débordement mobile reproduit.
+
+Cursor a livré le lot puis deux corrections de revue, tête produit `79b0568bd9b8ae9a3d2b2d992330c94add2e7671`, base `e9ff840`. Son compte n'a pas les droits de publication sur le produit. Le transfert par [PR privée Orchestrator #7](https://github.com/mboyer1269-pixel/oria-hq-orchestrator/pull/7) a réussi sans élargir ses accès. Le patch est appliqué dans la copie d'intégration et les 61 tests ciblés passent chez Codex. L'extension du périmètre se limite au test Ventures directement affecté par le changement de routage.
+
+Pour l'assemblage, Codex réutilise le checkout inoccupé `C:/Users/micha/Dev/Oria.HQ/.claude/worktrees/hq-acces-reprise`, arbre initial propre, sans processus actif correspondant. Branche `codex/hq-delivery-integration`, base `e9ff840`. Il est distinct du checkout actif Claude `claude-acces-reprise`. Aucun changement n'est intégré au produit canonique.
+
+L'arbre du lot Cursor appliqué correspond exactement à `558037ddc80cbcd58a001bb59c5244d79c98e8fa`. Les fichiers d'admission d'Antigravity ont ensuite été appliqués sans conflit et leurs 18 tests passent. L'assemblage est encore en validation; il ne vaut pas autorisation de déploiement.
+
+Optimisation des validations : chaque propriétaire fournit ses tests ciblés et son commit. Codex exécute les quatre contrôles globaux sur le candidat final assemblé. Cette attribution remplace leur répétition dans chaque copie; les rapports doivent dire explicitement quels contrôles sont délégués et pas encore exécutés. Claude a reçu cet ajustement après ses 37 tests ciblés réussis annoncés dans son journal; la revue indépendante de ce lot reste à faire.
