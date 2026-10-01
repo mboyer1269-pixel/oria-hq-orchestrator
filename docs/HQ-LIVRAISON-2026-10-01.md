@@ -9,7 +9,7 @@ Branche produit publiée : [codex/hq-delivery-integration](https://github.com/mb
 | Responsable | Action immédiate | Sortie attendue |
 | --- | --- | --- |
 | Claude Code | Lot accès/reprise terminé; reste propriétaire des corrections de ce formulaire. À la levée du prérequis d'accès, qualifier le runtime Hermes avec sa sonde existante. | Version, capacités et limites observées; pas de conclusion tirée du seul nom Hermes. |
-| Cursor | Lot routage terminé et revérifié; revue indépendante de la qualification PostgreSQL à transmettre avec les références publiées. | Vérifier la portée des assertions et les prérequis du branchement; aucun chantier produit parallèle ni appel modèle. |
+| Cursor | Revue indépendante du code de qualification PostgreSQL transmise et prise en charge confirmée, à partir des deux références publiées. | Vérifier la portée des assertions et les prérequis du branchement; aucun chantier produit parallèle ni appel modèle. Rapport attendu `CURSOR-REVUE-INTAKE-REEL.md`. |
 | Antigravity | Banc réel terminé; correctif stdin `78df517` accepté et intégré dans `ad549d7`. Le sous-agent `browser_recette` est effectivement lancé. La maquette attend toujours Michael. | Recette du composant réel rendu avec transport de test, revue des interactions et limites explicites. Aucun succès modèle déduit de ces preuves. |
 | Codex | Candidat validé; organiser l'hôte de qualification autorisé et contrôler les preuves du parcours complet. | Chaîne directive → mission unique → autorisation → OpenHands → tests → revue → aperçu, puis reprise sans doublon. |
 
