@@ -11,7 +11,8 @@
 - [x] Corriger et vérifier la syntaxe du banc PostgreSQL d'Antigravity (`720d513`); ne pas confondre préparation et exécution.
 - [x] Rétablir le moteur Docker local sans réinitialisation ni suppression des volumes; clients Windows et WSL vérifiés, moteur 29.4.0.
 - [x] Exécuter le banc réel avec concurrence, réponse perdue et contenu préservé après redémarrage : run `1790836047_67270`, code 0; journal, assertions et nettoyage revus par Codex. Correctif de blocage stdin du banc intégré dans `ad549d7`.
-- [ ] Terminer la recette navigateur du formulaire réel; le sous-agent Antigravity `browser_recette` est lancé, résultat à contrôler.
+- [x] Recette CUA du vrai formulaire avec transport simulé : résiduel, création explicite, réessai identique, changement de projet, réponse tardive ignorée, erreurs de stockage et rechargement. Voir `docs/HQ-RECETTE-NAVIGATEUR-2026-10-01.md`; l'ancien DOM maison est exclu de cette preuve.
+- [x] Revue indépendante Cursor du banc réel (`a279100` repris dans `78d2d89`) : preuve de persistance maintenue; auth/RLS/Hermes explicitement non qualifiés.
 - [x] Corriger et vérifier dans le navigateur la continuité Aujourd'hui → Discuter → Atelier de la maquette et l'état après GO (`87c00df`).
 - [ ] Obtenir la validation visuelle de Michael puis raccorder l'interface aux événements réels.
 - [x] Faire passer typecheck, lint, build et smoke sur le candidat de code `2f08e96` (0 erreur lint, 5 avertissements hors lot).
