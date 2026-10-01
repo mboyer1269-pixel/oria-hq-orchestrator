@@ -1,0 +1,2328 @@
+From 8497a19aa2c306954a1e410044b63e09ba53752d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 04:45:43 +0000
+Subject: [PATCH 1/5] Stop model selection from debiting or switching paid
+ providers.
+
+Selection records a relative weight only. An unavailable or unsupported model is refused, and a second paid provider runs only with an explicit same-workspace authorization.
+---
+ src/core/types.ts                             |  35 ++
+ src/server/ai/call-accounting.ts              |  56 +++
+ src/server/ai/cost-ladder.ts                  |  18 +-
+ src/server/ai/execution-models.ts             |  47 +++
+ src/server/ai/llm-json-provider.test.mjs      |  64 ++-
+ src/server/ai/llm-json-provider.ts            | 114 +++++-
+ src/server/ai/model-config.ts                 |  23 +-
+ src/server/ai/model-router.test.mjs           |  32 +-
+ src/server/ai/model-router.ts                 | 145 +++++--
+ src/server/ai/routing-execution.test.mjs      | 383 ++++++++++++++++++
+ .../joris/brain-cost-ladder-tagging.test.mjs  |   8 +-
+ src/server/joris/brain-llm-reply.test.mjs     |  11 +-
+ src/server/joris/brain.ts                     | 150 ++++---
+ src/server/joris/joris-reply-generator.ts     |  32 +-
+ .../missions/mission-draft-control.test.mjs   |   5 +-
+ src/server/missions/mission-draft-control.ts  |  52 +--
+ 16 files changed, 977 insertions(+), 198 deletions(-)
+ create mode 100644 src/server/ai/call-accounting.ts
+ create mode 100644 src/server/ai/execution-models.ts
+ create mode 100644 src/server/ai/routing-execution.test.mjs
+
+diff --git a/src/core/types.ts b/src/core/types.ts
+index 33c8da6..3405c50 100644
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -429,13 +429,48 @@ export type GovernanceAuditExport = {
+   noExecutionAuthorized: true;
+ };
+ 
++/**
++ * Accounting kinds for one model decision or one provider attempt.
++ * Relative weights 0/1/5 are not dollars. `monetaryUsd: null` means unknown
++ * or not applicable — it is not a zero-dollar observation.
++ */
++export type RoutingCostKind =
++  | "estimation"
++  | "reservation"
++  | "observed_usage"
++  | "unknown_cost"
++  | "failed_maybe_billed"
++  | "refused";
++
++export type RoutingCostAssessment = {
++  kind: RoutingCostKind;
++  /** No price table in this build. Null is never a claimed spend of zero dollars. */
++  monetaryUsd: null;
++  /** Ladder weight when kind is estimation. Not a currency amount. */
++  relativeWeight?: number;
++  inputTokens?: number;
++  outputTokens?: number;
++  networkRequestSent: boolean;
++};
++
+ // --- Command result (assistant turn output) ----------------------------------
+ 
+ export type CommandResult = {
+   intent: JorisIntent;
+   summary: string;
++  /**
++   * On `generation: "llm"`, the id actually placed in the provider request.
++   * On `generation: "fallback"`, absent — the summary was not produced by a model.
++   * On rules results, the chosen route id, not an executed call. See `executedModelId`.
++   */
+   modelId?: string;
++  /** Model the router selected. Present even when nothing was called. */
++  chosenModelId?: string;
++  /** Id sent to a provider. Null when no request carried a model id. */
++  executedModelId?: string | null;
+   costMode?: ModelMode;
++  /** Selection estimate or attempt outcome. `monetaryUsd` stays null. */
++  costAccounting?: RoutingCostAssessment;
+   workspaceId?: string;
+   modeId?: string;
+   assistantId?: string;
+diff --git a/src/server/ai/call-accounting.ts b/src/server/ai/call-accounting.ts
+new file mode 100644
+index 0000000..660a3ba
+--- /dev/null
++++ b/src/server/ai/call-accounting.ts
+@@ -0,0 +1,56 @@
++import type { RoutingCostKind } from "@/core/types";
++
++/**
++ * Process-local journal for routing and provider attempts.
++ * It is not a budget, not a reservation ledger, and not durable.
++ * `chooseModel` may append an estimation. It must not add that weight to a spend store.
++ *
++ * Durable budget is not implemented. A shared HQ migration would be required
++ * before any claim of a persisted budget. Proposed contract, not a table:
++ *   hq_model_call_cost (
++ *     workspace_id, attempt_id, kind, chosen_model_id, executed_model_id,
++ *     input_tokens, output_tokens, monetary_usd null, provider_request_reached,
++ *     created_at
++ *   )
++ * monetary_usd null means unknown, not zero. No row is written by this module.
++ */
++
++export const DURABLE_BUDGET_IMPLEMENTED = false;
++
++export type CallAccountingEvent = {
++  kind: RoutingCostKind;
++  workspaceId: string;
++  agentId?: string;
++  chosenModelId?: string;
++  executedModelId?: string | null;
++  relativeWeight?: number;
++  monetaryUsd: null;
++  networkRequestSent: boolean;
++  note: string;
++};
++
++const log: CallAccountingEvent[] = [];
++
++export function recordCallAccounting(event: CallAccountingEvent): CallAccountingEvent {
++  log.push(event);
++  return event;
++}
++
++export function getCallAccountingLog(workspaceId?: string): readonly CallAccountingEvent[] {
++  if (!workspaceId) return log.slice();
++  return log.filter((event) => event.workspaceId === workspaceId);
++}
++
++export function clearCallAccountingLog(): void {
++  log.length = 0;
++}
++
++/** No hold. Selection and refusal do not reserve money. */
++export function reservationNotImplemented(workspaceId: string): {
++  implemented: false;
++  effect: "none";
++  monetaryUsd: null;
++  workspaceId: string;
++} {
++  return { implemented: false, effect: "none", monetaryUsd: null, workspaceId };
++}
+diff --git a/src/server/ai/cost-ladder.ts b/src/server/ai/cost-ladder.ts
+index 9e8aebb..2b1c18c 100644
+--- a/src/server/ai/cost-ladder.ts
++++ b/src/server/ai/cost-ladder.ts
+@@ -18,11 +18,12 @@ import type { ModelProfile } from "@/core/types";
+ //   2. NO LOCK-IN — the free rung is config-driven: only models flagged
+ //      `enabled && recommended` in config/openrouter.free-models.json are
+ //      eligible. Promotion into the ladder is a deliberate flag flip (CEO),
+-//      never code. Demotion is handled upstream via the router's unavailable
+-//      set, so a vanished free model falls back to paid with no edit here.
++//      never code. An unavailable free model is not replaced by a paid model
++//      in this module. The router refuses it instead of climbing a paid chain.
+ //
+-// Pure + deterministic: no clock, no I/O, no module state. The caller reads the
+-// agent's current spend and commits the new spend; this module only decides.
++// Pure + deterministic: no clock, no I/O, no module state. estimatedCost is a
++// relative weight (0, 1 or 5), not dollars. This module does not commit spend.
++// A durable budget is not implemented here.
+ // ---------------------------------------------------------------------------
+ 
+ /** Ordered cheapest → dearest. The ladder never picks below a task's floor. */
+@@ -68,7 +69,10 @@ export const TASK_CLASS_HARD_FLOOR: Record<TaskClass, CostRung> = {
+   general: "free",
+ };
+ 
+-/** Estimated relative cost of one call at each rung (no live billing yet). */
++/**
++ * Relative weight of a rung. These integers are not dollars and must not be
++ * added to a spend store from model selection.
++ */
+ export const RUNG_COST_WEIGHT: Record<CostRung, number> = {
+   free: 0,
+   economy: 1,
+@@ -164,7 +168,7 @@ export function freeModelProfile(entry: FreeModelEntry): ModelProfile {
+     provider: "openrouter",
+     defaultUse: "Cost Ladder — étage gratuit (OpenRouter), plancher de qualité respecté.",
+     costTier: "low",
+-    strengths: ["coût zéro", "free-first", "sans lock-in"],
++    strengths: ["poids relatif 0, pas un dollar", "free-first", "sans lock-in"],
+   };
+ }
+ 
+@@ -269,7 +273,7 @@ function buildReason(args: {
+     return "Budget agent du jour atteint: routage rétrogradé vers l'étage gratuit.";
+   }
+   if (args.rung === "free" && args.freeModel) {
+-    return `Étage gratuit visé par la tâche: ${args.freeModel.name} (OpenRouter), zéro coût.`;
++    return `Étage gratuit visé par la tâche: ${args.freeModel.name} (OpenRouter). Poids relatif 0, qui n'est pas un montant en dollars ni un coût observé.`;
+   }
+   if (args.noFreeAvailable) {
+     return "Étage gratuit visé mais aucun modèle free éligible (enabled+recommended): repli économie.";
+diff --git a/src/server/ai/execution-models.ts b/src/server/ai/execution-models.ts
+new file mode 100644
+index 0000000..2b9e766
+--- /dev/null
++++ b/src/server/ai/execution-models.ts
+@@ -0,0 +1,47 @@
++/**
++ * Models this JSON path can actually place in a provider request.
++ * Gemini, OpenRouter, subscriptions and local runtimes are not clients here.
++ * They are refused. They are not announced as operational.
++ *
++ * The Haiku id matches ANTHROPIC_JSON_DEFAULT_MODEL. It is duplicated so the
++ * router does not import the server-only HTTP client.
++ */
++
++export type ExecutionProvider = "anthropic" | "openai";
++
++const SUPPORTED_EXECUTION_MODELS: Record<string, ExecutionProvider> = {
++  "claude-sonnet-4-6": "anthropic",
++  "claude-haiku-4-5-20251001": "anthropic",
++  "gpt-4o": "openai",
++  "gpt-4o-mini": "openai",
++};
++
++export type ExecutionTarget =
++  | { callable: true; provider: ExecutionProvider }
++  | { callable: false; reason: string };
++
++export function executionTargetForModel(modelId: string): ExecutionTarget {
++  const provider = SUPPORTED_EXECUTION_MODELS[modelId];
++  if (provider) {
++    return { callable: true, provider };
++  }
++
++  if (modelId === "gemini-flash") {
++    return {
++      callable: false,
++      reason: "gemini-flash n'a pas de client JSON sur ce chemin: refus, sans substitution.",
++    };
++  }
++
++  if (modelId.startsWith("openrouter/") || modelId.includes(":free")) {
++    return {
++      callable: false,
++      reason: "Ce modèle OpenRouter n'est pas un appel opérationnel: refus, sans substitution.",
++    };
++  }
++
++  return {
++    callable: false,
++    reason: `${modelId} n'est pas pris en charge. Aucun abonnement ni modèle local n'est opérationnel.`,
++  };
++}
+diff --git a/src/server/ai/llm-json-provider.test.mjs b/src/server/ai/llm-json-provider.test.mjs
+index a38a8f6..598297c 100644
+--- a/src/server/ai/llm-json-provider.test.mjs
++++ b/src/server/ai/llm-json-provider.test.mjs
+@@ -80,40 +80,53 @@ await test("generateStructuredJson", async (t) => {
+     assert.deepEqual(result.json, payload);
+   });
+ 
+-  await t.test("auto: falls back to OpenAI when Anthropic has no key", async () => {
++  await t.test("auto: does not call OpenAI when Anthropic has no key", async () => {
+     delete process.env.ANTHROPIC_API_KEY;
+     process.env.OPENAI_API_KEY = OPENAI_KEY;
++    let openaiCalls = 0;
+     const result = await generateStructuredJson({
+       providerPreference: "auto",
+       systemPrompt: "sys",
+       userPrompt: "user",
+-      fetchFns: { openai: makeOpenAiOkFetch(payload) },
++      fetchFns: {
++        openai: async () => {
++          openaiCalls += 1;
++          return makeOpenAiOkFetch(payload)();
++        },
++      },
+     });
+-    assert.equal(result.ok, true);
+-    assert.equal(result.providerUsed, "openai");
+-    assert.equal(result.fallbackUsed, true);
+-    assert.ok(result.failureChain.length > 0, "failureChain records Anthropic failure");
++    assert.equal(result.ok, false);
++    assert.equal(openaiCalls, 0);
++    assert.equal(result.cost.kind, "refused");
++    assert.equal(result.cost.monetaryUsd, null);
++    assert.equal(result.executedModelId, null);
+   });
+ 
+-  await t.test("auto: falls back to OpenAI when Anthropic returns provider error", async () => {
++  await t.test("auto: does not call OpenAI when Anthropic returns a provider error", async () => {
+     process.env.ANTHROPIC_API_KEY = ANTHROPIC_KEY;
+     process.env.OPENAI_API_KEY = OPENAI_KEY;
++    let openaiCalls = 0;
+     const result = await generateStructuredJson({
+       providerPreference: "auto",
+       systemPrompt: "sys",
+       userPrompt: "user",
+       fetchFns: {
+         anthropic: makeErrorFetch(503),
+-        openai: makeOpenAiOkFetch(payload),
++        openai: async () => {
++          openaiCalls += 1;
++          return makeOpenAiOkFetch(payload)();
++        },
+       },
+     });
+-    assert.equal(result.ok, true);
+-    assert.equal(result.providerUsed, "openai");
+-    assert.equal(result.fallbackUsed, true);
+-    assert.ok(result.failureChain.some((r) => r.startsWith("anthropic:")));
++    assert.equal(result.ok, false);
++    assert.equal(openaiCalls, 0);
++    assert.equal(result.cost.kind, "failed_maybe_billed");
++    assert.equal(result.cost.monetaryUsd, null);
++    assert.notEqual(result.cost.monetaryUsd, 0);
++    assert.equal(result.executedModelId, null);
+   });
+ 
+-  await t.test("auto: both providers fail → ok:false with populated failureChain", async () => {
++  await t.test("auto: without authorization only Anthropic is recorded when it fails", async () => {
+     process.env.ANTHROPIC_API_KEY = ANTHROPIC_KEY;
+     process.env.OPENAI_API_KEY = OPENAI_KEY;
+     const result = await generateStructuredJson({
+@@ -127,9 +140,9 @@ await test("generateStructuredJson", async (t) => {
+     });
+     assert.equal(result.ok, false);
+     assert.equal(result.errorCode, "all_providers_failed");
+-    assert.ok(result.failureChain.length >= 2);
+-    assert.ok(result.failureChain.some((r) => r.startsWith("anthropic:")));
+-    assert.ok(result.failureChain.some((r) => r.startsWith("openai:")));
++    assert.equal(result.failureChain.length, 1);
++    assert.ok(result.failureChain[0].startsWith("anthropic:"));
++    assert.equal(result.failureChain.some((r) => r.startsWith("openai:")), false);
+   });
+ 
+   await t.test("explicit anthropic: only tries Anthropic even with OpenAI available", async () => {
+@@ -192,24 +205,31 @@ await test("generateStructuredJson", async (t) => {
+       userPrompt: "user",
+     });
+     assert.equal(result.ok, false);
+-    assert.ok(result.failureChain.length >= 2);
++    assert.equal(result.failureChain.length, 1);
++    assert.ok(result.failureChain[0].startsWith("anthropic:"));
++    assert.equal(result.cost.networkRequestSent, false);
+   });
+ 
+-  await t.test("Anthropic timeout triggers OpenAI fallback", async () => {
++  await t.test("Anthropic timeout does not call OpenAI without workspace authorization", async () => {
+     process.env.ANTHROPIC_API_KEY = ANTHROPIC_KEY;
+     process.env.OPENAI_API_KEY = OPENAI_KEY;
++    let openaiCalls = 0;
+     const result = await generateStructuredJson({
+       providerPreference: "auto",
+       systemPrompt: "sys",
+       userPrompt: "user",
+       fetchFns: {
+         anthropic: makeAbortFetch(),
+-        openai: makeOpenAiOkFetch(payload),
++        openai: async () => {
++          openaiCalls += 1;
++          return makeOpenAiOkFetch(payload)();
++        },
+       },
+     });
+-    assert.equal(result.ok, true);
+-    assert.equal(result.providerUsed, "openai");
+-    assert.equal(result.fallbackUsed, true);
++    assert.equal(result.ok, false);
++    assert.equal(openaiCalls, 0);
++    assert.equal(result.cost.kind, "failed_maybe_billed");
++    assert.equal(result.cost.monetaryUsd, null);
+   });
+ 
+   await t.test("fallbackUsed is false when first provider succeeds", async () => {
+diff --git a/src/server/ai/llm-json-provider.ts b/src/server/ai/llm-json-provider.ts
+index 4728206..9f38c45 100644
+--- a/src/server/ai/llm-json-provider.ts
++++ b/src/server/ai/llm-json-provider.ts
+@@ -6,17 +6,22 @@
+ // provider preference, ordered fallback, and failure chain recording.
+ //
+ // Design:
+-//   - "auto" tries Anthropic first, then OpenAI (respects key availability).
++//   - "auto" tries Anthropic only, unless paidFallback authorizes OpenAI
++//     for the same workspaceId. There is no implicit second paid provider.
+ //   - "anthropic" / "openai" use that provider exclusively.
+-//   - On failure, the next provider in the fallback order is tried.
++//   - A requested modelId is sent only to the provider that supports it.
++//     An unsupported or unavailable id is refused before any fetch.
+ //   - failureChain records each failure reason for observability.
+ //   - Never throws toward the caller.
+ //   - Individual fetchFns per provider so tests can inject mocks independently.
+ //
+-// No side effects, no persistence, no execution.
++// No persistence. Monetary amount stays null: tokens are not dollars,
++// and a failed request is not recorded as zero.
+ 
+ import "server-only";
+ 
++import type { RoutingCostAssessment } from "@/core/types";
++import { executionTargetForModel } from "@/server/ai/execution-models";
+ import { generateJsonWithAnthropic } from "./anthropic-json-client";
+ import { generateJsonWithOpenAI } from "./openai-json-client";
+ 
+@@ -26,6 +31,12 @@ import { generateJsonWithOpenAI } from "./openai-json-client";
+ 
+ export type LlmProvider = "anthropic" | "openai";
+ 
++/** Explicit permission to try a second paid provider. Scoped to one workspace. */
++export type PaidFallbackAuthorization = {
++  authorized: true;
++  workspaceId: string;
++};
++
+ export type LlmJsonProviderInput = {
+   providerPreference: LlmProvider | "auto";
+   systemPrompt: string;
+@@ -33,6 +44,12 @@ export type LlmJsonProviderInput = {
+   maxTokens?: number;
+   temperature?: number;
+   timeoutMs?: number;
++  /** When set, only this id may be sent, and only to its supporting provider. */
++  modelId?: string;
++  /** Required to match paidFallback.workspaceId. Does not authorize by itself. */
++  workspaceId?: string;
++  /** Absent by default. A mismatching workspace does not authorize a second provider. */
++  paidFallback?: PaidFallbackAuthorization;
+   // Per-provider fetch overrides for test injection.
+   fetchFns?: {
+     anthropic?: typeof fetch;
+@@ -44,16 +61,22 @@ export type LlmJsonProviderSuccess = {
+   ok: true;
+   json: unknown;
+   rawText: string;
++  /** Id actually placed in the provider request. */
+   modelId: string;
++  chosenModelId?: string;
++  executedModelId: string;
+   providerUsed: LlmProvider;
++  /** True only when an authorized second provider produced this success. */
+   fallbackUsed: boolean;
+   failureChain: string[];
+   tokenUsage?: { input: number; output: number };
++  cost: RoutingCostAssessment;
+ };
+ 
+ export type LlmJsonProviderErrorCode =
+   | "no_provider_available"
+-  | "all_providers_failed";
++  | "all_providers_failed"
++  | "model_unsupported";
+ 
+ export type LlmJsonProviderFailure = {
+   ok: false;
+@@ -61,6 +84,9 @@ export type LlmJsonProviderFailure = {
+   fallbackReason: string;
+   failureChain: string[];
+   providerUsed?: LlmProvider;
++  chosenModelId?: string;
++  executedModelId: null;
++  cost: RoutingCostAssessment;
+ };
+ 
+ export type LlmJsonProviderResult = LlmJsonProviderSuccess | LlmJsonProviderFailure;
+@@ -69,11 +95,49 @@ export type LlmJsonProviderResult = LlmJsonProviderSuccess | LlmJsonProviderFail
+ // Provider order resolution
+ // ---------------------------------------------------------------------------
+ 
+-// "auto" = Anthropic first (lower cost per token, preferred), then OpenAI.
+-function resolveOrder(preference: LlmProvider | "auto"): LlmProvider[] {
+-  if (preference === "anthropic") return ["anthropic"];
+-  if (preference === "openai") return ["openai"];
+-  return ["anthropic", "openai"];
++function paidFallbackAuthorized(input: LlmJsonProviderInput): boolean {
++  const auth = input.paidFallback;
++  if (!auth || auth.authorized !== true) return false;
++  if (!input.workspaceId || auth.workspaceId !== input.workspaceId) return false;
++  return true;
++}
++
++function resolveOrder(input: LlmJsonProviderInput): LlmProvider[] {
++  if (input.modelId) {
++    const target = executionTargetForModel(input.modelId);
++    return target.callable ? [target.provider] : [];
++  }
++  if (input.providerPreference === "anthropic") return ["anthropic"];
++  if (input.providerPreference === "openai") return ["openai"];
++  // "auto" does not climb to a second paid provider unless this workspace opted in.
++  return paidFallbackAuthorized(input) ? ["anthropic", "openai"] : ["anthropic"];
++}
++
++function refused(networkRequestSent: false): RoutingCostAssessment {
++  return { kind: "refused", monetaryUsd: null, networkRequestSent };
++}
++
++function costFromClient(result: {
++  ok: boolean;
++  errorCode?: string;
++  tokenUsage?: { input: number; output: number };
++}): RoutingCostAssessment {
++  if (!result.ok) {
++    if (result.errorCode === "no_api_key") {
++      return { kind: "refused", monetaryUsd: null, networkRequestSent: false };
++    }
++    return { kind: "failed_maybe_billed", monetaryUsd: null, networkRequestSent: true };
++  }
++  if (result.tokenUsage) {
++    return {
++      kind: "observed_usage",
++      monetaryUsd: null,
++      inputTokens: result.tokenUsage.input,
++      outputTokens: result.tokenUsage.output,
++      networkRequestSent: true,
++    };
++  }
++  return { kind: "unknown_cost", monetaryUsd: null, networkRequestSent: true };
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -83,9 +147,25 @@ function resolveOrder(preference: LlmProvider | "auto"): LlmProvider[] {
+ export async function generateStructuredJson(
+   input: LlmJsonProviderInput,
+ ): Promise<LlmJsonProviderResult> {
+-  const order = resolveOrder(input.providerPreference);
++  if (input.modelId) {
++    const target = executionTargetForModel(input.modelId);
++    if (!target.callable) {
++      return {
++        ok: false,
++        errorCode: "model_unsupported",
++        fallbackReason: target.reason,
++        failureChain: [],
++        chosenModelId: input.modelId,
++        executedModelId: null,
++        cost: refused(false),
++      };
++    }
++  }
++
++  const order = resolveOrder(input);
+   const failureChain: string[] = [];
+   let attemptCount = 0;
++  let sawMaybeBilled = false;
+ 
+   for (const provider of order) {
+     attemptCount++;
+@@ -104,6 +184,7 @@ export async function generateStructuredJson(
+             maxTokens: input.maxTokens,
+             temperature: input.temperature,
+             timeoutMs: input.timeoutMs,
++            ...(input.modelId ? { modelId: input.modelId } : {}),
+           },
+           input.fetchFns?.anthropic,
+         );
+@@ -115,6 +196,7 @@ export async function generateStructuredJson(
+             maxTokens: input.maxTokens,
+             temperature: input.temperature,
+             timeoutMs: input.timeoutMs,
++            ...(input.modelId ? { modelId: input.modelId } : {}),
+           },
+           input.fetchFns?.openai,
+         );
+@@ -122,22 +204,29 @@ export async function generateStructuredJson(
+     } catch {
+       const reason = `${provider}: unexpected exception`;
+       failureChain.push(reason);
++      sawMaybeBilled = true;
+       continue;
+     }
+ 
+     if (result.ok) {
++      const cost = costFromClient(result);
+       return {
+         ok: true,
+         json: result.json,
+         rawText: result.rawText,
+         modelId: result.modelId,
++        ...(input.modelId ? { chosenModelId: input.modelId } : {}),
++        executedModelId: result.modelId,
+         providerUsed: provider,
+         fallbackUsed: !isFirstAttempt,
+         failureChain,
+         tokenUsage: result.tokenUsage,
++        cost,
+       };
+     }
+ 
++    const attemptCost = costFromClient(result);
++    if (attemptCost.kind === "failed_maybe_billed") sawMaybeBilled = true;
+     failureChain.push(`${provider}: ${result.fallbackReason}`);
+   }
+ 
+@@ -149,5 +238,10 @@ export async function generateStructuredJson(
+         ? failureChain[failureChain.length - 1]
+         : "No providers configured",
+     failureChain,
++    ...(input.modelId ? { chosenModelId: input.modelId } : {}),
++    executedModelId: null,
++    cost: sawMaybeBilled
++      ? { kind: "failed_maybe_billed", monetaryUsd: null, networkRequestSent: true }
++      : refused(false),
+   };
+ }
+diff --git a/src/server/ai/model-config.ts b/src/server/ai/model-config.ts
+index 2f9388b..2d659da 100644
+--- a/src/server/ai/model-config.ts
++++ b/src/server/ai/model-config.ts
+@@ -34,23 +34,14 @@ export function resolveModelProfileOrFallback(
+   return resolveModelProfile(modelId) ?? resolveModelProfile(fallbackId) ?? modelProfiles[0];
+ }
+ 
+-/** Ordered fallback when a target model is unavailable. */
+-export function fallbackModelIds(primaryId: string): readonly string[] {
+-  switch (primaryId) {
+-    case PREMIUM_MODEL_ID:
+-      return [PREMIUM_MODEL_ID, "gpt-4o", ECONOMY_MODEL_ID];
+-    case LONG_CONTEXT_MODEL_ID:
+-      return [LONG_CONTEXT_MODEL_ID, ECONOMY_MODEL_ID, PREMIUM_MODEL_ID];
+-    case ECONOMY_MODEL_ID:
+-    default:
+-      return [ECONOMY_MODEL_ID, LONG_CONTEXT_MODEL_ID, PREMIUM_MODEL_ID];
+-  }
+-}
+-
++/**
++ * Availability is a yes/no on the requested id. An unavailable model is not
++ * replaced by another paid model.
++ */
+ export function pickAvailableModelId(
+   primaryId: string,
+   unavailableModelIds: ReadonlySet<string> = new Set(),
+-): string {
+-  const chain = fallbackModelIds(primaryId);
+-  return chain.find((id) => !unavailableModelIds.has(id)) ?? ECONOMY_MODEL_ID;
++): string | null {
++  if (unavailableModelIds.has(primaryId)) return null;
++  return primaryId;
+ }
+diff --git a/src/server/ai/model-router.test.mjs b/src/server/ai/model-router.test.mjs
+index 939965a..eb668ad 100644
+--- a/src/server/ai/model-router.test.mjs
++++ b/src/server/ai/model-router.test.mjs
+@@ -64,7 +64,7 @@ test("economy mode routes to economy brain", () => {
+   assert.equal(decision.via, "keyword");
+ });
+ 
+-test("unavailable primary model falls back to next candidate", () => {
++test("unavailable primary model is refused without a paid substitution", () => {
+   clearBrainRouteLog();
+ 
+   const decision = chooseModel({
+@@ -72,9 +72,13 @@ test("unavailable primary model falls back to next candidate", () => {
+     unavailableModelIds: [PREMIUM_MODEL_ID],
+   });
+ 
+-  assert.notEqual(decision.modelId, PREMIUM_MODEL_ID);
+-  assert.equal(decision.modelId, "gpt-4o");
++  assert.equal(decision.modelId, PREMIUM_MODEL_ID);
++  assert.equal(decision.chosenModelId, PREMIUM_MODEL_ID);
++  assert.equal(decision.executedModelId, null);
++  assert.equal(decision.execution, "refused");
++  assert.notEqual(decision.modelId, "gpt-4o");
+   assert.match(decision.reason, /indisponible/i);
++  assert.equal(decision.accountingEffect, "none");
+ 
+   clearBrainRouteLog();
+ 
+@@ -84,7 +88,9 @@ test("unavailable primary model falls back to next candidate", () => {
+     unavailableModelIds: [ECONOMY_MODEL_ID],
+   });
+ 
+-  assert.notEqual(economyFallback.modelId, ECONOMY_MODEL_ID);
++  assert.equal(economyFallback.modelId, ECONOMY_MODEL_ID);
++  assert.equal(economyFallback.execution, "refused");
++  assert.equal(economyFallback.executedModelId, null);
+ });
+ 
+ test("ambiguous message uses semantic fallback classifier", () => {
+@@ -156,10 +162,10 @@ test("cost ladder routes a free-eligible class to the free model, overriding key
+   assert.equal(decision.via, "cost-ladder");
+ });
+ 
+-test("cost ladder budget guard downgrades general to free once the budget is spent", () => {
++test("choosing a model does not spend the budget, so a second selection is not downgraded", () => {
+   resetLadderBudget();
+   const base = {
+-    message: "Prépare le comité pour la négociation.", // strategic → base premium (cost 5)
++    message: "Prépare le comité pour la négociation.", // strategic → base premium (weight 5)
+     taskClass: "general",
+     agentId: "relay",
+     freeCatalog: [FREE_MODEL],
+@@ -167,11 +173,15 @@ test("cost ladder budget guard downgrades general to free once the budget is spe
+     nowMs: FIXED_NOW,
+   };
+   const first = chooseModel(base);
+-  assert.equal(first.modelId, PREMIUM_MODEL_ID); // budget not yet spent
+-
+-  const second = chooseModel(base); // now over budget
+-  assert.equal(second.modelId, FREE_MODEL.id);
+-  assert.equal(second.via, "cost-ladder");
++  assert.equal(first.modelId, PREMIUM_MODEL_ID);
++  assert.equal(first.accountingEffect, "none");
++  assert.equal(first.estimate.monetaryUsd, null);
++  assert.equal(first.estimate.relativeWeight, 5);
++  assert.equal(first.estimate.unit, "relative_weight_not_dollars");
++
++  const second = chooseModel(base);
++  assert.equal(second.modelId, PREMIUM_MODEL_ID);
++  assert.notEqual(second.modelId, FREE_MODEL.id);
+ });
+ 
+ test("budget pressure never lowers client_audit below premium", () => {
+diff --git a/src/server/ai/model-router.ts b/src/server/ai/model-router.ts
+index 08acf52..7023a6d 100644
+--- a/src/server/ai/model-router.ts
++++ b/src/server/ai/model-router.ts
+@@ -3,21 +3,21 @@ import {
+   ECONOMY_MODEL_ID,
+   LONG_CONTEXT_MODEL_ID,
+   PREMIUM_MODEL_ID,
+-  pickAvailableModelId,
+-  resolveModelProfileOrFallback,
++  resolveModelProfile,
+ } from "@/server/ai/model-config";
+ import {
+   createInMemoryBudgetStore,
+   dayKeyOf,
+   decideLadder,
+   freeModelProfile,
+-  recordLadderCost,
+   RUNG_COST_WEIGHT,
+   type BudgetStore,
+   type CostRung,
+   type FreeModelEntry,
+   type TaskClass,
+ } from "@/server/ai/cost-ladder";
++import { recordCallAccounting } from "@/server/ai/call-accounting";
++import { executionTargetForModel } from "@/server/ai/execution-models";
+ 
+ export type ModelRouteInput = {
+   message: string;
+@@ -38,6 +38,8 @@ export type ModelRouteInput = {
+   dailyBudget?: number;
+   /** Override the budget store (defaults to the module in-memory store). */
+   budgetStore?: BudgetStore;
++  /** Journal scope only. Selection does not bill this workspace. */
++  workspaceId?: string;
+ };
+ 
+ export type BrainRouteVia = "keyword" | "semantic-fallback" | "default" | "cost-ladder";
+@@ -45,6 +47,21 @@ export type BrainRouteVia = "keyword" | "semantic-fallback" | "default" | "cost-
+ export type ModelRouteDecision = {
+   model: ModelProfile;
+   modelId: string;
++  /** Same id as `modelId`. Selection never executes a model. */
++  chosenModelId: string;
++  executedModelId: null;
++  /** `refused` means the caller must not send a provider request. */
++  execution: "callable" | "refused";
++  refusalReason?: string;
++  /** Relative ladder weight. Not dollars. Not written to the budget store. */
++  estimate: {
++    kind: "estimation";
++    relativeWeight: number;
++    unit: "relative_weight_not_dollars";
++    monetaryUsd: null;
++  };
++  /** chooseModel does not debit, reserve, or observe a provider usage. */
++  accountingEffect: "none";
+   mode: ModelMode;
+   reason: string;
+   via: BrainRouteVia;
+@@ -120,6 +137,8 @@ type RouteCandidate = {
+   mode: ModelMode;
+   reason: string;
+   via: BrainRouteVia;
++  /** Set when this id must not be sent to a provider. */
++  refused?: string;
+ };
+ 
+ /**
+@@ -234,15 +253,14 @@ function applyAvailabilityFallback(
+   candidate: RouteCandidate,
+   unavailableModelIds: ReadonlySet<string>,
+ ): RouteCandidate {
+-  const resolvedId = pickAvailableModelId(candidate.modelId, unavailableModelIds);
+-  if (resolvedId === candidate.modelId) {
++  if (!unavailableModelIds.has(candidate.modelId)) {
+     return candidate;
+   }
+ 
+   return {
+     ...candidate,
+-    modelId: resolvedId,
+-    reason: `${candidate.reason} (fallback: ${candidate.modelId} indisponible → ${resolvedId})`,
++    refused: `${candidate.modelId} indisponible: refus, aucune substitution payante`,
++    reason: `${candidate.reason} (refusé: ${candidate.modelId} indisponible, aucune substitution payante)`,
+   };
+ }
+ 
+@@ -269,6 +287,8 @@ type LadderRoute = {
+   candidate: RouteCandidate;
+   /** Set when the ladder picked a concrete free model (skips generic fallback). */
+   profile?: ModelProfile;
++  /** Relative weight of the rung. Not added to the budget store. */
++  relativeWeight: number;
+ };
+ 
+ function applyCostLadder(
+@@ -290,37 +310,47 @@ function applyCostLadder(
+     ...(input.dailyBudget !== undefined ? { dailyBudget: input.dailyBudget } : {}),
+   });
+ 
+-  // Respect the router's unavailable set before committing to a free model.
+-  let rung = decision.rung;
+-  let freeModel = decision.freeModel;
+-  if (rung === "free" && freeModel && unavailable.has(freeModel.id)) {
+-    rung = "economy";
+-    freeModel = undefined;
+-  }
+-
+-  const estimatedCost =
+-    rung === decision.rung ? decision.estimatedCost : RUNG_COST_WEIGHT.economy;
+-  store.add(agentId, dayKey, estimatedCost);
+-
+   const requested = input.requestedMode ?? "auto";
+   let candidate: RouteCandidate;
+   let profile: ModelProfile | undefined;
++  const relativeWeight = decision.estimatedCost;
+ 
+-  if (rung === "free" && freeModel) {
++  if (decision.rung === "free" && decision.freeModel && unavailable.has(decision.freeModel.id)) {
++    candidate = {
++      modelId: decision.freeModel.id,
++      mode: resolveMode(requested, "economy"),
++      reason: `Modèle ${decision.freeModel.id} indisponible. Aucune substitution payante. Poids relatif ${relativeWeight}, qui n'est pas un dollar ni un coût observé.`,
++      via: "cost-ladder",
++      refused: `${decision.freeModel.id} indisponible`,
++    };
++    profile = freeModelProfile(decision.freeModel);
++  } else if (decision.rung === "free" && decision.freeModel) {
+     candidate = {
+-      modelId: freeModel.id,
++      modelId: decision.freeModel.id,
+       mode: resolveMode(requested, "economy"),
+       reason: decision.reason,
+       via: "cost-ladder",
+     };
+-    profile = freeModelProfile(freeModel);
+-  } else if (rung === "premium") {
++    profile = freeModelProfile(decision.freeModel);
++  } else if (decision.rung === "premium") {
+     candidate = {
+       modelId: PREMIUM_MODEL_ID,
+       mode: resolveMode(requested, "brute"),
+       reason: decision.reason,
+       via: "cost-ladder",
+     };
++  } else if (
++    decision.rung === "economy" &&
++    rungOfModelId(baseCandidate.modelId) === "economy"
++  ) {
++    // Keep the base id. Do not replace Gemini, or any other non-premium id,
++    // with gpt-4o-mini just because the rung is economy.
++    candidate = {
++      modelId: baseCandidate.modelId,
++      mode: resolveMode(requested, "economy"),
++      reason: decision.reason,
++      via: "cost-ladder",
++    };
+   } else {
+     candidate = {
+       modelId: ECONOMY_MODEL_ID,
+@@ -330,18 +360,8 @@ function applyCostLadder(
+     };
+   }
+ 
+-  recordLadderCost({
+-    agentId,
+-    taskClass,
+-    rung,
+-    modelId: candidate.modelId,
+-    estimatedCost,
+-    floorBound: decision.floorBound,
+-    budgetBound: decision.budgetBound,
+-    timestamp: new Date(nowMs).toISOString(),
+-  });
+-
+-  return profile ? { candidate, profile } : { candidate };
++  // `store.spendOf` is only a policy input. This function does not add to it.
++  return profile ? { candidate, profile, relativeWeight } : { candidate, relativeWeight };
+ }
+ 
+ export function setBrainRouteSink(sink: BrainRouteSink): void {
+@@ -398,22 +418,73 @@ export function chooseModel(input: ModelRouteInput): ModelRouteDecision {
+   let resolved: RouteCandidate;
+   let model: ModelProfile;
+   if (ladder?.profile) {
+-    // Concrete free model: availability already handled inside the ladder.
+     resolved = ladder.candidate;
+     model = ladder.profile;
+   } else {
+     resolved = applyAvailabilityFallback(ladder?.candidate ?? baseCandidate, unavailable);
+-    model = resolveModelProfileOrFallback(resolved.modelId);
++    const known = resolveModelProfile(resolved.modelId);
++    model = known ?? {
++      id: resolved.modelId,
++      label: resolved.modelId,
++      provider: "openrouter",
++      defaultUse: "Identifiant absent du catalogue: aucun appel et aucune substitution.",
++      costTier: "low",
++      strengths: [],
++    };
++    if (!known) {
++      resolved = {
++        ...resolved,
++        refused: resolved.refused ?? `${resolved.modelId} absent du catalogue`,
++      };
++    }
++  }
++
++  const target = executionTargetForModel(resolved.modelId);
++  let execution: ModelRouteDecision["execution"] = "callable";
++  let refusalReason: string | undefined;
++  if (resolved.refused) {
++    execution = "refused";
++    refusalReason = resolved.refused;
++  } else if (!target.callable) {
++    execution = "refused";
++    refusalReason = target.reason;
+   }
+ 
++  const relativeWeight =
++    ladder?.relativeWeight ??
++    (resolved.modelId === PREMIUM_MODEL_ID ? RUNG_COST_WEIGHT.premium : RUNG_COST_WEIGHT.economy);
++
+   const decision: ModelRouteDecision = {
+     model,
+     modelId: model.id,
++    chosenModelId: model.id,
++    executedModelId: null,
++    execution,
++    ...(refusalReason ? { refusalReason } : {}),
++    estimate: {
++      kind: "estimation",
++      relativeWeight,
++      unit: "relative_weight_not_dollars",
++      monetaryUsd: null,
++    },
++    accountingEffect: "none",
+     mode: resolved.mode,
+     reason: resolved.reason,
+     via: resolved.via,
+   };
+ 
++  recordCallAccounting({
++    kind: "estimation",
++    workspaceId: input.workspaceId ?? "unscoped",
++    ...(input.agentId ? { agentId: input.agentId } : {}),
++    chosenModelId: decision.chosenModelId,
++    executedModelId: null,
++    relativeWeight,
++    monetaryUsd: null,
++    networkRequestSent: false,
++    note: "Sélection uniquement. Le poids relatif n'est pas un dollar et n'est pas ajouté au budget.",
++  });
++
+   recordBrainRoute({
+     model: decision.model,
+     modelId: decision.modelId,
+diff --git a/src/server/ai/routing-execution.test.mjs b/src/server/ai/routing-execution.test.mjs
+new file mode 100644
+index 0000000..8cef54a
+--- /dev/null
++++ b/src/server/ai/routing-execution.test.mjs
+@@ -0,0 +1,383 @@
++#!/usr/bin/env node
++// Contract tests for selection vs execution.
++// Fixtures prove the routing contract. They do not perform a real provider call.
++
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..");
++
++const { createJiti } = await import("jiti");
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(projectRoot, "src"),
++    "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++  },
++});
++
++const { chooseModel, resetLadderBudget } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/model-router.ts"),
++);
++const { createInMemoryBudgetStore } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/cost-ladder.ts"),
++);
++const { clearCallAccountingLog, getCallAccountingLog, reservationNotImplemented, DURABLE_BUDGET_IMPLEMENTED } =
++  await jiti.import(path.join(projectRoot, "src/server/ai/call-accounting.ts"));
++const { generateStructuredJson } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/llm-json-provider.ts"),
++);
++const { PREMIUM_MODEL_ID, ECONOMY_MODEL_ID, LONG_CONTEXT_MODEL_ID } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/model-config.ts"),
++);
++
++const FIXED_NOW = Date.parse("2026-06-14T08:00:00.000Z");
++const FREE_MODEL = {
++  id: "qwen/qwen3-coder:free",
++  name: "Qwen3 Coder (free)",
++  provider: "qwen",
++  contextLength: 1048576,
++  enabled: true,
++  recommended: true,
++};
++
++function anthropicOk(json, usage) {
++  return async (_url, init) => ({
++    ok: true,
++    status: 200,
++    json: async () => ({
++      content: [{ type: "text", text: JSON.stringify(json) }],
++      ...(usage ? { usage } : {}),
++    }),
++    body: init?.body,
++  });
++}
++
++test("selection records an estimate and does not debit the budget store", () => {
++  resetLadderBudget();
++  clearCallAccountingLog();
++  const store = createInMemoryBudgetStore();
++  store.add("relay", "2026-06-14", 5);
++  const before = store.spendOf("relay", "2026-06-14");
++
++  const decision = chooseModel({
++    message: "Prépare le comité pour la négociation.",
++    taskClass: "general",
++    agentId: "relay",
++    budgetStore: store,
++    nowMs: FIXED_NOW,
++    workspaceId: "ws-a",
++  });
++
++  assert.equal(store.spendOf("relay", "2026-06-14"), before);
++  assert.equal(decision.modelId, PREMIUM_MODEL_ID);
++  assert.equal(decision.accountingEffect, "none");
++  assert.equal(decision.estimate.kind, "estimation");
++  assert.equal(decision.estimate.relativeWeight, 5);
++  assert.equal(decision.estimate.monetaryUsd, null);
++  assert.notEqual(decision.estimate.relativeWeight, decision.estimate.monetaryUsd);
++  store.add("relay", "2026-06-14", 95);
++  const downgraded = chooseModel({
++    message: "Prépare le comité pour la négociation.",
++    taskClass: "general",
++    agentId: "relay",
++    budgetStore: store,
++    freeCatalog: [FREE_MODEL],
++    dailyBudget: 100,
++    nowMs: FIXED_NOW,
++    workspaceId: "ws-a",
++  });
++  assert.equal(store.spendOf("relay", "2026-06-14"), 100);
++  assert.equal(downgraded.modelId, FREE_MODEL.id);
++  assert.equal(downgraded.execution, "refused");
++  const events = getCallAccountingLog("ws-a");
++  assert.equal(events.length, 2);
++  assert.equal(events.every((event) => event.kind === "estimation"), true);
++  assert.equal(events.every((event) => event.monetaryUsd === null), true);
++  assert.equal(events.every((event) => event.networkRequestSent === false), true);
++});
++
++test("an unavailable free model is not rewritten as a paid model or as zero dollars", () => {
++  resetLadderBudget();
++  const decision = chooseModel({
++    message: "classe ce libellé",
++    taskClass: "classification",
++    agentId: "relay",
++    freeCatalog: [FREE_MODEL],
++    unavailableModelIds: [FREE_MODEL.id],
++    nowMs: FIXED_NOW,
++    workspaceId: "ws-a",
++  });
++  assert.equal(decision.modelId, FREE_MODEL.id);
++  assert.equal(decision.execution, "refused");
++  assert.notEqual(decision.modelId, ECONOMY_MODEL_ID);
++  assert.equal(decision.estimate.relativeWeight, 0);
++  assert.equal(decision.estimate.monetaryUsd, null);
++  assert.equal(decision.estimate.unit, "relative_weight_not_dollars");
++  assert.doesNotMatch(decision.reason, /zéro coût/i);
++  assert.match(decision.reason, /aucune substitution payante/i);
++});
++
++test("long-context Gemini is kept and refused instead of becoming gpt-4o-mini", () => {
++  resetLadderBudget();
++  const decision = chooseModel({
++    message: "Résume ce document du vault.",
++    taskClass: "general",
++    agentId: "joris",
++    nowMs: FIXED_NOW,
++  });
++  assert.equal(decision.modelId, LONG_CONTEXT_MODEL_ID);
++  assert.equal(decision.execution, "refused");
++  assert.notEqual(decision.modelId, ECONOMY_MODEL_ID);
++  assert.match(decision.refusalReason, /refus/i);
++});
++
++test("refusal of an unsupported model sends zero network requests", async () => {
++  let calls = 0;
++  const fetchFn = async () => {
++    calls += 1;
++    throw new Error("network must not be used");
++  };
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  const result = await generateStructuredJson({
++    providerPreference: "auto",
++    modelId: LONG_CONTEXT_MODEL_ID,
++    workspaceId: "ws-a",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns: { anthropic: fetchFn, openai: fetchFn },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  delete process.env.OPENAI_API_KEY;
++  assert.equal(calls, 0);
++  assert.equal(result.ok, false);
++  assert.equal(result.errorCode, "model_unsupported");
++  assert.equal(result.executedModelId, null);
++  assert.equal(result.cost.kind, "refused");
++  assert.equal(result.cost.networkRequestSent, false);
++  assert.equal(result.cost.monetaryUsd, null);
++  assert.match(result.fallbackReason, /n'est pas opérationnel|sans substitution/i);
++});
++
++test("a local or subscription id is refused and not described as operational", async () => {
++  let calls = 0;
++  const result = await generateStructuredJson({
++    providerPreference: "auto",
++    modelId: "local-subscription-runtime",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns: {
++      anthropic: async () => {
++        calls += 1;
++        throw new Error("network");
++      },
++      openai: async () => {
++        calls += 1;
++        throw new Error("network");
++      },
++    },
++  });
++  assert.equal(calls, 0);
++  assert.equal(result.ok, false);
++  assert.match(result.fallbackReason, /Aucun abonnement ni modèle local n'est opérationnel/);
++});
++
++test("implicit paid fallback is blocked, and a second workspace cannot reuse another workspace's authorization", async () => {
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  let openaiCalls = 0;
++  const fetchFns = {
++    anthropic: async () => ({ ok: false, status: 503, json: async () => ({}) }),
++    openai: async () => {
++      openaiCalls += 1;
++      return {
++        ok: true,
++        status: 200,
++        json: async () => ({ choices: [{ message: { content: JSON.stringify({ reply: "x" }) } }] }),
++      };
++    },
++  };
++  const blocked = await generateStructuredJson({
++    providerPreference: "auto",
++    workspaceId: "ws-b",
++    paidFallback: { authorized: true, workspaceId: "ws-a" },
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns,
++  });
++  assert.equal(blocked.ok, false);
++  assert.equal(openaiCalls, 0);
++  assert.equal(blocked.cost.kind, "failed_maybe_billed");
++  assert.equal(blocked.cost.monetaryUsd, null);
++
++  const allowed = await generateStructuredJson({
++    providerPreference: "auto",
++    workspaceId: "ws-a",
++    paidFallback: { authorized: true, workspaceId: "ws-a" },
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns,
++  });
++  assert.equal(allowed.ok, true);
++  assert.equal(allowed.fallbackUsed, true);
++  assert.equal(allowed.providerUsed, "openai");
++  assert.equal(openaiCalls, 1);
++  delete process.env.ANTHROPIC_API_KEY;
++  delete process.env.OPENAI_API_KEY;
++});
++
++test("workspace journals do not share selection events", () => {
++  clearCallAccountingLog();
++  chooseModel({
++    message: "Salut",
++    requestedMode: "economy",
++    workspaceId: "ws-a",
++    agentId: "a",
++  });
++  chooseModel({
++    message: "Salut",
++    requestedMode: "economy",
++    workspaceId: "ws-b",
++    agentId: "b",
++  });
++  const a = getCallAccountingLog("ws-a");
++  const b = getCallAccountingLog("ws-b");
++  assert.equal(a.length, 1);
++  assert.equal(b.length, 1);
++  assert.equal(a[0].workspaceId, "ws-a");
++  assert.equal(b[0].workspaceId, "ws-b");
++  assert.equal(a[0].agentId, "a");
++  assert.notEqual(a[0].agentId, b[0].agentId);
++});
++
++test("unknown monetary cost is distinct from zero after a completed call without usage", async () => {
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  delete process.env.OPENAI_API_KEY;
++  const result = await generateStructuredJson({
++    providerPreference: "anthropic",
++    modelId: PREMIUM_MODEL_ID,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns: { anthropic: anthropicOk({ reply: "ok" }) },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(result.ok, true);
++  assert.equal(result.cost.kind, "unknown_cost");
++  assert.equal(result.cost.monetaryUsd, null);
++  assert.notEqual(result.cost.monetaryUsd, 0);
++  assert.equal(result.cost.networkRequestSent, true);
++});
++
++test("observed usage keeps token counts and a null monetary amount", async () => {
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const result = await generateStructuredJson({
++    providerPreference: "anthropic",
++    modelId: PREMIUM_MODEL_ID,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns: {
++      anthropic: anthropicOk({ reply: "ok" }, { input_tokens: 11, output_tokens: 7 }),
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(result.ok, true);
++  assert.equal(result.cost.kind, "observed_usage");
++  assert.equal(result.cost.inputTokens, 11);
++  assert.equal(result.cost.outputTokens, 7);
++  assert.equal(result.cost.monetaryUsd, null);
++  assert.notEqual(result.cost.monetaryUsd, 0);
++});
++
++test("the executed model id is the id placed in the request, not the client default", async () => {
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  let sentModel = null;
++  const result = await generateStructuredJson({
++    providerPreference: "auto",
++    modelId: PREMIUM_MODEL_ID,
++    workspaceId: "ws-a",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns: {
++      anthropic: async (_url, init) => {
++        sentModel = JSON.parse(init.body).model;
++        return {
++          ok: true,
++          status: 200,
++          json: async () => ({
++            content: [{ type: "text", text: JSON.stringify({ reply: "ok" }) }],
++            usage: { input_tokens: 1, output_tokens: 1 },
++          }),
++        };
++      },
++      openai: async () => {
++        throw new Error("openai must not be called for a chosen Anthropic model");
++      },
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(result.ok, true);
++  assert.equal(sentModel, PREMIUM_MODEL_ID);
++  assert.equal(result.modelId, PREMIUM_MODEL_ID);
++  assert.equal(result.executedModelId, PREMIUM_MODEL_ID);
++  assert.notEqual(result.executedModelId, "claude-haiku-4-5-20251001");
++  assert.equal(result.fallbackUsed, false);
++});
++
++test("reservation is not implemented and the durable budget is not claimed", () => {
++  const reservation = reservationNotImplemented("ws-a");
++  assert.equal(reservation.implemented, false);
++  assert.equal(reservation.effect, "none");
++  assert.equal(reservation.monetaryUsd, null);
++  assert.equal(DURABLE_BUDGET_IMPLEMENTED, false);
++});
++
++test("an economy selection stays on gpt-4o-mini and can be executed as that id", async () => {
++  const decision = chooseModel({
++    message: "Reformule cette phrase simplement.",
++    requestedMode: "economy",
++    taskClass: "general",
++    agentId: "joris",
++    nowMs: FIXED_NOW,
++    workspaceId: "ws-b",
++  });
++  assert.equal(decision.chosenModelId, ECONOMY_MODEL_ID);
++  assert.equal(decision.execution, "callable");
++  assert.equal(decision.executedModelId, null);
++
++  process.env.OPENAI_API_KEY = "synthetic";
++  delete process.env.ANTHROPIC_API_KEY;
++  let sent = null;
++  let anthropicCalls = 0;
++  const result = await generateStructuredJson({
++    providerPreference: "auto",
++    modelId: decision.chosenModelId,
++    workspaceId: "ws-b",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns: {
++      anthropic: async () => {
++        anthropicCalls += 1;
++        throw new Error("anthropic must not run for gpt-4o-mini");
++      },
++      openai: async (_url, init) => {
++        sent = JSON.parse(init.body).model;
++        return {
++          ok: true,
++          status: 200,
++          json: async () => ({
++            choices: [{ message: { content: JSON.stringify({ reply: "ok" }) } }],
++            usage: { prompt_tokens: 3, completion_tokens: 4 },
++          }),
++        };
++      },
++    },
++  });
++  delete process.env.OPENAI_API_KEY;
++  assert.equal(anthropicCalls, 0);
++  assert.equal(sent, ECONOMY_MODEL_ID);
++  assert.equal(result.executedModelId, ECONOMY_MODEL_ID);
++  assert.equal(result.providerUsed, "openai");
++});
+diff --git a/src/server/joris/brain-cost-ladder-tagging.test.mjs b/src/server/joris/brain-cost-ladder-tagging.test.mjs
+index 853bba9..67f81af 100644
+--- a/src/server/joris/brain-cost-ladder-tagging.test.mjs
++++ b/src/server/joris/brain-cost-ladder-tagging.test.mjs
+@@ -89,8 +89,8 @@ test("a non-critical intent defers to the base router but the ladder is observab
+ 
+ test("board.consult through the brain stays premium end-to-end (fallback path, no network)", async () => {
+   resetLadderBudget();
+-  // The fallback path (no provider) surfaces the routed model in the result.
+   // No network: the reply generator is injected and returns ok:false.
++  // The template must not publish the routed premium id as an executed model.
+   const deps = { generateReply: async () => ({ ok: false, reason: "no provider configured" }) };
+ 
+   const result = await runJorisCommand(
+@@ -101,7 +101,11 @@ test("board.consult through the brain stays premium end-to-end (fallback path, n
+ 
+   assert.equal(result.intent, "board.consult");
+   assert.equal(result.generation, "fallback");
+-  assert.equal(result.modelId, PREMIUM_MODEL_ID);
++  assert.equal(result.modelId, undefined);
++  assert.equal(result.chosenModelId, PREMIUM_MODEL_ID);
++  assert.equal(result.executedModelId, null);
++  assert.equal(result.costAccounting.monetaryUsd, null);
++  assert.notEqual(result.costAccounting.kind, "observed_usage");
+ });
+ 
+ test("a structured intent stays deterministic and the rails are unchanged (no LLM, no network)", async () => {
+diff --git a/src/server/joris/brain-llm-reply.test.mjs b/src/server/joris/brain-llm-reply.test.mjs
+index 2fbe2dd..db9dc05 100644
+--- a/src/server/joris/brain-llm-reply.test.mjs
++++ b/src/server/joris/brain-llm-reply.test.mjs
+@@ -33,7 +33,12 @@ test("Joris brain — conversational LLM wiring", async (t) => {
+     assert.equal(result.generation, "llm");
+     assert.equal(result.summary, "REPONSE_LLM_MOCK");
+     assert.equal(result.modelId, "mock-model-x");
+-    assert.equal(result.costMode, "economy");
++    assert.equal(result.executedModelId, "mock-model-x");
++    assert.ok(result.chosenModelId);
++    assert.notEqual(result.chosenModelId, result.executedModelId);
++    assert.equal(result.costMode, undefined);
++    assert.equal(result.costAccounting.kind, "unknown_cost");
++    assert.equal(result.costAccounting.monetaryUsd, null);
+   });
+ 
+   await t.test("falls back to a deterministic summary when the LLM is unavailable (no silent AI mode)", async () => {
+@@ -75,6 +80,8 @@ test("Joris brain — conversational LLM wiring", async (t) => {
+       result.summary.includes("VERIFIED_MEMORY_LESSONS_FOR_JORIS"),
+       "verified-lessons rail preserved verbatim",
+     );
+-    assert.equal(result.costMode, "economy");
++    assert.equal(result.executedModelId, "mock-model");
++    assert.equal(result.costMode, undefined);
++    assert.equal(result.costAccounting.monetaryUsd, null);
+   });
+ });
+diff --git a/src/server/joris/brain.ts b/src/server/joris/brain.ts
+index c2cb5d5..b252409 100644
+--- a/src/server/joris/brain.ts
++++ b/src/server/joris/brain.ts
+@@ -72,9 +72,9 @@ const DEFAULT_GOVERNANCE_AUDIT_LIMIT = 500;
+  * intents carry the premium-mandatory `client_audit` floor (never downgraded,
+  * even in economy mode or under budget pressure). Every other intent is
+  * `general`, which defers to the base router — so the displayed model is
+- * unchanged and the ladder simply becomes observable (`via: "cost-ladder"` plus
+- * a recorded cost event). No free model is ever forced here: the free rung
+- * stays config-gated and empty until a later (dispatch) phase.
++ * unchanged and the ladder stays observable (`via: "cost-ladder"`). Selection
++ * does not debit. No free model is forced here: the free rung stays
++ * config-gated, and an unsupported id is refused instead of being called.
+  *
+  * `client_audit` is reused as the only existing premium-floor class; the tag is
+  * a routing-tier signal, not a claim that these intents are literal audits.
+@@ -102,6 +102,22 @@ export function taskClassForIntent(intent: JorisIntent): TaskClass {
+   return INTENT_TASK_CLASS[intent] ?? "general";
+ }
+ 
++/** Rules path: the route id is chosen, not executed. The weight is not a debit. */
++function unexecutedRouteFields(route: ReturnType<typeof chooseModel>) {
++  return {
++    modelId: route.modelId,
++    chosenModelId: route.chosenModelId,
++    executedModelId: null as null,
++    costMode: route.mode,
++    costAccounting: {
++      kind: "estimation" as const,
++      monetaryUsd: null as null,
++      relativeWeight: route.estimate.relativeWeight,
++      networkRequestSent: false,
++    },
++  };
++}
++
+ /**
+  * Formats verified Memory Vault entries as a concise context note for Joris.
+  * Returns null when no entries are available (no noise on empty vault).
+@@ -145,8 +161,7 @@ async function handleMissionDraftReply(
+         intent: "mission.draft",
+         summary:
+           "Ta réponse mélange confirmation et nouvelle demande calendrier. Réponds seulement « confirme », « oui » ou « go » pour booker la mission draft en cours, ou « annule » pour abandonner.",
+-        modelId: route.model.id,
+-        costMode: route.mode,
++        ...unexecutedRouteFields(route),
+         ...workspaceMeta,
+         missionDraftPreview: pending.preview,
+         pendingDraftId: pending.pendingDraftId,
+@@ -261,8 +276,7 @@ async function handleGovernanceReviewReply(
+   return {
+     intent: "opportunity.score",
+     summary,
+-    modelId: route.model.id,
+-    costMode: route.mode,
++    ...unexecutedRouteFields(route),
+     ...workspaceMeta,
+     requiresConfirmation: false,
+   };
+@@ -270,7 +284,12 @@ async function handleGovernanceReviewReply(
+ 
+ /** Injectable dependencies — lets tests supply a mock LLM reply / vault (no network). */
+ export type RunJorisCommandDeps = {
+-  generateReply: (input: { message: string; memoryContext?: string | null }) => Promise<JorisReplyResult>;
++  generateReply: (input: {
++    message: string;
++    memoryContext?: string | null;
++    chosenModelId?: string;
++    workspaceId?: string;
++  }) => Promise<JorisReplyResult>;
+   /** Verified-vault reader; defaults to the real one. Injectable for tests. */
+   readVerifiedVault?: (workspaceId: string) => MemoryVaultReadResult;
+   /** Optional Memex read-only enrichment — defaults to env-gated stdio client. */
+@@ -301,9 +320,10 @@ export async function runJorisCommand(
+     // (governance / mission-draft confirmations) is always tagged conservatively
+     // `general` — a confirmation reply must never inherit a premium or free tag
+     // from its own keywords. `general` defers to the base router, so the
+-    // displayed model is unchanged; only `via` + the cost event become observable.
++    // displayed model is unchanged. Selection does not debit.
+     taskClass: "general",
+     agentId: ctx.activeAgentProfile.id,
++    workspaceId: ctx.workspace.id,
+   });
+ 
+   const workspaceMeta = {
+@@ -391,6 +411,7 @@ export async function runJorisCommand(
+     // forced — the free rung stays config-gated/empty in this phase.
+     taskClass: taskClassForIntent(intent),
+     agentId: ctx.activeAgentProfile.id,
++    workspaceId: ctx.workspace.id,
+   });
+ 
+   if (intent === "governance.audit") {
+@@ -418,8 +439,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary,
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+       auditExport: {
+@@ -473,8 +493,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary,
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -490,8 +509,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary: attachMemexPreview(briefSummary, "brief.generate", memory),
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -505,8 +523,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary: listing.summary,
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -520,8 +537,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary: market.summary,
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -536,8 +552,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary: livre.summary,
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -551,8 +566,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary: marketing.summary,
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -566,8 +580,7 @@ export async function runJorisCommand(
+       return {
+         intent,
+         summary: `Je ne peux pas exécuter cette action sans confirmation: ${permission.reason}`,
+-        modelId: routedModel.model.id,
+-        costMode: routedModel.mode,
++        ...unexecutedRouteFields(routedModel),
+         ...workspaceMeta,
+         requiresConfirmation: true,
+       };
+@@ -578,15 +591,13 @@ export async function runJorisCommand(
+         workspaceId: ctx.workspace.id,
+         userId: ctx.userId,
+         calendarIntent,
+-        modelId: routedModel.model.id,
+-        costMode: routedModel.mode,
++        ...unexecutedRouteFields(routedModel),
+       });
+ 
+       return {
+         intent: "mission.draft",
+         summary: formatMissionDraftProposalSummary(pending.preview),
+-        modelId: routedModel.model.id,
+-        costMode: routedModel.mode,
++        ...unexecutedRouteFields(routedModel),
+         ...workspaceMeta,
+         calendarIntent,
+         missionDraftPreview: pending.preview,
+@@ -598,8 +609,7 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary: "Il me manque l’heure ou la date pour booker ça proprement. Donne-moi au moins l’heure, puis je le crée sans friction.",
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -619,8 +629,7 @@ export async function runJorisCommand(
+         return {
+           intent,
+           summary: `Plusieurs missions correspondent. Précise laquelle :\n${list}`,
+-          modelId: routedModel.model.id,
+-          costMode: routedModel.mode,
++          ...unexecutedRouteFields(routedModel),
+           ...workspaceMeta,
+           requiresConfirmation: false,
+         };
+@@ -633,8 +642,7 @@ export async function runJorisCommand(
+         summary: available
+           ? `Aucune mission trouvée pour ta demande. Missions disponibles :\n${available}`
+           : "Aucune mission active dans ce workspace.",
+-        modelId: routedModel.model.id,
+-        costMode: routedModel.mode,
++        ...unexecutedRouteFields(routedModel),
+         ...workspaceMeta,
+         requiresConfirmation: false,
+       };
+@@ -680,20 +688,45 @@ export async function runJorisCommand(
+     return {
+       intent,
+       summary,
+-      modelId: routedModel.model.id,
+-      costMode: routedModel.mode,
++      ...unexecutedRouteFields(routedModel),
+       ...workspaceMeta,
+       requiresConfirmation: true,
+       missionPlanResult,
+     };
+   }
+ 
+-  // Conversational catch-all (chat / board.consult / reminders). Attempt a real
+-  // LLM reply via the shared provider; when no provider is configured (no API
+-  // keys) or the call fails, fall back to a deterministic summary. The result is
+-  // labelled (`generation`) so nothing claims "AI mode" when rules produced it.
++  // Conversational catch-all (chat / board.consult / reminders). A provider
++  // request is sent only when the chosen id is supported. A template summary
++  // does not publish that id as an executed model.
+   const memory = await getMemoryContext();
+-  const llmReply = await deps.generateReply({ message, memoryContext: memory.memoryContext });
++  const fallbackSummary = buildFallbackSummary(intent, message);
++  const finalSummary =
++    intent === "board.consult" && memory.memoryContext
++      ? `${fallbackSummary}\n\n${memory.memoryContext}`
++      : fallbackSummary;
++  const template = {
++    intent,
++    summary: attachMemexPreview(finalSummary, intent, memory),
++    chosenModelId: routedModel.chosenModelId,
++    executedModelId: null as null,
++    ...workspaceMeta,
++    requiresConfirmation: false as const,
++    generation: "fallback" as const,
++  };
++
++  if (routedModel.execution === "refused") {
++    return {
++      ...template,
++      costAccounting: { kind: "refused", monetaryUsd: null, networkRequestSent: false },
++    };
++  }
++
++  const llmReply = await deps.generateReply({
++    message,
++    memoryContext: memory.memoryContext,
++    chosenModelId: routedModel.chosenModelId,
++    workspaceId: ctx.workspace.id,
++  });
+   if (llmReply.ok) {
+     // Preserve the deterministic verified-memory/lessons rail verbatim by
+     // appending it OUTSIDE the LLM (board.consult), so the audit block is
+@@ -702,32 +735,31 @@ export async function runJorisCommand(
+       intent === "board.consult" && memory.memoryContext
+         ? `${llmReply.text}\n\n${memory.memoryContext}`
+         : llmReply.text;
++    const executedModelId = llmReply.modelId;
+     return {
+       intent,
+       summary: attachMemexPreview(summary, intent, memory),
+-      modelId: llmReply.modelId,
+-      // The shared provider uses a low-cost default model; report an honest
+-      // conservative cost mode rather than the routed (possibly premium) one.
+-      costMode: "economy",
++      modelId: executedModelId,
++      chosenModelId: routedModel.chosenModelId,
++      executedModelId,
++      ...(executedModelId === routedModel.chosenModelId ? { costMode: routedModel.mode } : {}),
++      costAccounting: llmReply.cost ?? {
++        kind: "unknown_cost",
++        monetaryUsd: null,
++        networkRequestSent: true,
++      },
+       ...workspaceMeta,
+       requiresConfirmation: false,
+       generation: "llm",
+     };
+   }
+ 
+-  const fallbackSummary = buildFallbackSummary(intent, message);
+-  const finalSummary =
+-    intent === "board.consult" && memory.memoryContext
+-      ? `${fallbackSummary}\n\n${memory.memoryContext}`
+-      : fallbackSummary;
+-
+   return {
+-    intent,
+-    summary: attachMemexPreview(finalSummary, intent, memory),
+-    modelId: routedModel.model.id,
+-    costMode: routedModel.mode,
+-    ...workspaceMeta,
+-    requiresConfirmation: false,
+-    generation: "fallback",
++    ...template,
++    costAccounting: llmReply.cost ?? {
++      kind: "refused",
++      monetaryUsd: null,
++      networkRequestSent: false,
++    },
+   };
+ }
+diff --git a/src/server/joris/joris-reply-generator.ts b/src/server/joris/joris-reply-generator.ts
+index f2760f8..50c1e14 100644
+--- a/src/server/joris/joris-reply-generator.ts
++++ b/src/server/joris/joris-reply-generator.ts
+@@ -5,7 +5,8 @@
+ // prompt so the conversational path is genuinely model-backed when configured.
+ //
+ // Design:
+-//   - Uses generateStructuredJson (Anthropic -> OpenAI, key-gated, never throws).
++//   - Uses generateStructuredJson. A second paid provider is not tried unless
++//     the caller passes paidFallback for the same workspace.
+ //   - Returns ok:false when no provider is configured or the reply is malformed,
+ //     so the caller falls back to a deterministic, non-deceptive summary.
+ //   - fetchFn is injectable so tests run without network access or real API keys.
+@@ -14,7 +15,11 @@
+ import "server-only";
+ 
+ import { z } from "zod";
+-import { generateStructuredJson } from "@/server/ai/llm-json-provider";
++import type { RoutingCostAssessment } from "@/core/types";
++import {
++  generateStructuredJson,
++  type PaidFallbackAuthorization,
++} from "@/server/ai/llm-json-provider";
+ import { buildJorisSystemPrompt } from "@/server/joris/joris-prompt";
+ 
+ export type JorisReplyInput = {
+@@ -23,11 +28,16 @@ export type JorisReplyInput = {
+   memoryContext?: string | null;
+   /** Inject fetch for tests — avoids network access and real API keys. */
+   fetchFn?: typeof fetch;
++  /** Route selection. Sent only when that id is supported by one existing client. */
++  chosenModelId?: string;
++  workspaceId?: string;
++  /** Off unless the caller sets an explicit same-workspace authorization. */
++  paidFallback?: PaidFallbackAuthorization;
+ };
+ 
+ export type JorisReplyResult =
+-  | { ok: true; text: string; modelId: string }
+-  | { ok: false; reason: string };
++  | { ok: true; text: string; modelId: string; cost?: RoutingCostAssessment }
++  | { ok: false; reason: string; cost?: RoutingCostAssessment; executedModelId?: null };
+ 
+ const replySchema = z.object({ reply: z.string().trim().min(1) });
+ 
+@@ -53,17 +63,25 @@ export async function generateJorisReply(input: JorisReplyInput): Promise<JorisR
+     maxTokens: 1024,
+     temperature: 0.4,
+     timeoutMs: 20_000,
++    ...(input.chosenModelId ? { modelId: input.chosenModelId } : {}),
++    ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
++    ...(input.paidFallback ? { paidFallback: input.paidFallback } : {}),
+     fetchFns: input.fetchFn ? { anthropic: input.fetchFn, openai: input.fetchFn } : undefined,
+   });
+ 
+   if (!result.ok) {
+-    return { ok: false, reason: result.fallbackReason };
++    return { ok: false, reason: result.fallbackReason, executedModelId: null, cost: result.cost };
+   }
+ 
+   const parsed = replySchema.safeParse(result.json);
+   if (!parsed.success) {
+-    return { ok: false, reason: "LLM reply did not match the expected { reply } shape" };
++    return {
++      ok: false,
++      reason: "LLM reply did not match the expected { reply } shape",
++      executedModelId: null,
++      cost: result.cost,
++    };
+   }
+ 
+-  return { ok: true, text: parsed.data.reply, modelId: result.modelId };
++  return { ok: true, text: parsed.data.reply, modelId: result.modelId, cost: result.cost };
+ }
+diff --git a/src/server/missions/mission-draft-control.test.mjs b/src/server/missions/mission-draft-control.test.mjs
+index 38e3b01..b5b5c95 100644
+--- a/src/server/missions/mission-draft-control.test.mjs
++++ b/src/server/missions/mission-draft-control.test.mjs
+@@ -226,6 +226,9 @@ test("shadow tagging: buildRoute tags the mission-draft route via the ladder, ou
+   const result = cancelPendingMissionDraft(ctx);
+   assert.equal(result.intent, "chat");
+   assert.match(result.summary, /aucune mission draft en attente/i);
+-  assert.ok(result.modelId, "route metadata is still surfaced (behaviour identical)");
++  assert.ok(result.modelId, "chosen route id stays available to existing callers");
++  assert.equal(result.chosenModelId, result.modelId);
++  assert.equal(result.executedModelId, null);
++  assert.equal(result.costAccounting.monetaryUsd, null);
+   assert.ok(result.costMode);
+ });
+diff --git a/src/server/missions/mission-draft-control.ts b/src/server/missions/mission-draft-control.ts
+index 6a1d95d..523ea55 100644
+--- a/src/server/missions/mission-draft-control.ts
++++ b/src/server/missions/mission-draft-control.ts
+@@ -41,11 +41,26 @@ function buildWorkspaceMeta(ctx: WorkspaceContext): Pick<CommandResult, "workspa
+   };
+ }
+ 
++function unexecutedRouteFields(route: ReturnType<typeof buildRoute>) {
++  return {
++    modelId: route.modelId,
++    chosenModelId: route.chosenModelId,
++    executedModelId: null as null,
++    costMode: route.mode,
++    costAccounting: {
++      kind: "estimation" as const,
++      monetaryUsd: null as null,
++      relativeWeight: route.estimate.relativeWeight,
++      networkRequestSent: false,
++    },
++  };
++}
++
+ export function buildRoute(message: string) {
+   // Shadow tagging (Cost Ladder, display_only): mission-draft confirmations
+   // (confirm / cancel) are tagged conservatively `general` — they defer to the
+-  // base router, so the displayed model is unchanged; only `via` + the cost
+-  // event become observable. No provider call changes; no free model is forced.
++  // base router, so the displayed model is unchanged. Selection does not debit
++  // and executedModelId stays null. No provider call; no free model is forced.
+   return chooseModel({
+     message,
+     highImpact: false,
+@@ -114,8 +129,7 @@ export function cancelPendingMissionDraft(
+     return {
+       intent: "chat",
+       summary: "Il n'y a aucune mission draft en attente à annuler.",
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -125,8 +139,7 @@ export function cancelPendingMissionDraft(
+   if (mismatch) {
+     return {
+       ...mismatch,
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       missionDraftPreview: pending.preview,
+     };
+@@ -137,8 +150,7 @@ export function cancelPendingMissionDraft(
+   return {
+     intent: "mission.draft",
+     summary: "Mission draft annulée. Tu peux reformuler un nouveau rendez-vous quand tu veux.",
+-    modelId: route.model.id,
+-    costMode: route.mode,
++    ...unexecutedRouteFields(route),
+     ...workspaceMeta,
+     requiresConfirmation: false,
+   };
+@@ -156,8 +168,7 @@ export async function confirmPendingMissionDraft(
+     return {
+       intent: "chat",
+       summary: "Il n'y a rien à confirmer pour l'instant. Propose d'abord un rendez-vous à booker.",
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -167,8 +178,7 @@ export async function confirmPendingMissionDraft(
+   if (mismatch) {
+     return {
+       ...mismatch,
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       missionDraftPreview: pending.preview,
+       requiresConfirmation: true,
+@@ -181,8 +191,7 @@ export async function confirmPendingMissionDraft(
+     return {
+       intent: "calendar.book",
+       summary: cachedBeforeBook.summary,
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       pendingDraftId: cachedBeforeBook.pendingDraftId,
+       missionId: cachedBeforeBook.missionId,
+@@ -196,8 +205,7 @@ export async function confirmPendingMissionDraft(
+       intent: "mission.draft",
+       summary:
+         "La mission draft a expiré. Reformule le rendez-vous à booker (date et heure) pour que je prépare une nouvelle proposition.",
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -207,8 +215,7 @@ export async function confirmPendingMissionDraft(
+     return {
+       intent: "mission.draft",
+       summary: "La mission draft en attente ne correspond pas à calendar.book. Reformule ta demande.",
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       requiresConfirmation: false,
+     };
+@@ -219,8 +226,7 @@ export async function confirmPendingMissionDraft(
+     return {
+       intent: "calendar.book",
+       summary: `Je ne peux pas exécuter cette action sans confirmation: ${permission.reason}`,
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       missionDraftPreview: pending.preview,
+       pendingDraftId: pending.pendingDraftId,
+@@ -270,8 +276,7 @@ export async function confirmPendingMissionDraft(
+     return {
+       intent: "calendar.book",
+       summary: `${summary} ${ledgerSummary} ${storageSummary}`,
+-      modelId: route.model.id,
+-      costMode: route.mode,
++      ...unexecutedRouteFields(route),
+       ...workspaceMeta,
+       calendarIntent: pending.calendarIntent,
+       calendarEvent: event,
+@@ -287,8 +292,7 @@ export async function confirmPendingMissionDraft(
+       return {
+         intent: "calendar.book",
+         summary: `Je ne peux pas booker ce rendez-vous tout de suite: ${error.message}`,
+-        modelId: route.model.id,
+-        costMode: route.mode,
++        ...unexecutedRouteFields(route),
+         ...workspaceMeta,
+         missionDraftPreview: pending.preview,
+         pendingDraftId: pending.pendingDraftId,
+-- 
+2.43.0
+
+
+From aa3d543b8ab10255b6c61c5a172cb93d892d90e9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 04:46:07 +0000
+Subject: [PATCH 2/5] Record the routing execution result against base e9ff840.
+
+The note names the implementation commit, the commands that were run, and the limits that remain.
+---
+ docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md | 93 +++++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+ create mode 100644 docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+
+diff --git a/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+new file mode 100644
+index 0000000..bb09f28
+--- /dev/null
++++ b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+@@ -0,0 +1,93 @@
++# Routage et coût — résultat d'exécution
++
++Correctif local du produit `Oria.HQ.Michael.HQ-APP`. Ce document décrit un contrat et des essais injectés. Il n'authentifie pas un appel fournisseur réel, un budget durable, ni une mission réelle.
++
++## Base
++
++- Dépôt : `mboyer1269-pixel/Oria.HQ.Michael.HQ-APP`
++- Branche de base : `codex/hq-mission-dossier`
++- Commit de base : `e9ff840a38b4532b687bb29f3e2371afeeb3024e`
++- Branche de travail : `cursor/routage-couts-execution`
++- Commit d'implémentation : `8497a19aa2c306954a1e410044b63e09ba53752d`
++- Ce document est le commit suivant sur la même branche. Son SHA se lit avec `git rev-parse HEAD` après ce commit.
++
++## Reproduction sur e9ff840, avant correctif
++
++Worktree détaché à `e9ff840`, clients HTTP remplacés, aucune clé réelle.
++
++- `chooseModel` avec un modèle gratuit éligible, puis le même modèle marqué indisponible : le store passe de 0 à 1. Le second choix devient `gpt-4o-mini` alors que la raison reste « zéro coût ».
++- Premium indisponible : le choix devient `gpt-4o`, raison `claude-sonnet-4-6 indisponible → gpt-4o`.
++- `generateStructuredJson` en `auto` : Anthropic répond 503, OpenAI est appelé (`openaiCalls: 1`, `fallbackUsed: true`).
++
++Les entiers 0, 1 et 5 sont des poids relatifs. Ils ne sont pas des dollars.
++
++## Ce qui change
++
++La sélection n'appelle plus `BudgetStore.add` et n'écrit plus dans le journal sommé par `getCostLadderSnapshot`. Elle peut journaliser une estimation : poids relatif, `monetaryUsd: null`, `networkRequestSent: false`.
++
++Cinq situations restent distinctes :
++
++- estimation : poids 0, 1 ou 5, sans débit ;
++- réservation : non implémentée, aucun hold (`reservationNotImplemented`) ;
++- usage observé : jetons d'une réponse complétée, montant monétaire toujours `null` ;
++- coût inconnu : appel terminé sans usage, `null`, distinct de 0 ;
++- appel échoué possiblement facturé : la requête a pu atteindre le fournisseur, `null`, distinct de 0.
++
++Un modèle indisponible ou non pris en charge est refusé. Il n'est pas remplacé par `gpt-4o`, `gpt-4o-mini` ou un autre fournisseur payant. Gemini, OpenRouter, un id local ou un id d'abonnement ne sont pas appelés et ne sont pas annoncés comme opérationnels.
++
++`auto` n'essaie OpenAI après Anthropic que si l'appel porte `paidFallback: { authorized: true, workspaceId }` et que `workspaceId` est le même. L'autorisation d'un workspace ne vaut pas pour un autre.
++
++`chooseModel` renvoie `chosenModelId` et `executedModelId: null`. Le chemin conversationnel n'envoie un id que s'il est pris en charge (`claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, `gpt-4o`, `gpt-4o-mini`). Le résultat LLM met cet id dans `modelId` et `executedModelId`. Un résumé template met `executedModelId: null` et n'écrit pas `modelId`. Les résultats de règles gardent `modelId` comme id choisi, avec `executedModelId: null`, pour les appelants existants.
++
++## Budget durable
++
++Non implémenté. `DURABLE_BUDGET_IMPLEMENTED` vaut `false`. Le `Map` en mémoire n'est pas un budget.
++
++Contrat proposé, non migré, pour une table HQ partagée et non pour Antigravity :
++
++`hq_model_call_cost (workspace_id, attempt_id, kind, chosen_model_id, executed_model_id, input_tokens, output_tokens, monetary_usd, provider_request_reached, created_at)`
++
++`monetary_usd` reste nullable. `null` signifie inconnu, pas zéro. Aucune ligne n'est écrite ici.
++
++## Fichiers
++
++- `src/server/ai/model-router.ts`
++- `src/server/ai/model-config.ts`
++- `src/server/ai/cost-ladder.ts`
++- `src/server/ai/llm-json-provider.ts`
++- `src/server/ai/call-accounting.ts`
++- `src/server/ai/execution-models.ts`
++- `src/server/ai/model-router.test.mjs`
++- `src/server/ai/llm-json-provider.test.mjs`
++- `src/server/ai/routing-execution.test.mjs`
++- `src/server/ai/cost-ladder.test.mjs` (inchangé, rejoué)
++- `src/server/joris/brain.ts`
++- `src/server/joris/joris-reply-generator.ts` (adaptateur d'appel utilisé par le cerveau)
++- `src/server/missions/mission-draft-control.ts`
++- `src/core/types.ts` (champs optionnels)
++- tests d'appelants listés ci-dessous
++- ce document
++
++Hors diff : auth, formulaire de mission, CLI d'admission, cockpit, Antigravity.
++
++## Commandes exécutées
++
++Depuis le clone produit, après `npm ci --ignore-scripts` (760 paquets, code 0) :
++
++- `npx tsc --noEmit` : code 0
++- `npm run lint` : code 0, 5 avertissements déjà présents (mémoire / Memex), aucun dans ce diff
++- `npm run build` : code 0, Next.js 16.3.7
++- `npm run smoke:joris` : `PASS`, mode local, aucun écrit Supabase
++- `npm run smoke:runtime` : `PASS`, echo local
++- `node --test --test-concurrency=1` sur `model-router`, `routing-execution`, `llm-json-provider`, `cost-ladder`, `brain-cost-ladder-tagging`, `brain-llm-reply`, `joris-reply-generator`, `mission-draft-control` : 72 tests, 0 échec
++
++Les fixtures n'ouvrent pas le réseau réel. `fetch` est injecté ou la requête est refusée avant `fetch`.
++
++## Limites
++
++- `permissions.push` du dépôt produit était faux dans cette session. Si le push de cette branche échoue, la livraison est le commit local et le patch, pas une branche GitHub.
++- `src/features/ventures/llm-cash-action-packet-generator.test.mjs` a deux sous-tests rouges : ils exigent encore le repli implicite Anthropic vers OpenAI et une `failureChain` de longueur au moins 2. Le générateur n'a pas été modifié. Action : son propriétaire passe `paidFallback` seulement avec une autorisation explicite du même workspace, puis aligne ces deux assertions. `daily-direction-generator` reste vert.
++- Pas de table de prix. Un usage observé n'est pas un montant.
++- Le journal d'estimation disparaît avec le processus.
++- Aucune preuve backend réelle (`be61d26`, rapport PostgreSQL collecté) n'est dans ce clone. Elle n'a pas été revue.
++- Aucun appel de modèle payant n'a été fait.
+-- 
+2.43.0
+
+
+From fe166b1b19dc61b8571c5efac50bea249621371d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 04:46:34 +0000
+Subject: [PATCH 3/5] Record the product push refusal for the routing branch.
+
+GitHub returned 403 for cursor[bot], so the branch stays local and the patch is the verifiable delivery.
+---
+ docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+index bb09f28..56fc3d0 100644
+--- a/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
++++ b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+@@ -9,7 +9,8 @@ Correctif local du produit `Oria.HQ.Michael.HQ-APP`. Ce document décrit un cont
+ - Commit de base : `e9ff840a38b4532b687bb29f3e2371afeeb3024e`
+ - Branche de travail : `cursor/routage-couts-execution`
+ - Commit d'implémentation : `8497a19aa2c306954a1e410044b63e09ba53752d`
+-- Ce document est le commit suivant sur la même branche. Son SHA se lit avec `git rev-parse HEAD` après ce commit.
++- Commit de ce document, avant la note de push : `aa3d543b8ab10255b6c61c5a172cb93d892d90e9`
++- Le commit qui enregistre le refus de push est le sommet de la branche. `git rev-parse HEAD` le donne.
+ 
+ ## Reproduction sur e9ff840, avant correctif
+ 
+@@ -85,7 +86,7 @@ Les fixtures n'ouvrent pas le réseau réel. `fetch` est injecté ou la requête
+ 
+ ## Limites
+ 
+-- `permissions.push` du dépôt produit était faux dans cette session. Si le push de cette branche échoue, la livraison est le commit local et le patch, pas une branche GitHub.
++- `git push -u origin cursor/routage-couts-execution` a répondu `403` : `Permission to mboyer1269-pixel/Oria.HQ.Michael.HQ-APP.git denied to cursor[bot]`. La branche n'existe pas sur GitHub. La livraison est le commit local `aa3d543b8ab10255b6c61c5a172cb93d892d90e9` et le patch `git format-patch e9ff840..HEAD`. Action pour publier : un compte qui a `contents: write` sur ce dépôt pousse cette branche, sans force-push.
+ - `src/features/ventures/llm-cash-action-packet-generator.test.mjs` a deux sous-tests rouges : ils exigent encore le repli implicite Anthropic vers OpenAI et une `failureChain` de longueur au moins 2. Le générateur n'a pas été modifié. Action : son propriétaire passe `paidFallback` seulement avec une autorisation explicite du même workspace, puis aligne ces deux assertions. `daily-direction-generator` reste vert.
+ - Pas de table de prix. Un usage observé n'est pas un montant.
+ - Le journal d'estimation disparaît avec le processus.
+-- 
+2.43.0
+
+
+From c332438c3b6f3464158c8601fd09537cd3220474 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 04:50:03 +0000
+Subject: [PATCH 4/5] Prove cash-packet routing does not fall back without
+ consent.
+
+The generator stays unchanged and gains no default authorization. One Anthropic failure does not call OpenAI; a second provider runs only when the same workspace authorizes it.
+---
+ docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md     | 25 +++++-
+ .../llm-cash-action-packet-generator.test.mjs | 78 ++++++++++++++++---
+ 2 files changed, 92 insertions(+), 11 deletions(-)
+
+diff --git a/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+index 56fc3d0..7ee9a90 100644
+--- a/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
++++ b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+@@ -66,6 +66,7 @@ Contrat proposé, non migré, pour une table HQ partagée et non pour Antigravit
+ - `src/server/joris/joris-reply-generator.ts` (adaptateur d'appel utilisé par le cerveau)
+ - `src/server/missions/mission-draft-control.ts`
+ - `src/core/types.ts` (champs optionnels)
++- `src/features/ventures/llm-cash-action-packet-generator.test.mjs`
+ - tests d'appelants listés ci-dessous
+ - ce document
+ 
+@@ -84,10 +85,30 @@ Depuis le clone produit, après `npm ci --ignore-scripts` (760 paquets, code 0)
+ 
+ Les fixtures n'ouvrent pas le réseau réel. `fetch` est injecté ou la requête est refusée avant `fetch`.
+ 
++## Impact sur les appelants de `generateStructuredJson`
++
++Aucun appelant ne reçoit un consentement par défaut. `paidFallback` n'est envoyé que si l'appelant le fournit, et seulement s'il vise le même `workspaceId`. La fonction Ventures n'a pas été modifiée : elle n'a pas de paramètre d'autorisation.
++
++- `generateLlmCashActionPacketsFromVentures` appelle `auto` sans `paidFallback`. Un échec Anthropic produit `fallback_seed` et une `failureChain` d'un seul élément. OpenAI n'est pas appelé. `providerPreference: "openai"` ou `"anthropic"` reste un choix explicite d'un seul fournisseur, pas un repli. Le commentaire du paramètre dit encore « Anthropic → OpenAI » ; le comportement ne le fait plus. `smoke:revenue` l'appelle sans clé et obtient `fallback_seed`.
++- `generateDailyDirection` fait deux tentatives de prompt, chacune en `auto` sans `paidFallback`. Chaque tentative n'appelle qu'Anthropic. Ce n'est pas un repli de fournisseur. Ses 6 tests passent.
++- `generateJorisReply` transmet `paidFallback` seulement si on le lui donne. `runJorisCommand` ne le donne pas. Le modèle choisi part vers son seul fournisseur pris en charge.
++- `runShadowProposalForVenture` appelle `auto` sans workspace ni `paidFallback`. Un échec Anthropic saute la venture ; OpenAI n'est pas tenté. Ses tests injectent `generateJson` et passent.
++- Le test du générateur de paquets prouve les deux côtés sans ajouter de consentement au générateur : un appel Anthropic et zéro appel OpenAI ; puis, sur `generateStructuredJson` seulement, le second fournisseur quand `paidFallback` autorise le même workspace, et pas quand le workspace diffère.
++
++## Vérifications du 1er octobre, après alignement du test
++
++- `npx tsc --noEmit` : code 0
++- `npm run lint` : code 0, 5 avertissements déjà présents, aucun dans ce diff
++- `npm run build` : code 0
++- `npm run smoke:joris` : PASS
++- `npm run smoke:runtime` : PASS
++- `npm run smoke:revenue` : PASS, `source: fallback_seed`, clés absentes
++- `node --test --test-concurrency=1` sur le générateur de paquets, `daily-direction-generator`, `joris-reply-generator`, `venture-score-shadow-runner` : 59 tests, 0 échec
++
+ ## Limites
+ 
+-- `git push -u origin cursor/routage-couts-execution` a répondu `403` : `Permission to mboyer1269-pixel/Oria.HQ.Michael.HQ-APP.git denied to cursor[bot]`. La branche n'existe pas sur GitHub. La livraison est le commit local `aa3d543b8ab10255b6c61c5a172cb93d892d90e9` et le patch `git format-patch e9ff840..HEAD`. Action pour publier : un compte qui a `contents: write` sur ce dépôt pousse cette branche, sans force-push.
+-- `src/features/ventures/llm-cash-action-packet-generator.test.mjs` a deux sous-tests rouges : ils exigent encore le repli implicite Anthropic vers OpenAI et une `failureChain` de longueur au moins 2. Le générateur n'a pas été modifié. Action : son propriétaire passe `paidFallback` seulement avec une autorisation explicite du même workspace, puis aligne ces deux assertions. `daily-direction-generator` reste vert.
++- La tentative de push précédente a reçu `403` : `Permission to mboyer1269-pixel/Oria.HQ.Michael.HQ-APP.git denied to cursor[bot]`. Une nouvelle tentative suit ce commit. S'il échoue encore, la branche reste locale et le patch `git format-patch e9ff840..HEAD` est la copie vérifiable. Action : un compte avec `contents: write` pousse `cursor/routage-couts-execution` vers `codex/hq-mission-dossier`, sans force-push, puis ouvre la PR. Aucune fusion.
++- Pas de migration de budget. `DURABLE_BUDGET_IMPLEMENTED` reste `false`.
+ - Pas de table de prix. Un usage observé n'est pas un montant.
+ - Le journal d'estimation disparaît avec le processus.
+ - Aucune preuve backend réelle (`be61d26`, rapport PostgreSQL collecté) n'est dans ce clone. Elle n'a pas été revue.
+diff --git a/src/features/ventures/llm-cash-action-packet-generator.test.mjs b/src/features/ventures/llm-cash-action-packet-generator.test.mjs
+index 18642be..6db4896 100644
+--- a/src/features/ventures/llm-cash-action-packet-generator.test.mjs
++++ b/src/features/ventures/llm-cash-action-packet-generator.test.mjs
+@@ -163,30 +163,44 @@ await test("llm-cash-action-packet-generator", async (t) => {
+   });
+ 
+   // -------------------------------------------------------------------------
+-  // Auto fallback: Anthropic → OpenAI
++  // Auto does not climb to a second paid provider. The generator has no
++  // authorization argument, so this path must not invent one.
+   // -------------------------------------------------------------------------
+ 
+-  await t.test("auto: Anthropic fails → falls back to OpenAI, source=openai", async () => {
++  await t.test("auto without authorization calls Anthropic once and does not call OpenAI", async () => {
+     process.env.ANTHROPIC_API_KEY = ANTHROPIC_KEY;
+     process.env.OPENAI_API_KEY = OPENAI_KEY;
++    let anthropicCalls = 0;
++    let openaiCalls = 0;
+     const mod = await loadGenerator();
+     const result = await mod.generateLlmCashActionPacketsFromVentures({
+       ventures: mod.ORYA_VENTURES,
+       fallbackItems,
+       createdAt,
+       fetchFns: {
+-        anthropic: makeErrorFetch(503),
+-        openai: makeOpenAiFetch([validRawPacket()]),
++        anthropic: async () => {
++          anthropicCalls += 1;
++          return makeErrorFetch(503)();
++        },
++        openai: async () => {
++          openaiCalls += 1;
++          return makeOpenAiFetch([validRawPacket()])();
++        },
+       },
+     });
+-    assert.equal(result.source, "openai");
+-    assert.equal(result.providerFallbackUsed, true);
++    assert.equal(anthropicCalls, 1);
++    assert.equal(openaiCalls, 0);
++    assert.equal(result.source, "fallback_seed");
++    assert.notEqual(result.providerFallbackUsed, true);
++    assert.equal(result.failureChain.length, 1);
++    assert.ok(result.failureChain[0].startsWith("anthropic:"));
+     assert.ok(result.packets.length > 0);
+   });
+ 
+-  await t.test("auto: both fail → fallback_seed with failureChain", async () => {
++  await t.test("auto does not record an OpenAI failure that was never attempted", async () => {
+     process.env.ANTHROPIC_API_KEY = ANTHROPIC_KEY;
+     process.env.OPENAI_API_KEY = OPENAI_KEY;
++    let openaiCalls = 0;
+     const mod = await loadGenerator();
+     const result = await mod.generateLlmCashActionPacketsFromVentures({
+       ventures: mod.ORYA_VENTURES,
+@@ -194,14 +208,60 @@ await test("llm-cash-action-packet-generator", async (t) => {
+       createdAt,
+       fetchFns: {
+         anthropic: makeErrorFetch(500),
+-        openai: makeErrorFetch(500),
++        openai: async () => {
++          openaiCalls += 1;
++          throw new Error("OpenAI must not be called without authorization");
++        },
+       },
+     });
++    assert.equal(openaiCalls, 0);
+     assert.equal(result.source, "fallback_seed");
+-    assert.ok(Array.isArray(result.failureChain) && result.failureChain.length >= 2);
++    assert.equal(result.failureChain.length, 1);
++    assert.ok(result.failureChain[0].startsWith("anthropic:"));
++    assert.equal(result.failureChain.some((entry) => entry.startsWith("openai:")), false);
+     assert.ok(result.packets.length > 0);
+   });
+ 
++  await t.test("a second paid provider runs only when the same workspace authorizes it", async () => {
++    process.env.ANTHROPIC_API_KEY = ANTHROPIC_KEY;
++    process.env.OPENAI_API_KEY = OPENAI_KEY;
++    const { generateStructuredJson } = await jiti.import(
++      path.join(projectRoot, "src/server/ai/llm-json-provider.ts"),
++    );
++    let openaiCalls = 0;
++    const fetchFns = {
++      anthropic: makeErrorFetch(503),
++      openai: async () => {
++        openaiCalls += 1;
++        return makeOpenAiFetch([validRawPacket()])();
++      },
++    };
++    const blocked = await generateStructuredJson({
++      providerPreference: "auto",
++      workspaceId: "ws-cash-b",
++      paidFallback: { authorized: true, workspaceId: "ws-cash-a" },
++      systemPrompt: "sys",
++      userPrompt: "user",
++      fetchFns,
++    });
++    assert.equal(blocked.ok, false);
++    assert.equal(openaiCalls, 0);
++    assert.equal(blocked.executedModelId, null);
++
++    const allowed = await generateStructuredJson({
++      providerPreference: "auto",
++      workspaceId: "ws-cash-a",
++      paidFallback: { authorized: true, workspaceId: "ws-cash-a" },
++      systemPrompt: "sys",
++      userPrompt: "user",
++      fetchFns,
++    });
++    assert.equal(allowed.ok, true);
++    assert.equal(allowed.providerUsed, "openai");
++    assert.equal(allowed.fallbackUsed, true);
++    assert.equal(openaiCalls, 1);
++  });
++
+   // -------------------------------------------------------------------------
+   // Validation / rejection
+   // -------------------------------------------------------------------------
+-- 
+2.43.0
+
+
+From cbc7d61473a5e77d524e2018f07cce287d4a3ec8 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 04:50:31 +0000
+Subject: [PATCH 5/5] Record the second product push refusal.
+
+The routing branch still cannot be published: GitHub denied cursor[bot] with 403 and push permission remains false.
+---
+ docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+index 7ee9a90..aaaa22d 100644
+--- a/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
++++ b/docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+@@ -107,7 +107,7 @@ Aucun appelant ne reçoit un consentement par défaut. `paidFallback` n'est envo
+ 
+ ## Limites
+ 
+-- La tentative de push précédente a reçu `403` : `Permission to mboyer1269-pixel/Oria.HQ.Michael.HQ-APP.git denied to cursor[bot]`. Une nouvelle tentative suit ce commit. S'il échoue encore, la branche reste locale et le patch `git format-patch e9ff840..HEAD` est la copie vérifiable. Action : un compte avec `contents: write` pousse `cursor/routage-couts-execution` vers `codex/hq-mission-dossier`, sans force-push, puis ouvre la PR. Aucune fusion.
++- `git push -u origin cursor/routage-couts-execution` a de nouveau répondu `403` : `Permission to mboyer1269-pixel/Oria.HQ.Michael.HQ-APP.git denied to cursor[bot]`. `permissions.push` est `false`. La PR n'a pas été ouverte. Le SHA à rejouer est le sommet de cette branche locale. Action : un compte avec `contents: write` pousse `cursor/routage-couts-execution` et ouvre une PR vers `codex/hq-mission-dossier`, sans fusion ni force-push.
+ - Pas de migration de budget. `DURABLE_BUDGET_IMPLEMENTED` reste `false`.
+ - Pas de table de prix. Un usage observé n'est pas un montant.
+ - Le journal d'estimation disparaît avec le processus.
+-- 
+2.43.0
+

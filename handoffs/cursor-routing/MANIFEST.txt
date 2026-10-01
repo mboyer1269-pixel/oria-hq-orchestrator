@@ -1,0 +1,40 @@
+Transfer artifact only. This is not a product integration into oria-hq-orchestrator.
+Do not merge these files into the orchestrator runtime. Apply the patch in a clone of the product repository.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_base_branch: codex/hq-mission-dossier
+product_base: e9ff840a38b4532b687bb29f3e2371afeeb3024e
+product_head: cbc7d61473a5e77d524e2018f07cce287d4a3ec8
+product_tree: 58d354330c3687432fbe5fb5d4a301e7246d63b6
+patch_range: e9ff840a38b4532b687bb29f3e2371afeeb3024e..cbc7d61473a5e77d524e2018f07cce287d4a3ec8
+patch_commits: 5
+patch_path: handoffs/cursor-routing/cursor-routage-couts-execution.patch
+report_path: handoffs/cursor-routing/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+sha256: bd0392246e0a572b712eb41994aa87d06f6f6d6f6bf14ba838e06f45497033c2
+size_bytes: 97023
+
+files:
+docs/CURSOR-ROUTAGE-EXECUTION-RESULTAT.md
+src/core/types.ts
+src/features/ventures/llm-cash-action-packet-generator.test.mjs
+src/server/ai/call-accounting.ts
+src/server/ai/cost-ladder.ts
+src/server/ai/execution-models.ts
+src/server/ai/llm-json-provider.test.mjs
+src/server/ai/llm-json-provider.ts
+src/server/ai/model-config.ts
+src/server/ai/model-router.test.mjs
+src/server/ai/model-router.ts
+src/server/ai/routing-execution.test.mjs
+src/server/joris/brain-cost-ladder-tagging.test.mjs
+src/server/joris/brain-llm-reply.test.mjs
+src/server/joris/brain.ts
+src/server/joris/joris-reply-generator.ts
+src/server/missions/mission-draft-control.test.mjs
+src/server/missions/mission-draft-control.ts
+
+apply:
+git checkout e9ff840a38b4532b687bb29f3e2371afeeb3024e
+git am handoffs/cursor-routing/cursor-routage-couts-execution.patch
+git rev-parse HEAD^{tree}
+expected_tree: 58d354330c3687432fbe5fb5d4a301e7246d63b6
