@@ -120,12 +120,22 @@ confinées à `src/server/ai/llm-json-provider.ts` (9),
 voir le document ApprovedServerBinding.
 
 `node --test src/server/missions/model-emission-launch-gate.test.mjs` :
-24 passés / 4 échecs. Les 4 échecs sont **préexistants**, pas écrits par ce
-lot, et échouent pour la même cause runtime que `model-emission-gate.test.mjs`
-(11/11 échecs, fichier jamais touché) — prouvé par comparaison directe.
-Tous les tests ajoutés ou modifiés par ce lot passent : alignement du
-registre (binding pur, 2 cas), sonde runner (16 cas), `approvalStillAuthorizes`
-(6 cas), non-régression du court-circuit existant (1 cas).
+**24 passés / 3 échecs**. Un quatrième test préexistant («TOCTOU: ...
+connection is re-checked ... ») attendait `connected.callCount() === 2` —
+cette hypothèse supposait un registre à UN seul fournisseur ; avec deux
+fournisseurs désormais enregistrés (§ 1), `resolveProviderConnectionDiscovery`
+sonde chacun à chaque appel, donc 2 fournisseurs × 2 appels = 4. Corrigé
+dans ce lot (assertion mise à jour `2` → `4`, commentaire ajouté) : ce n'est
+pas un bug, c'est la conséquence directe et attendue de l'alignement du
+registre demandé au point 1 du mandat. Les 3 échecs restants sont
+**préexistants**, pas écrits par ce lot, et échouent pour la même cause
+runtime que `model-emission-gate.test.mjs` (11/11 échecs, fichier jamais
+touché) — prouvé par comparaison directe (`block: "not_listed"` au lieu de
+`"not_authorized"`, signature exacte du filtrage `verifiedEntry()` sur
+`accountId` manquant). Tous les tests ajoutés ou modifiés par ce lot
+passent : alignement du registre (binding pur, 2 cas), sonde runner
+(16 cas), `approvalStillAuthorizes` (6 cas), non-régression du
+court-circuit existant (1 cas), correction TOCTOU (1 cas).
 
 `node --test src/core/openhands-launch-contract.test.mjs` : 6/6 (hérité du
 lot politique précédent, revérifié intact).
