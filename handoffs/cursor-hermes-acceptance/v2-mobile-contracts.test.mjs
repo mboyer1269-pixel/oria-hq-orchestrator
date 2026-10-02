@@ -88,8 +88,10 @@ test("local ladder spend is not a provider quota", () => {
   const unknown = decideLadder({ taskClass: "draft", baseRung: "economy", freeCatalog: [], currentSpend: 0 });
   assert.equal(Object.hasOwn(unknown, "quota"), false);
   assert.equal(unknown.estimatedCost === 0 || unknown.estimatedCost === 1 || unknown.estimatedCost === 5, true);
-  assert.equal(unknown.rung, "economy");
-  assert.match(unknown.reason, /aucun modèle free éligible/);
+  assert.equal(unknown.rung, "free");
+  assert.equal(unknown.block, "free_unavailable");
+  assert.equal(unknown.estimatedCost, 0);
+  assert.match(unknown.reason, /aucune descente payante/);
 });
 
 test("a lost create retried after reconnection keeps one mission", async () => {

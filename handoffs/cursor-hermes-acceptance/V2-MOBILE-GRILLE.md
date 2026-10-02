@@ -14,7 +14,7 @@ Ici : 6 tests, 0 échec, 625 ms, exit 0. `fetch` n'a pas été appelé.
 | Mission fermé | idem | lire le panneau | non observé | — | idem |
 | Brouillon, scroll, projet, artefact, Atelier | idem | aller-retour | non observé. Aucun champ HQ pour le scroll | — | la continuité d'id est seulement celle de la mission |
 | Demandé ≠ exécuté | message `bonjour` | `chooseModel` | `chosenModelId` `gpt-4o-mini`, `executedModelId` null, `monetaryUsd` null | test 1 | `model-router.ts` |
-| Quota inconnu | catalogue libre vide, dépense locale 0 | `decideLadder` tâche `draft` | pas de quota fournisseur. Écart bloquant : le palier devient `economy` (« aucun modèle free éligible »). Ne pas l'afficher comme quota épuisé ni comme envoi payant autorisé | test 4 | `cost-ladder.ts` |
+| Quota inconnu | catalogue libre vide, dépense locale 0 | `decideLadder` tâche `draft` | pas de quota fournisseur. Palier `free`, `free_unavailable`, poids 0, aucune descente payante. Ne pas l'afficher comme quota épuisé ni comme envoi payant | test 4 | `cost-ladder.ts` |
 | Modèle incompatible | id `openrouter/free` ou `:free` | `generateStructuredJson` | `model_unsupported`, `executedModelId` null, 0 tentative, aucun réseau | test 2 | `execution-models.ts` |
 | Pas de repli payant non autorisé | `auto`, sans accord ou avec un autre workspace | `generateStructuredJson`, clés absentes | une tentative `anthropic` seulement. Avec accord du même workspace : `anthropic` puis `openai`, toujours sans socket | test 3 | `paidFallback` dans `llm-json-provider.ts` |
 | Reconnexion, une mission | même `requestId`, écriture puis erreur | `create` puis `lookup` puis `create` | `outcome_unknown`, puis le même id, une ligne, `executionRequested` false | test 5 | `development-mission.ts` |

@@ -27,7 +27,7 @@ Chaque ligne se vérifie en appelant la fonction nommée, sans fetch. L'exemple 
 | Gratuit sans outils, mission | `executionTargetForModel` sur un id `:free` ou `openrouter/free` | `refused`, aucun fetch. Le catalogue ne connaît pas les outils | Montrer « non appelé ». Ne pas badger connecté. Le filtre outils est celui d'OpenRouter, pas de HQ |
 | Quota épuisé ou inconnu | `decideLadder` avec `currentSpend >= dailyBudget` | Peut viser `free`, puis économie si aucun gratuit. Aucun 429 observé | Afficher `inconnu` tant qu'aucune réponse fournisseur ne dit épuisé |
 | Catalogue périmé | `parseFreeModelCatalogText` du fichier du 2026-06-12 | 0 éligible | Étiquette « catalogue périmé », pas une liste live |
-| Aucun compatible | `decideLadder` si `selectFreeModel` est vide | `rung` économie, raison « repli économie » | V2 doit rester « aucun compatible » et refuser. Ne pas monter en payant |
+| Aucun compatible | `decideLadder` si `selectFreeModel` est vide | `rung` free, `block` free_unavailable, poids 0, aucune descente payante | Rester « aucun compatible ». Ne pas monter en payant |
 | Abonnement déconnecté | `accessClassForModel` | Une sous-chaîne, pas une session Codex/Hermes | Pas de badge. Claude prouve la capacité ; cet écran ne l'affirme pas |
 | API payante demandée / refus | `resolveOrder` sans `paidFallback` conforme | Un seul fournisseur, pas de second payant | L'accord est ce champ serveur. Un interrupteur d'exemple ne l'arme pas |
 | Demandé vs utilisé | `chooseModel` puis, plus tard seulement, `generateStructuredJson` | Demandé ≠ utilisé. Utilisé reste nul ici | Deux libellés. « Utilisé » vide tant que `executedModelId` est nul |
