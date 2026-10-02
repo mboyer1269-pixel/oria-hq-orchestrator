@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/local/bin/node /opt/codex-acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js "$@"

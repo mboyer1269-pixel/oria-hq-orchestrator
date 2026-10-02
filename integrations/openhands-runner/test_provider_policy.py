@@ -5,18 +5,24 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from provider_policy import (EXPECTED,FILES,authorized_profile,load_provider_policy,provider_preflight,
-                             validate_authorization,validate_manifest)
+from provider_policy import (EXPECTED,FILES,PROVIDER_POLICIES,authorized_profile,load_provider_policy,
+                             provider_preflight,validate_authorization,validate_manifest,validate_profile)
+
+
+def build_fixture(provider,image,*,profile_id):
+    template=PROVIDER_POLICIES[provider]
+    manifest={**template,'version':1,'agentNetwork':'none','runtimeImage':image,
+        'proxyImage':'sha256:'+'b'*64,'relayPort':3129,'socketPath':'/provider/provider.sock',
+        'files':{name:hashlib.sha256(b'fixture').hexdigest() for name in FILES}}
+    raw=json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()
+    profile={**template,'id':profile_id,'policySha256':hashlib.sha256(raw).hexdigest()}
+    return manifest,raw,profile
 
 
 class ProviderPolicyTests(unittest.TestCase):
     def setUp(self):
         self.image='sha256:'+'a'*64
-        self.manifest={**EXPECTED,'version':1,'agentNetwork':'none','runtimeImage':self.image,
-            'proxyImage':'sha256:'+'b'*64,'relayPort':3129,'socketPath':'/provider/provider.sock',
-            'files':{name:hashlib.sha256(b'fixture').hexdigest() for name in FILES}}
-        self.raw=json.dumps(self.manifest,sort_keys=True,separators=(',',':')).encode()
-        self.profile={**EXPECTED,'id':'test-policy','policySha256':hashlib.sha256(self.raw).hexdigest()}
+        self.manifest,self.raw,self.profile=build_fixture('claude',self.image,profile_id='test-policy')
         self.config={'providerProfile':self.profile,'imageDigest':self.image}
 
     def test_exact_policy_and_runtime_match(self):
@@ -31,6 +37,43 @@ class ProviderPolicyTests(unittest.TestCase):
             raw=json.dumps({**self.manifest,**change},sort_keys=True,separators=(',',':')).encode()
             profile={**self.profile,'policySha256':hashlib.sha256(raw).hexdigest()}
             with self.assertRaises(ValueError):validate_manifest(raw,profile,self.image)
+
+    def test_codex_profile_is_explicit_and_matches_only_its_own_template(self):
+        codex_image='sha256:'+'d'*64
+        codex_manifest,codex_raw,codex_profile=build_fixture('codex',codex_image,profile_id='codex-test-policy')
+        self.assertEqual(validate_manifest(codex_raw,codex_profile,codex_image),codex_manifest)
+        self.assertEqual(codex_profile['provider'],'codex')
+        self.assertNotEqual(codex_profile,self.profile)
+        # Weakening the Codex template the same way the Claude template is
+        # weakened elsewhere must be refused too - the second entry is its own
+        # fully-checked policy, not a copy that happens to validate by accident.
+        for change in ({'authentication':'api-key'},{'network':'open'},{'accountConnectors':'enabled'}):
+            raw=json.dumps({**codex_manifest,**change},sort_keys=True,separators=(',',':')).encode()
+            profile={**codex_profile,'policySha256':hashlib.sha256(raw).hexdigest()}
+            with self.assertRaises(ValueError):validate_manifest(raw,profile,codex_image)
+
+    def test_unknown_provider_is_refused_not_silently_widened(self):
+        unknown_profile={**self.profile,'provider':'gemini'}
+        with self.assertRaises(ValueError):validate_profile(unknown_profile)
+        with self.assertRaises(ValueError):validate_manifest(self.raw,unknown_profile,self.image)
+
+    def test_claude_policy_or_relay_can_never_be_presented_as_codex(self):
+        codex_image='sha256:'+'d'*64
+        codex_manifest,codex_raw,codex_profile=build_fixture('codex',codex_image,profile_id='codex-test-policy')
+        # A profile that declares provider "codex" but whose approved digest
+        # actually names a Claude-shaped manifest (every other field Claude's,
+        # including the manifest's own internal provider field) must never
+        # validate: no Claude relay/proxy artifact, however exactly it was
+        # qualified, can stand in for Codex just because the surrounding
+        # profile fields happen to be identical across both templates.
+        raw=json.dumps(self.manifest,sort_keys=True,separators=(',',':')).encode()
+        mislabeled_profile={**codex_profile,'policySha256':hashlib.sha256(raw).hexdigest()}
+        self.assertIsNone(validate_profile(mislabeled_profile))
+        with self.assertRaises(ValueError):validate_manifest(raw,mislabeled_profile,self.image)
+        # And the reverse: a Codex-shaped manifest can never satisfy a profile
+        # that declares provider "claude", even with a matching digest.
+        reversed_profile={**self.profile,'policySha256':codex_profile['policySha256']}
+        with self.assertRaises(ValueError):validate_manifest(codex_raw,reversed_profile,codex_image)
 
     def test_duplicate_keys_noncanonical_json_and_profile_traversal_rejected(self):
         for raw in (self.raw.replace(b'{',b'{"version":1,',1),self.raw+b'\n'):

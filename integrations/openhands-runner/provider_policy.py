@@ -8,7 +8,21 @@ import stat
 
 ROOT=Path('/etc/oria-hq/provider-policies')
 PROFILE_FIELDS={'id','policySha256','provider','authentication','network','accountConnectors'}
-EXPECTED={'provider':'claude','authentication':'subscription','network':'restricted-proxy','accountConnectors':'disabled'}
+# Each supported provider has its own explicit, fully-spelled policy template.
+# Supporting a new provider means adding a new entry here, never widening a
+# shared field's type (e.g. provider from a literal to an open string). A
+# profile is checked only against the single template named by its own
+# declared `provider`, so a Codex profile can never be satisfied by Claude's
+# template (or vice versa): no policy, relay or proxy qualified for one
+# provider can be presented as another's.
+PROVIDER_POLICIES={
+    'claude':{'provider':'claude','authentication':'subscription','network':'restricted-proxy','accountConnectors':'disabled'},
+    'codex':{'provider':'codex','authentication':'subscription','network':'restricted-proxy','accountConnectors':'disabled'},
+}
+# Backward-compatible alias to the Claude template: kept so the already
+# qualified Claude profile/digest and existing callers (qualify_hq_postgrest.py)
+# are unaffected. Never read as "the" expected policy for any other provider.
+EXPECTED=PROVIDER_POLICIES['claude']
 FILES={'squid.conf','entrypoint.sh','relay.mjs'}
 AUTHORIZATION={'profileId','policySha256','policyRoot','gatewayRoot'}
 
@@ -21,6 +35,15 @@ def unique(pairs):
     return value
 
 
+def provider_policy_template(provider):
+    """The one policy a profile for this provider must match exactly. Raises for
+    any provider not explicitly enumerated in PROVIDER_POLICIES - never falls
+    back to a default template or to another provider's template."""
+    template=PROVIDER_POLICIES.get(provider)
+    if template is None:raise ValueError('Unsupported provider')
+    return template
+
+
 def validate_profile(profile):
     if not isinstance(profile,dict) or set(profile)!=PROFILE_FIELDS:
         raise ValueError('Invalid provider profile')
@@ -28,7 +51,8 @@ def validate_profile(profile):
         raise ValueError('Invalid profile identity')
     if not isinstance(profile['policySha256'],str) or not re.fullmatch(r'[a-f0-9]{64}',profile['policySha256']):
         raise ValueError('Invalid policy digest')
-    if any(profile[key]!=value for key,value in EXPECTED.items()):raise ValueError('Unsupported policy')
+    template=provider_policy_template(profile.get('provider'))
+    if any(profile[key]!=value for key,value in template.items()):raise ValueError('Unsupported policy')
 
 
 def validate_manifest(raw,profile,runtime_image):
@@ -37,10 +61,15 @@ def validate_manifest(raw,profile,runtime_image):
         raise ValueError('Policy digest mismatch')
     manifest=json.loads(raw,object_pairs_hook=unique,
                         parse_constant=lambda _:(_ for _ in ()).throw(ValueError('Nonfinite policy')))
-    keys=set(EXPECTED)|{'version','agentNetwork','runtimeImage','proxyImage','relayPort','socketPath','files'}
+    # The profile already proved its own provider matches one explicit
+    # template; the manifest must match that same template exactly, so a
+    # manifest that declares (or silently defaults to) a different provider
+    # than the profile can never pass - no cross-provider reuse by digest.
+    template=provider_policy_template(profile['provider'])
+    keys=set(template)|{'version','agentNetwork','runtimeImage','proxyImage','relayPort','socketPath','files'}
     if not isinstance(manifest,dict) or set(manifest)!=keys:raise ValueError('Unexpected policy fields')
     if type(manifest['version']) is not int or manifest['version']!=1:raise ValueError('Unsupported policy version')
-    if any(manifest[key]!=value for key,value in EXPECTED.items()):raise ValueError('Profile policy mismatch')
+    if any(manifest[key]!=value for key,value in template.items()):raise ValueError('Profile policy mismatch')
     if manifest['agentNetwork']!='none' or manifest['socketPath']!='/provider/provider.sock':raise ValueError('Unsupported transport')
     if type(manifest['relayPort']) is not int or manifest['relayPort']!=3129:raise ValueError('Unsupported relay port')
     for name in ('runtimeImage','proxyImage'):
