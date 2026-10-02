@@ -1,3 +1,13 @@
+> **Mise à jour, même jour (voir `docs/CLAUDE-COMPLEMENT-DIRECTION-ACP.md`) :**
+> le patch Cursor ci-dessous est maintenant appliqué et stable (106/106
+> tests, zéro skip), et le raccordement décrit en § "Raccordement que
+> `evaluateModelEmissionGate` devrait faire" a été effectivement implémenté
+> dans `docs/CLAUDE-REPRISE-BACKEND-RESULTAT-2026-10-02.md` § 4bis
+> (`accountId`/`catalogRevision` réels, disposition `non_api` traitée comme
+> condition de succès pour un lancement par abonnement). Ce document reste
+> comme trace de l'état observé au moment du blocage ; il n'est plus l'état
+> courant.
+
 # ApprovedServerBinding — raccordement requis, non implémenté (par périmètre)
 
 2 octobre 2026. Mandat : `docs/CLAUDE-REPRISE-BACKEND-2026-10-02.md`, point 4
