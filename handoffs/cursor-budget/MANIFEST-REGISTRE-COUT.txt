@@ -1,0 +1,33 @@
+Same registry fix, next commit. Do not replace the registre patch.
+registre patch sha256: 15fef1f9af9964fbad1552e240f713b162d4860af48d8284e81a0eaec6a2875c
+Apply this patch after that one, in a clone of the product repository.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_base: 2694df17036b92948184fb2ada2de6d655092826
+product_base_tree: 92f008f296eb2a1ef834eb8214faee9ffe5569c5
+product_head: 0eba51d49dab07d6d1110ad88330e6a3a9cfee9d
+product_tree: f7151f6ccb27e4a5bb461663cb1f1e911efcf8d9
+patch_range: 2694df17036b92948184fb2ada2de6d655092826..0eba51d49dab07d6d1110ad88330e6a3a9cfee9d
+patch_commits: 1
+patch_path: handoffs/cursor-budget/cursor-budget-registre-cout.patch
+report_path: handoffs/cursor-budget/CURSOR-BUDGET-REGISTRE-COUT-RESULTAT.md
+sha256: 32a6a3930e158f763a58045e7c9fd8adaf38a113f1a1f4f50981d989af63aeba
+size_bytes: 5603
+
+apply:
+git checkout 2694df17036b92948184fb2ada2de6d655092826
+git am handoffs/cursor-budget/cursor-budget-registre-cout.patch
+git rev-parse HEAD^{tree}
+expected_tree: f7151f6ccb27e4a5bb461663cb1f1e911efcf8d9
+
+verified:
+git am on a detached worktree at 2694df1 produced commit 0eba51d49dab07d6d1110ad88330e6a3a9cfee9d
+and tree f7151f6ccb27e4a5bb461663cb1f1e911efcf8d9, equal to product HEAD^{tree}.
+Product push was not retried.
+
+commands:
+node --test --test-concurrency=1 src/server/ai/call-reservation.test.mjs src/server/ai/llm-json-provider.test.mjs
+exit 0, 22 tests, 0 fail
+npx eslint on llm-json-provider.ts and call-reservation.test.mjs exit 0
+npx tsc --noEmit exit 0
+PostgreSQL was not replayed. Build, smoke, and the four global gates were not run.

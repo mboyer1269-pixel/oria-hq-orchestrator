@@ -1,0 +1,39 @@
+Supplementary transfer. Do not replace the budget, deadline, or ecarts patches.
+budget patch sha256: 5105873bc9d143c7a4ada14468cc29e09391b71e791e64fe89b02a3fec46ee92
+deadline patch sha256: bea0c3093e250bbdc27b933f8f4ef5953eef8d8084b4b883be5889dd8356cb7a
+ecarts patch sha256: 4a3920e36783a44a51d8033a37deb6f8ca32fd8d1537dc9e5e4d8ab96c8eaca2
+Apply this patch after those three, in a clone of the product repository.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_base: 8ec216414359f7b2484b05c62bf18281fcf8fb8a
+product_base_tree: 087a126fa1d063b4a29aa7dbb0cd272b281b93b2
+product_head: 2694df17036b92948184fb2ada2de6d655092826
+product_tree: 92f008f296eb2a1ef834eb8214faee9ffe5569c5
+patch_range: 8ec216414359f7b2484b05c62bf18281fcf8fb8a..2694df17036b92948184fb2ada2de6d655092826
+patch_commits: 1
+patch_path: handoffs/cursor-budget/cursor-budget-registre.patch
+report_path: handoffs/cursor-budget/CURSOR-BUDGET-REGISTRE-RESULTAT.md
+sha256: 15fef1f9af9964fbad1552e240f713b162d4860af48d8284e81a0eaec6a2875c
+size_bytes: 16979
+
+apply:
+git checkout 8ec216414359f7b2484b05c62bf18281fcf8fb8a
+git am handoffs/cursor-budget/cursor-budget-registre.patch
+git rev-parse HEAD^{tree}
+expected_tree: 92f008f296eb2a1ef834eb8214faee9ffe5569c5
+
+verified:
+git am on a detached worktree at 8ec2164 produced commit 321b9c7db540385314a1764f9036a7c4e010fcfa
+and tree 92f008f296eb2a1ef834eb8214faee9ffe5569c5, equal to product HEAD^{tree}.
+The applied commit hash differs. The tree does not.
+Product push was not retried.
+
+commands:
+node --test --test-concurrency=1 src/server/ai/call-reservation.test.mjs src/server/ai/llm-json-provider.test.mjs
+exit 0, 21 tests, 0 fail
+node --test --test-concurrency=1 on the JSON clients, router, cost ladder, and routing-execution
+exit 0, 63 tests, 0 fail
+npx tsc --noEmit exit 0
+npx eslint on call-reservation.ts, llm-json-provider.ts, call-reservation.test.mjs exit 0
+PostgreSQL was not replayed. This commit does not change SQL.
+Build, smoke, and the four global gates were not run.
