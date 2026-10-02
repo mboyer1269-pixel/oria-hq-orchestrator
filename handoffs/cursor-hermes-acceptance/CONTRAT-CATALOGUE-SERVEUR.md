@@ -3,54 +3,45 @@
 Module produit : `src/server/ai/server-capability-catalog.ts`.
 Claude l'importe. Il ne modifie pas `src/server/ai/`.
 
+Entrée HQ obligatoire : `generateHqStructuredJson` dans `src/server/ai/llm-json-provider.ts`.
+Sans `serverCatalog`, `workspaceId` et `modelId`, le résultat est `catalog_required`, zéro fetch.
+`generateStructuredJson` sans catalogue reste le chemin des appelants déjà livrés. Ce n'est pas une preuve de sécurité.
+
 ## Objet
 
-`ServerCapabilityCatalog` : `{ source, observedAt, entries }`.
+`ServerCapability` : `modelId`, `provider`, `state` (`listed` | `connected` | `authorized`), `source`, `observedAt`, `tools`, `billingKind`, `tariff`, `workspaceId`.
 
-Chaque entrée : `modelId`, `provider`, `state` (`listed` | `connected` | `authorized`), `source`, `observedAt`, `tools`, `tariff`, `workspaceId`.
+`billingKind` :
 
-`tariff` : `{ currency: "USD", notToExceedCents, source, observedAt }` ou `null`.
-Âge maximal : `TARIFF_MAX_AGE_MS` (24 h), constante serveur.
+- `api` : `tariff` USD, `notToExceedCents` entier strictement positif. Ce plafond est passé à `authorizeCallAttempt`. Une retenue serveur plus haute est libérée avant `mark`, sans socket.
+- `verified_free` : `tariff` null. Pas un coût observé de 0.
+- `subscription` : `tariff` null. Pas un coût observé de 0.
+
+`notToExceedCents` 0, ou un tarif posé sur le gratuit ou l'abonnement, donne `tariff_unknown`.
+`observedAt` de l'entrée et du tarif : âge maximal `TARIFF_MAX_AGE_MS` (24 h). Futur ou périmé : `capability_stale` ou `tariff_stale`.
+`provider` doit être celui de l'adaptateur réellement invoqué. Sinon `provider_mismatch`. Une autorisation OpenAI ne couvre pas un appel Anthropic du même `modelId`.
 
 ## Décision
 
-`assessServerEmission({ catalog, modelId, workspaceId, requiresTools, nowMs })`.
+`assessServerEmission({ catalog, modelId, workspaceId, requiresTools, nowMs, invokedProvider })`.
 
-Blocages : `not_listed`, `public_catalog_only`, `not_authorized`, `workspace_mismatch`, `tools_unavailable`, `tariff_unknown`, `tariff_stale`.
+Blocages : `not_listed`, `public_catalog_only`, `not_authorized`, `workspace_mismatch`, `provider_mismatch`, `capability_stale`, `tools_unavailable`, `tariff_unknown`, `tariff_stale`, `catalog_required`.
 
-Seul `authorized`, même workspace, outils si `requiresTools`, tarif USD entier frais, autorise. Le catalogue public, passé en `listed`, ne donne aucun droit. Aucun prix ni accord ne vient du navigateur.
-
-## Branchements
-
-`chooseModel` et `generateStructuredJson` acceptent `serverCatalog`, `requiresTools`, `nowMs` en option.
-Catalogue absent : les quatre ids API statiques restent sur le chemin déjà qualifié.
-Catalogue présent : même un id statique doit passer `assessServerEmission` avant fetch et avant réservation.
-Un id autorisé sans client JSON reste `model_unsupported`, zéro fetch, sans repli payant.
-Étage gratuit sans modèle éligible : `block` `free_unavailable`, poids 0, exécution refusée.
-
-## Retour d'émission
-
-`requestedModelId` : l'id demandé, sinon `null`.
-`executedModelId` : champ `model` du corps fournisseur, sinon `null`. Jamais recopié depuis le choix.
-`provider`, `usage` : `null` si absents.
-`costSource` : `provider_usage`, `refused`, `unknown` ou `estimation`.
-`chooseModel` reste une estimation (`executedModelId` null). La consommation est seulement `generateStructuredJson`.
+`listed` et `connected` ne donnent aucun droit. Le catalogue public ne suffit pas.
+Gratuit ou abonnement autorisé : `non_api_authorized`, `monetaryUsd` null, zéro fetch. Pas de descente vers l'API payante.
 
 ## Commande
 
 ```
 node --test --test-concurrency=1 \
   src/server/ai/server-capability-catalog.test.mjs \
-  src/server/ai/cost-ladder.test.mjs \
-  src/server/ai/model-router.test.mjs \
-  src/server/ai/llm-json-provider.test.mjs \
-  src/server/ai/routing-execution.test.mjs
+  src/server/ai/call-reservation.test.mjs
 ```
 
 ## Limites
 
-Pas de facture, pas d'appel fournisseur réel, pas de découverte de compte dans ce dossier.
-Le délai de corps reste dans les handlers HTTP, non modifiés.
-`emitted_unknown` n'est pas libéré. `HQ_CALL_RESERVATION` et la facturation sont inchangés.
-Aucun client JSON pour `openrouter/free`, même si un catalogue futur l'autorise.
+Pas de facture, pas d'appel fournisseur réel, pas de découverte dans ce dossier.
+Le délai de corps et `emitted_unknown` sont inchangés. La facturation n'est pas réécrite.
+Sans `HQ_CALL_RESERVATION=1`, une entrée `api` du chemin strict ne part pas : le plafond ne peut pas être appliqué.
+Aucun client JSON pour `openrouter/free`.
 Ce cloud n'a pas vu le localhost Windows.
