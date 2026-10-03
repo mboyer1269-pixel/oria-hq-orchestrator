@@ -2,7 +2,7 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path,PurePosixPath
 import re
 import stat
 
@@ -10,6 +10,73 @@ ROOT=Path('/etc/oria-hq/provider-policies')
 PROFILE_FIELDS={'id','policySha256','provider','authentication','network','accountConnectors'}
 EXPECTED={'provider':'claude','authentication':'subscription','network':'restricted-proxy','accountConnectors':'disabled'}
 FILES={'squid.conf','entrypoint.sh','relay.mjs'}
+AUTHORIZATION={'profileId','policySha256','policyRoot','gatewayRoot'}
+AUTH_CONTEXT={'reference','provider','workspaceId','profileId','policySha256','directory'}
+
+
+def validate_auth_context(context):
+    """Host-only reference to an existing Claude directory; never credential values."""
+    if not isinstance(context,dict) or set(context)!=AUTH_CONTEXT:
+        raise ValueError('Invalid authentication context')
+    if context['provider']!='claude':raise ValueError('Unsupported authentication provider')
+    for field in ('reference','profileId'):
+        if not isinstance(context[field],str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,79}',context[field]):
+            raise ValueError('Invalid authentication reference')
+    if not isinstance(context['policySha256'],str) or not re.fullmatch(r'[a-f0-9]{64}',context['policySha256']):
+        raise ValueError('Invalid authentication policy binding')
+    workspace=context['workspaceId']
+    if not isinstance(workspace,str) or not 1<=len(workspace)<=160 or workspace!=workspace.strip() or any(ord(c)<32 for c in workspace):
+        raise ValueError('Invalid authentication workspace')
+    directory=context['directory']
+    if (not isinstance(directory,str) or not 1<len(directory)<=4096 or not directory.startswith('/')
+            or str(PurePosixPath(directory))!=directory or '..' in PurePosixPath(directory).parts
+            or any(c in directory for c in ('\0','\n','\r',','))):
+        raise ValueError('Invalid authentication directory')
+    return context
+
+
+def inspect_auth_directory(context):
+    """Only directory metadata is inspected. No credential file is opened or listed."""
+    validate_auth_context(context)
+    if os.name!='posix' or os.geteuid()!=0:raise ValueError('Linux root operator required')
+    directory=Path(context['directory'])
+    if directory.resolve(strict=True)!=directory:raise ValueError('Real authentication directory required')
+    info=directory.stat()
+    mode=stat.S_IMODE(info.st_mode)
+    # Existing dedicated account storage only. The CLI reads as UID/GID10001.
+    readable=(info.st_uid==10001 and mode==0o700) or (info.st_uid==0 and info.st_gid==10001 and mode==0o750)
+    if not stat.S_ISDIR(info.st_mode) or not readable:raise ValueError('Private authentication directory required')
+    for parent in directory.parents:
+        pinfo=parent.stat()
+        # A parent may be root, OR this exact leaf's own owner with no
+        # group/other write bit -- never any third uid. The dedicated
+        # account's real HOME (the leaf's own parent in every deployment
+        # observed so far) legitimately needs top-level write access for
+        # the official CLI's own config/lock files (confirmed empirically
+        # against the real candidate image: `claude-agent-acp --cli
+        # --version` and `auth status --json` alone create ~/.claude.json
+        # and ~/.claude.json.lock, siblings of the credential leaf, never
+        # inside it) -- demanding every ancestor be root-owned would make
+        # this contract incompatible with every real deployment of this
+        # CLI, not just overly cautious. This does not weaken the TOCTOU
+        # protection the parent chain exists for: a THIRD-PARTY uid is
+        # still refused outright, and every caller rereads this exact
+        # (dev, inode) pair immediately before mount (container_job's
+        # create_job, permission_worker's re-checks), so a parent-mediated
+        # substitution of the leaf is still caught there.
+        if pinfo.st_uid not in (0,info.st_uid) or pinfo.st_mode & 0o022:
+            raise ValueError('Protected authentication parents required')
+    return (info.st_dev,info.st_ino)
+
+
+def bound_auth_context(config,authorization,workspace_id):
+    """A directory reference is not account attestation or provider authorization."""
+    authorized_profile(config,authorization)
+    context=authorization.get('authContext')
+    if context is None:return None
+    if context['workspaceId']!=workspace_id or config.get('permissionPolicy')!='deny':
+        raise ValueError('Authentication scope or permission policy mismatch')
+    return context
 
 
 def unique(pairs):
@@ -80,10 +147,59 @@ def load_provider_policy(config,root=ROOT):
     return manifest
 
 
-def provider_preflight(config):
+def validate_authorization(authorization):
+    """Operator-declared approval of one profile. Never read from HQ or a dossier."""
+    if not isinstance(authorization,dict) or set(authorization) not in (AUTHORIZATION,AUTHORIZATION|{'authContext'}):
+        raise ValueError('Invalid provider authorization')
+    if not isinstance(authorization['profileId'],str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,79}',authorization['profileId']):
+        raise ValueError('Invalid authorized profile identity')
+    if not isinstance(authorization['policySha256'],str) or not re.fullmatch(r'[a-f0-9]{64}',authorization['policySha256']):
+        raise ValueError('Invalid authorized policy digest')
+    for field in ('policyRoot','gatewayRoot'):
+        root=authorization[field]
+        if (not isinstance(root,str) or not 1<len(root)<=4096 or chr(0) in root or not root.startswith('/')
+                or str(PurePosixPath(root))!=root or '..' in PurePosixPath(root).parts):
+            raise ValueError('Absolute host path required for '+field)
+    if authorization['policyRoot']==authorization['gatewayRoot']:
+        raise ValueError('Separate policy registry and gateway roots required')
+    if 'authContext' in authorization:
+        context=validate_auth_context(authorization['authContext'])
+        if (context['profileId'],context['policySha256'])!=(authorization['profileId'],authorization['policySha256']):
+            raise ValueError('Authentication profile binding mismatch')
+        separate_gateway_root(Path(context['directory']),(Path(authorization['policyRoot']),Path(authorization['gatewayRoot'])))
+    return authorization
+
+
+def separate_gateway_root(gateway,others):
+    """One rule for every caller: the gateway shares no subtree with these paths."""
+    for other in others:
+        if gateway==other or gateway in other.parents or other in gateway.parents:
+            raise ValueError('Separate protected gateway root required')
+    return gateway
+
+
+def authorized_profile(config,authorization):
+    """Refuse any canonical profile the operator did not approve by identity and digest."""
+    validate_authorization(authorization)
+    profile=config.get('providerProfile')
+    validate_profile(profile)
+    if (profile['id'],profile['policySha256'])!=(authorization['profileId'],authorization['policySha256']):
+        raise ValueError('Canonical profile is not the authorized profile')
+    return profile
+
+
+def provider_preflight(config,authorization=None):
     if 'providerProfile' not in config:return None
-    try:load_provider_policy(config)
+    try:
+        if authorization is None:load_provider_policy(config)
+        else:
+            authorized_profile(config,authorization)
+            # The approved registry is named by the authorization, never guessed.
+            load_provider_policy(config,authorization['policyRoot'])
     except (ValueError,TypeError,KeyError,OSError):
         return {'state':'invalid_provider_policy','started':False}
     # Policy integrity does not prove credentials, relay lifecycle or tool review.
-    return {'state':'unsupported_provider_profile','started':False}
+    if authorization is None:return {'state':'unsupported_provider_profile','started':False}
+    # The operator approved this exact policy here. Nothing is started yet: the
+    # worker repeats both checks against the canonical reread before any effect.
+    return None
