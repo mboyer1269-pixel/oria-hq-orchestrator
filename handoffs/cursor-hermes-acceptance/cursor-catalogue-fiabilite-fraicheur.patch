@@ -1,0 +1,299 @@
+From 0b5269ce22091cb2ea8f7ef10864720500dc569c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 3 Oct 2026 18:28:50 +0000
+Subject: [PATCH] Fix free-model catalog freshness after on-disk rewrites
+
+Invalidate the module cache when config/openrouter.free-models.json mtime
+changes, and drop held OpenRouter consultations when that file is rewritten
+so a stale snapshot can refresh without waiting for the 24h hold.
+---
+ src/server/ai/free-model-catalog.test.mjs | 59 ++++++++++++++++++++
+ src/server/ai/free-model-catalog.ts       | 25 +++++++--
+ src/server/ai/hq-model-catalog.test.mjs   | 65 ++++++++++++++++++++++-
+ src/server/ai/hq-model-catalog.ts         | 24 ++++++++-
+ 4 files changed, 166 insertions(+), 7 deletions(-)
+ create mode 100644 src/server/ai/free-model-catalog.test.mjs
+
+diff --git a/src/server/ai/free-model-catalog.test.mjs b/src/server/ai/free-model-catalog.test.mjs
+new file mode 100644
+index 0000000..094eef8
+--- /dev/null
++++ b/src/server/ai/free-model-catalog.test.mjs
+@@ -0,0 +1,59 @@
++#!/usr/bin/env node
++
++import assert from "node:assert/strict";
++import { readFileSync, writeFileSync } from "node:fs";
++import path from "node:path";
++import test, { after } from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..");
++const configPath = path.join(projectRoot, "config/openrouter.free-models.json");
++
++process.env.NODE_ENV = "test";
++
++const { createJiti } = await import("jiti");
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(projectRoot, "src"),
++    "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++  },
++});
++
++const catalogPath = path.join(projectRoot, "src/server/ai/free-model-catalog.ts");
++const {
++  loadFreeModelCatalogSnapshot,
++  resetFreeModelCatalogCache,
++  freeModelCatalogSourceMtimeMs,
++} = await jiti.import(catalogPath);
++
++const originalBytes = readFileSync(configPath);
++
++after(() => {
++  writeFileSync(configPath, originalBytes);
++  resetFreeModelCatalogCache();
++});
++
++test("loadFreeModelCatalogSnapshot picks up a rewritten free-model file without resetFreeModelCatalogCache", () => {
++  resetFreeModelCatalogCache();
++  const first = loadFreeModelCatalogSnapshot();
++  assert.ok(first.entries.length > 0);
++
++  writeFileSync(
++    configPath,
++    JSON.stringify(
++      {
++        generated_at: "2026-10-02T00:00:00.000Z",
++        provider: "openrouter",
++        models: [{ id: "test/disk-only", name: "Disk only", enabled: true, recommended: true }],
++      },
++      null,
++      2,
++    ),
++  );
++
++  const second = loadFreeModelCatalogSnapshot();
++  assert.equal(second.entries.some((entry) => entry.id === "test/disk-only"), true);
++  assert.equal(second.generatedAt, "2026-10-02T00:00:00.000Z");
++  assert.notEqual(freeModelCatalogSourceMtimeMs(), null);
++});
+diff --git a/src/server/ai/free-model-catalog.ts b/src/server/ai/free-model-catalog.ts
+index cdf7e50..5f368a2 100644
+--- a/src/server/ai/free-model-catalog.ts
++++ b/src/server/ai/free-model-catalog.ts
+@@ -1,5 +1,5 @@
+ import "server-only";
+-import { readFileSync } from "node:fs";
++import { readFileSync, statSync } from "node:fs";
+ import { join } from "node:path";
+ import {
+   parseFreeModelCatalog,
+@@ -25,10 +25,24 @@ export type FreeModelCatalogSnapshot = {
+ };
+ 
+ let cachedSnapshot: FreeModelCatalogSnapshot | null = null;
++let cachedConfigMtimeMs: number | null | undefined;
++
++function configAbsolutePath(): string {
++  return join(process.cwd(), CONFIG_RELATIVE_PATH);
++}
++
++/** Config file mtime for cache invalidation (Market Watch rewrites without clearing module state). */
++export function freeModelCatalogSourceMtimeMs(): number | null {
++  try {
++    return statSync(configAbsolutePath()).mtimeMs;
++  } catch {
++    return null;
++  }
++}
+ 
+ function readSnapshotFromDisk(): FreeModelCatalogSnapshot {
+   try {
+-    const raw = readFileSync(join(process.cwd(), CONFIG_RELATIVE_PATH), "utf-8");
++    const raw = readFileSync(configAbsolutePath(), "utf-8");
+     const withoutBom = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+     const json = JSON.parse(withoutBom) as { generated_at?: unknown; provider?: unknown };
+     const generatedAt = typeof json.generated_at === "string" ? json.generated_at : null;
+@@ -41,8 +55,12 @@ function readSnapshotFromDisk(): FreeModelCatalogSnapshot {
+ 
+ /** Cached snapshot, including the original generated_at. A later read does not refresh that date. */
+ export function loadFreeModelCatalogSnapshot(): FreeModelCatalogSnapshot {
+-  if (cachedSnapshot) return cachedSnapshot;
++  const mtimeMs = freeModelCatalogSourceMtimeMs();
++  if (cachedSnapshot !== null && cachedConfigMtimeMs === mtimeMs) {
++    return cachedSnapshot;
++  }
+   cachedSnapshot = readSnapshotFromDisk();
++  cachedConfigMtimeMs = mtimeMs;
+   return cachedSnapshot;
+ }
+ 
+@@ -59,4 +77,5 @@ export function readFreeModelCatalog(): FreeModelEntry[] {
+ /** Clears the cache (tests / after a Market Watch refresh). */
+ export function resetFreeModelCatalogCache(): void {
+   cachedSnapshot = null;
++  cachedConfigMtimeMs = undefined;
+ }
+diff --git a/src/server/ai/hq-model-catalog.test.mjs b/src/server/ai/hq-model-catalog.test.mjs
+index 64936de..11640f9 100644
+--- a/src/server/ai/hq-model-catalog.test.mjs
++++ b/src/server/ai/hq-model-catalog.test.mjs
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env node
+ 
+ import assert from "node:assert/strict";
+-import { readFileSync } from "node:fs";
++import { readFileSync, writeFileSync } from "node:fs";
+ import path from "node:path";
+ import test, { after } from "node:test";
+ import { fileURLToPath } from "node:url";
+@@ -26,7 +26,12 @@ const jiti = createJiti(import.meta.url, {
+ 
+ const surfacePath = path.join(projectRoot, "src/server/ai/hq-model-catalog.ts");
+ const pagePath = path.join(projectRoot, "src/app/hq/runtime/page.tsx");
+-const { loadHqModelCatalog } = await jiti.import(surfacePath);
++const { loadHqModelCatalog, resetHqModelCatalogHold } = await jiti.import(surfacePath);
++const { resetFreeModelCatalogCache } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/free-model-catalog.ts"),
++);
++const freeConfigPath = path.join(projectRoot, "config/openrouter.free-models.json");
++const freeConfigOriginal = readFileSync(freeConfigPath);
+ const { chooseModel } = await jiti.import(path.join(projectRoot, "src/server/ai/model-router.ts"));
+ const { resolveModelProfile } = await jiti.import(path.join(projectRoot, "src/server/ai/model-config.ts"));
+ const { getCostLadderSnapshot, getLadderCostLog } = await jiti.import(
+@@ -54,6 +59,9 @@ globalThis.fetch = async () => {
+ after(() => {
+   globalThis.fetch = realFetch;
+   delete globalThis.__ownerApiSessionTestResult;
++  writeFileSync(freeConfigPath, freeConfigOriginal);
++  resetFreeModelCatalogCache();
++  resetHqModelCatalogHold();
+ });
+ 
+ function paidModel(id = "openai/live") {
+@@ -458,7 +466,60 @@ test("loading the catalog does not change the approved model choice or the budge
+   assert.equal(afterProfile.label, beforeProfile.label);
+ });
+ 
++test("rewriting the OpenRouter free-model file bypasses a held consultation", async () => {
++  writeFileSync(freeConfigPath, freeConfigOriginal);
++  resetHqModelCatalogHold();
++  resetFreeModelCatalogCache();
++  let openRouterCalls = 0;
++  const authorize = async () => null;
++  globalThis.fetch = async (url, init) => {
++    if (String(url) === OPENROUTER_PUBLIC_MODELS_URL) {
++      openRouterCalls += 1;
++      return new Response(
++        JSON.stringify({ data: [paidModel(`openai/held-${openRouterCalls}`)] }),
++        { status: 200 },
++      );
++    }
++    if (String(url) === NARA_PUBLIC_PLANS_URL) {
++      return new Response(JSON.stringify(naraPlans().body), { status: 200 });
++    }
++    return new Response("no", { status: 404 });
++  };
++  try {
++    const first = await loadHqModelCatalog({ nowMs: NOW, authorize });
++    assert.equal(first.ok, true);
++    assert.equal(openRouterCalls, 1);
++    assert.equal(first.lines.some((line) => line.modelId === "openai/held-1"), true);
++
++    writeFileSync(
++      freeConfigPath,
++      JSON.stringify(
++        {
++          generated_at: FILE_DATE,
++          provider: "openrouter",
++          models: [{ id: "openrouter/file-touch", name: "Touch", enabled: true, recommended: true }],
++        },
++        null,
++        2,
++      ),
++    );
++    resetFreeModelCatalogCache();
++
++    const second = await loadHqModelCatalog({ nowMs: NOW + 1000, authorize });
++    assert.equal(second.ok, true);
++    assert.equal(openRouterCalls, 2);
++    assert.equal(second.lines.some((line) => line.modelId === "openai/held-2"), true);
++  } finally {
++    globalThis.fetch = async () => {
++      throw new Error("global fetch must not run");
++    };
++  }
++});
++
+ test("a stale server snapshot refreshes on open and a fresh one does not call again", async () => {
++  writeFileSync(freeConfigPath, freeConfigOriginal);
++  resetHqModelCatalogHold();
++  resetFreeModelCatalogCache();
+   const calls = [];
+   globalThis.fetch = async (url, init) => {
+     calls.push({ url: String(url), method: init.method, redirect: init.redirect });
+diff --git a/src/server/ai/hq-model-catalog.ts b/src/server/ai/hq-model-catalog.ts
+index 429ca2f..79c3388 100644
+--- a/src/server/ai/hq-model-catalog.ts
++++ b/src/server/ai/hq-model-catalog.ts
+@@ -21,6 +21,7 @@ import {
+   type CatalogTransport,
+ } from "@/server/ai/model-catalog-consultation";
+ import { readRouterModelCatalog } from "@/server/ai/model-router";
++import { freeModelCatalogSourceMtimeMs } from "@/server/ai/free-model-catalog";
+ import { TARIFF_MAX_AGE_MS } from "@/server/ai/server-capability-catalog";
+ 
+ const PROVIDERS = ["openrouter", "nara"] as const;
+@@ -96,6 +97,8 @@ export type HqModelCatalogLoad = {
+ 
+ type HeldGateway = {
+   observedAtMs: number;
++  /** OpenRouter free-model file mtime when the hold was taken; null when absent. */
++  freeCatalogMtimeMs: number | null;
+   consultation: Extract<CatalogConsultation, { ok: true }>;
+ };
+ 
+@@ -285,7 +288,14 @@ async function loadProvider(
+ ): Promise<CatalogConsultation> {
+   if (serverDefaults && refresh !== "now") {
+     const cached = held.get(provider);
+-    if (cached && freshHold(cached.observedAtMs, input.nowMs)) return cached.consultation;
++    if (cached && freshHold(cached.observedAtMs, input.nowMs)) {
++      if (provider === "openrouter") {
++        const mtimeMs = freeModelCatalogSourceMtimeMs();
++        if (mtimeMs === cached.freeCatalogMtimeMs) return cached.consultation;
++      } else {
++        return cached.consultation;
++      }
++    }
+   }
+   const result = await readRouterModelCatalog({
+     gateway: provider,
+@@ -301,11 +311,21 @@ async function loadProvider(
+         : { transport: nodeCatalogTransport() }),
+   });
+   if (serverDefaults && result.ok && result.source === "catalog_get" && !result.stale) {
+-    held.set(provider, { observedAtMs: input.nowMs, consultation: result });
++    held.set(provider, {
++      observedAtMs: input.nowMs,
++      freeCatalogMtimeMs: provider === "openrouter" ? freeModelCatalogSourceMtimeMs() : null,
++      consultation: result,
++    });
+   }
+   return result;
+ }
+ 
++/** Clears in-process consultation holds (tests). */
++export function resetHqModelCatalogHold(): void {
++  held.clear();
++  inflight.clear();
++}
++
+ async function loadAuthorized(
+   input: HqModelCatalogLoad,
+   refresh: "if-stale" | "now",
+-- 
+2.43.0
+

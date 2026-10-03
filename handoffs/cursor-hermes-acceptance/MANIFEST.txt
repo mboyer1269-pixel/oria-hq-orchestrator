@@ -1,0 +1,37 @@
+Hermes/HQ acceptance recipe. Does not replace the admission or budget patches.
+Apply in a product clone. Do not push this patch to the product remote from Cursor.
+
+product_repository: mboyer1269-pixel/Oria.HQ.Michael.HQ-APP
+product_branch: codex/hq-delivery-integration
+product_base: f0e42a531c1a1e2d47726f870d15f0f905f367d8
+product_base_tree: 12f387bccc0687f92c28e6e1abf11f9cb4a4365e
+product_head: 4bfd061ac5ddc4bd1ed3f003de0d3f92e3ed891d
+product_tree: 84a94aace9b1d82129405748eeda6bceec35c6cb
+patch_range: f0e42a531c1a1e2d47726f870d15f0f905f367d8..4bfd061ac5ddc4bd1ed3f003de0d3f92e3ed891d
+patch_commits: 2
+patch_path: handoffs/cursor-hermes-acceptance/cursor-hermes-acceptance.patch
+report_path: handoffs/cursor-hermes-acceptance/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
+sha256: 2e523f66c659486382923d817dc25009d5af916c370fbdee7fda7a83c7a063d5
+size_bytes: 25179
+scope: proofs/hermes-hq-acceptance.mjs, docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
+No product service, router, UI, or migration.
+
+apply:
+git checkout f0e42a531c1a1e2d47726f870d15f0f905f367d8
+git am handoffs/cursor-hermes-acceptance/cursor-hermes-acceptance.patch
+git rev-parse HEAD^{tree}
+expected_tree: 84a94aace9b1d82129405748eeda6bceec35c6cb
+
+verified:
+git am on a detached worktree at f0e42a531c1a1e2d47726f870d15f0f905f367d8
+produced commit 7e30063af06a6ad6c53bf58a9f17185417303ce4
+and tree 84a94aace9b1d82129405748eeda6bceec35c6cb, equal to product HEAD^{tree}.
+The applied commit hash differs. The tree does not.
+Product push was not attempted.
+
+command:
+node --test --test-concurrency=1 proofs/hermes-hq-acceptance.mjs
+Node 22.14.0. 5 tests, 0 fail, 5274 ms, exit 0.
+Verdict: HERMES_HQ_RECETTE contrat_simule=ok adapter=bloque infrastructure=non_execute modele_reel=non_execute
+Exit 0 is not a qualified Hermes connection. The adapter commit is still awaited.
+Stalled body returned in 5023 ms. fetch was not called.

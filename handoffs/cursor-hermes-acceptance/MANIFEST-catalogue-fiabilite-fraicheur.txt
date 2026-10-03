@@ -1,0 +1,20 @@
+Produit Oria.HQ.Michael.HQ-APP — correctif catalogue (fraîcheur fichier free-models)
+Base produit qualifiée: f0e42a531c1a1e2d47726f870d15f0f905f367d8 (codex/hq-delivery-integration)
+Chaîne consultation appliquée localement: HEAD 0834abd puis patch ci-dessous → 0b5269c
+
+Patch: cursor-catalogue-fiabilite-fraicheur.patch
+Parent attendu sur branche produit: 0834abd054b9822cab2f69b988ac0698e034fafc
+Commit cible: 0b5269c (Fix free-model catalog freshness after on-disk rewrites)
+
+Défauts corrigés (2):
+1. loadFreeModelCatalogSnapshot ignorait les réécritures disque tant que resetFreeModelCatalogCache n'était pas appelé.
+2. loadHqModelCatalog conservait une consultation OpenRouter en hold alors que le fichier free-models avait été réécrit.
+
+Tests exécutés (node --test --test-concurrency=1):
+- src/server/ai/free-model-catalog.test.mjs
+- src/server/ai/hq-model-catalog.test.mjs
+- src/server/ai/model-catalog-consultation.test.mjs
+- src/server/ai/gateway-catalog.test.mjs
+(49 pass, 0 fail)
+
+Limites: commits produit 4bfd061 / 2ed003a non fetchables sur le remote public; tree handoff surcharge ≠ manifeste (patches prix-delta / surface-cumul non appliqués). Pas de push produit ni déploiement.

@@ -1,0 +1,830 @@
+From 86cc891e47c0323c9b6ad9bd618a8bb57ba5b852 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Oct 2026 16:03:58 +0000
+Subject: [PATCH] Bind the strict HQ entry to one approved server account.
+
+generateHqStructuredJson refuses a missing or divergent account, workspace, model, billing kind, or catalog revision before any reservation or fetch. Subscription and verified free stay non_api_authorized. The legacy path without a catalog is unchanged and is not a security proof.
+---
+ src/server/ai/llm-json-provider.ts            | 149 ++++++++-
+ src/server/ai/model-router.ts                 |   8 +-
+ .../ai/server-capability-catalog.test.mjs     | 304 +++++++++++++++++-
+ src/server/ai/server-capability-catalog.ts    |  56 +++-
+ 4 files changed, 492 insertions(+), 25 deletions(-)
+
+diff --git a/src/server/ai/llm-json-provider.ts b/src/server/ai/llm-json-provider.ts
+index 30b9515..c078798 100644
+--- a/src/server/ai/llm-json-provider.ts
++++ b/src/server/ai/llm-json-provider.ts
+@@ -34,12 +34,15 @@ import {
+   createDurableCallReservationGate,
+   requestInputBytes,
+   unavailableReservation,
++  type CallAccessClass,
+   type CallReservationGate,
+   type CallReservationSnapshot,
+ } from "@/server/ai/call-reservation";
+ import { executionTargetForModel } from "@/server/ai/execution-models";
+ import {
+   assessServerEmission,
++  type ApprovedServerBinding,
++  type ServerCapability,
+   type ServerCapabilityCatalog,
+   type ServerEmissionBlock,
+ } from "@/server/ai/server-capability-catalog";
+@@ -93,6 +96,11 @@ export type LlmJsonProviderInput = {
+    * An unset catalog is not a security proof.
+    */
+   requireServerCatalog?: boolean;
++  /**
++   * Required by generateHqStructuredJson. Compared to the catalog before
++   * any reservation or fetch. Legacy callers leave it unset.
++   */
++  approved?: ApprovedServerBinding;
+   // Per-provider fetch overrides for test injection.
+   fetchFns?: {
+     anthropic?: typeof fetch;
+@@ -114,6 +122,8 @@ export type LlmJsonProviderSuccess = {
+   modelId: string;
+   /** Id the caller asked for. Null when the caller did not name one. */
+   requestedModelId: string | null;
++  /** Server account the strict decision named. Null when the call did not bind one. */
++  accountId: string | null;
+   chosenModelId?: string;
+   /** Model id from the provider body. Null when the body does not say. Never the request id. */
+   executedModelId: string | null;
+@@ -157,6 +167,8 @@ export type LlmJsonProviderFailure = {
+   fallbackReason: string;
+   failureChain: string[];
+   requestedModelId: string | null;
++  /** Server account the strict decision named. Null when the call did not bind one. */
++  accountId: string | null;
+   providerUsed?: LlmProvider;
+   provider: null;
+   chosenModelId?: string;
+@@ -213,12 +225,69 @@ function observedFrom(result: { observedModelId?: string | null }): string | nul
+     : null;
+ }
+ 
++function refusalAccessClass(
++  block: string,
++  modelId: string | undefined,
++): CallAccessClass | undefined {
++  if (block === "subscription") return "subscription";
++  if (block === "verified_free") return "unknown";
++  if (
++    block === "binding_required"
++    || block === "binding_mismatch"
++    || block === "account_mismatch"
++    || block === "account_ambiguous"
++    || block === "catalog_required"
++  ) {
++    return undefined;
++  }
++  if (!modelId) return undefined;
++  return accessClassForModel(modelId);
++}
++
++function boundAccountId(input: LlmJsonProviderInput): string | null {
++  const id = input.approved?.accountId;
++  return typeof id === "string" && id.length > 0 ? id : null;
++}
++
++function readStrictBinding(input: LlmJsonProviderInput): "binding_required" | "binding_mismatch" | null {
++  if (!input.requireServerCatalog) return null;
++  const approved = input.approved;
++  const revision = input.serverCatalog?.revision;
++  if (!approved || typeof revision !== "string" || revision.length === 0) return "binding_required";
++  if (
++    typeof approved.accountId !== "string" || approved.accountId.length === 0
++    || typeof approved.workspaceId !== "string" || approved.workspaceId.length === 0
++    || typeof approved.modelId !== "string" || approved.modelId.length === 0
++    || typeof approved.catalogRevision !== "string" || approved.catalogRevision.length === 0
++    || (approved.billingKind !== "api" && approved.billingKind !== "verified_free" && approved.billingKind !== "subscription")
++  ) {
++    return "binding_required";
++  }
++  if (
++    approved.catalogRevision !== revision
++    || approved.workspaceId !== input.workspaceId
++    || approved.modelId !== input.modelId
++  ) {
++    return "binding_mismatch";
++  }
++  return null;
++}
++
++function entryMatchesBinding(entry: ServerCapability, approved: ApprovedServerBinding): boolean {
++  return entry.accountId === approved.accountId
++    && entry.workspaceId === approved.workspaceId
++    && entry.modelId === approved.modelId
++    && entry.billingKind === approved.billingKind;
++}
++
+ function capabilityBlocked(
+   input: LlmJsonProviderInput,
+   block: ServerEmissionBlock | "catalog_ceiling" | "verified_free" | "subscription",
+   configured: boolean,
+   errorCode: LlmJsonProviderErrorCode = "capability_blocked",
++  accountId: string | null = null,
+ ): LlmJsonProviderFailure {
++  const accessClass = refusalAccessClass(block, input.modelId);
+   const reservation: CallReservationSnapshot = configured
+     ? {
+         configured: true,
+@@ -228,7 +297,7 @@ function capabilityBlocked(
+         networkEmitted: false,
+         reconciliationRequired: false,
+         reason: block,
+-        ...(input.modelId ? { accessClass: accessClassForModel(input.modelId) } : {}),
++        ...(accessClass ? { accessClass } : {}),
+       }
+     : unavailableReservation();
+   const cost = refused();
+@@ -238,6 +307,7 @@ function capabilityBlocked(
+     fallbackReason: block,
+     failureChain: [],
+     requestedModelId: requestedModelIdOf(input),
++    accountId,
+     provider: null,
+     ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+     executedModelId: null,
+@@ -371,7 +441,11 @@ export async function generateStructuredJson(
+   let catalogCeilingCents: number | undefined;
+ 
+   if (input.requireServerCatalog && (!input.serverCatalog || !input.modelId || !input.workspaceId)) {
+-    return capabilityBlocked(input, "catalog_required", configured);
++    return capabilityBlocked(input, "catalog_required", configured, "capability_blocked", boundAccountId(input));
++  }
++  const bindingFault = readStrictBinding(input);
++  if (bindingFault) {
++    return capabilityBlocked(input, bindingFault, configured, "capability_blocked", boundAccountId(input));
+   }
+ 
+   if (input.serverCatalog && input.modelId) {
+@@ -382,15 +456,42 @@ export async function generateStructuredJson(
+       workspaceId: input.workspaceId ?? "",
+       requiresTools: input.requiresTools === true,
+       nowMs: input.nowMs ?? Date.now(),
++      ...(input.approved ? { accountId: input.approved.accountId } : {}),
+       ...(invoked.callable ? { invokedProvider: invoked.provider } : {}),
+     });
+-    if (!assessment.emit) return capabilityBlocked(input, assessment.block, configured);
+-    if (assessment.billingKind !== "api") {
+-      return capabilityBlocked(input, assessment.billingKind, configured, "non_api_authorized");
++    if (!assessment.emit) {
++      if (assessment.disposition === "non_api") {
++        if (input.approved && !entryMatchesBinding(assessment.capability, input.approved)) {
++          return capabilityBlocked(input, "binding_mismatch", configured, "capability_blocked", boundAccountId(input));
++        }
++        return capabilityBlocked(
++          input,
++          assessment.billingKind,
++          configured,
++          "non_api_authorized",
++          assessment.capability.accountId,
++        );
++      }
++      return capabilityBlocked(input, assessment.block, configured, "capability_blocked", boundAccountId(input));
++    }
++    const capabilityBilling = assessment.capability.billingKind;
++    if (capabilityBilling !== "api") {
++      return capabilityBlocked(
++        input,
++        capabilityBilling,
++        configured,
++        "non_api_authorized",
++        assessment.capability.accountId,
++      );
++    }
++    if (input.approved && !entryMatchesBinding(assessment.capability, input.approved)) {
++      return capabilityBlocked(input, "binding_mismatch", configured, "capability_blocked", boundAccountId(input));
+     }
+     if (invoked.callable) {
+       catalogCeilingCents = assessment.notToExceedCents;
+-      if (!configured) return capabilityBlocked(input, "catalog_ceiling", configured);
++      if (!configured) {
++        return capabilityBlocked(input, "catalog_ceiling", configured, "capability_blocked", boundAccountId(input));
++      }
+     }
+   }
+ 
+@@ -416,6 +517,7 @@ export async function generateStructuredJson(
+         fallbackReason: target.reason,
+         failureChain: [],
+         requestedModelId: requestedModelIdOf(input),
++        accountId: boundAccountId(input),
+         provider: null,
+         chosenModelId: input.modelId,
+         executedModelId: null,
+@@ -443,6 +545,7 @@ export async function generateStructuredJson(
+         fallbackReason: `${String(provider)} n'est pas un fournisseur pris en charge.`,
+         failureChain,
+         requestedModelId: requestedModelIdOf(input),
++        accountId: boundAccountId(input),
+         provider: null,
+         ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+         executedModelId: null,
+@@ -466,13 +569,22 @@ export async function generateStructuredJson(
+         invokedProvider: provider,
+       });
+       if (!assessment.emit) {
++        if (assessment.disposition === "non_api") {
++          if (attempts.length === 0) {
++            return capabilityBlocked(
++              input,
++              assessment.billingKind,
++              configured,
++              "non_api_authorized",
++              assessment.capability.accountId,
++            );
++          }
++          break;
++        }
+         if (attempts.length === 0) return capabilityBlocked(input, assessment.block, configured);
+         break;
+       }
+       if (assessment.billingKind !== "api") {
+-        if (attempts.length === 0) {
+-          return capabilityBlocked(input, assessment.billingKind, configured, "non_api_authorized");
+-        }
+         break;
+       }
+       catalogCeilingCents = assessment.notToExceedCents;
+@@ -516,6 +628,7 @@ export async function generateStructuredJson(
+           fallbackReason: failureChain[failureChain.length - 1],
+           failureChain,
+           requestedModelId: requestedModelIdOf(input),
++          accountId: boundAccountId(input),
+           provider: null,
+           ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+           executedModelId: null,
+@@ -585,6 +698,7 @@ export async function generateStructuredJson(
+         rawText: result.rawText,
+         modelId: result.modelId,
+         requestedModelId: requestedModelIdOf(input),
++        accountId: boundAccountId(input),
+         ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+         executedModelId: observedFrom(result),
+         provider,
+@@ -613,6 +727,7 @@ export async function generateStructuredJson(
+         : "No providers configured",
+     failureChain,
+     requestedModelId: requestedModelIdOf(input),
++    accountId: boundAccountId(input),
+     provider: null,
+     ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+     executedModelId: null,
+@@ -624,9 +739,21 @@ export async function generateStructuredJson(
+   };
+ }
+ 
+-/** New HQ entry. Refuses when the server catalog, workspace, model, or authorization is missing. */
++/**
++ * Strict HQ entry. The caller supplies the approved server binding.
++ * A missing catalog, workspace, model, or binding is refused before any
++ * reservation or fetch. Subscription and verified free are not executed:
++ * `emit: true` is only the metered API shape, and a non-API capability
++ * still returns `non_api_authorized` with no socket.
++ * `generateStructuredJson` without this flag is the legacy path. It is not a security proof.
++ */
+ export async function generateHqStructuredJson(
+-  input: Omit<LlmJsonProviderInput, "requireServerCatalog">,
++  input: Omit<LlmJsonProviderInput, "requireServerCatalog" | "approved" | "serverCatalog" | "modelId" | "workspaceId"> & {
++    approved: ApprovedServerBinding;
++    serverCatalog: ServerCapabilityCatalog;
++    modelId: string;
++    workspaceId: string;
++  },
+ ): Promise<LlmJsonProviderResult> {
+   return generateStructuredJson({ ...input, requireServerCatalog: true });
+ }
+diff --git a/src/server/ai/model-router.ts b/src/server/ai/model-router.ts
+index 06cf1b8..5c2d11a 100644
+--- a/src/server/ai/model-router.ts
++++ b/src/server/ai/model-router.ts
+@@ -50,6 +50,8 @@ export type ModelRouteInput = {
+    * keep the existing path. This object is not a browser price list.
+    */
+   serverCatalog?: ServerCapabilityCatalog;
++  /** Server account. Required when the catalog lists more than one for the model. */
++  accountId?: string;
+   /** A tools-required call cannot select an entry whose tools flag is false. */
+   requiresTools?: boolean;
+ };
+@@ -476,13 +478,11 @@ export function chooseModel(input: ModelRouteInput): ModelRouteDecision {
+       requiresTools: input.requiresTools === true,
+       nowMs: input.nowMs ?? Date.now(),
+       invokedProvider: target.provider,
++      ...(input.accountId ? { accountId: input.accountId } : {}),
+     });
+     if (!assessment.emit) {
+       execution = "refused";
+-      refusalReason = assessment.block;
+-    } else if (assessment.billingKind !== "api") {
+-      execution = "refused";
+-      refusalReason = assessment.billingKind;
++      refusalReason = assessment.disposition === "non_api" ? assessment.billingKind : assessment.block;
+     }
+   }
+ 
+diff --git a/src/server/ai/server-capability-catalog.test.mjs b/src/server/ai/server-capability-catalog.test.mjs
+index 67ad090..307e01b 100644
+--- a/src/server/ai/server-capability-catalog.test.mjs
++++ b/src/server/ai/server-capability-catalog.test.mjs
+@@ -28,9 +28,12 @@ const NOW = Date.parse("2026-10-02T12:00:00.000Z");
+ const FRESH = new Date(NOW - 60_000).toISOString();
+ const HAIKU = "claude-haiku-4-5-20251001";
+ const WORKSPACE = "ws-catalogue";
++const ACCOUNT = "acct-server-1";
++const REVISION = "rev-1";
+ 
+ function entry(overrides = {}) {
+   return {
++    accountId: ACCOUNT,
+     modelId: HAIKU,
+     provider: "anthropic",
+     state: "authorized",
+@@ -49,8 +52,39 @@ function entry(overrides = {}) {
+   };
+ }
+ 
+-function catalog(entries) {
+-  return { source: "server-discovery", observedAt: FRESH, entries };
++function catalog(entries, revision = REVISION) {
++  return { source: "server-discovery", observedAt: FRESH, revision, entries };
++}
++
++function approved(overrides = {}) {
++  return {
++    accountId: ACCOUNT,
++    workspaceId: WORKSPACE,
++    modelId: HAIKU,
++    billingKind: "api",
++    catalogRevision: REVISION,
++    ...overrides,
++  };
++}
++
++function closedGate(counters) {
++  return {
++    async reserve() {
++      counters.reserves += 1;
++      throw new Error("reserve must not run");
++    },
++    async markEmitted() {
++      counters.marks += 1;
++      throw new Error("mark must not run");
++    },
++    async release() {
++      counters.releases += 1;
++      throw new Error("release must not run");
++    },
++    async consume() {
++      throw new Error("consume must not run");
++    },
++  };
+ }
+ 
+ function assess(overrides = {}, call = {}) {
+@@ -431,10 +465,12 @@ test("zero cents is not verified free, and free or subscription invents no zero
+   assert.equal(assess({ billingKind: "subscription", tariff: zero }).block, "tariff_unknown");
+   const free = assess({ billingKind: "verified_free", tariff: null });
+   const subscription = assess({ billingKind: "subscription", tariff: null });
+-  assert.equal(free.emit, true);
++  assert.equal(free.emit, false);
++  assert.equal(free.disposition, "non_api");
+   assert.equal(free.billingKind, "verified_free");
+   assert.equal(free.capability.tariff, null);
+-  assert.equal(subscription.emit, true);
++  assert.equal(subscription.emit, false);
++  assert.equal(subscription.disposition, "non_api");
+   assert.equal(subscription.billingKind, "subscription");
+ 
+   let fetches = 0;
+@@ -447,6 +483,7 @@ test("zero cents is not verified free, and free or subscription invents no zero
+     userPrompt: "user",
+     nowMs: NOW,
+     serverCatalog: catalog([entry({ billingKind: "verified_free", tariff: null })]),
++    approved: approved({ billingKind: "verified_free" }),
+     fetchFns: {
+       anthropic: async () => {
+         fetches += 1;
+@@ -480,6 +517,7 @@ test("a catalog ceiling above the server hold does not emit", async () => {
+     userPrompt: "user",
+     nowMs: NOW,
+     serverCatalog: catalog([entry()]),
++    approved: approved(),
+     reservationGate: {
+       ...holdingGate(41),
+       async markEmitted() {
+@@ -522,6 +560,7 @@ test("a catalog ceiling above the server hold does not emit", async () => {
+     userPrompt: "user",
+     nowMs: NOW,
+     serverCatalog: catalog([entry()]),
++    approved: approved(),
+     reservationGate: holdingGate(40),
+     fetchFns: {
+       anthropic: async () => {
+@@ -542,6 +581,7 @@ test("a catalog ceiling above the server hold does not emit", async () => {
+   delete process.env.ANTHROPIC_API_KEY;
+   assert.equal(fetches, 1);
+   assert.equal(within.ok, true);
++  assert.equal(within.accountId, ACCOUNT);
+   assert.equal(within.executedModelId, HAIKU);
+   assert.equal(within.cost.monetaryUsd, null);
+ });
+@@ -564,6 +604,7 @@ test("a stale or future capability and a foreign provider do not emit", async ()
+     systemPrompt: "sys",
+     userPrompt: "user",
+     nowMs: NOW,
++    approved: approved(),
+     paidFallback: { authorized: true, workspaceId: WORKSPACE },
+     serverCatalog: catalog([
+       entry({ provider: "openai" }),
+@@ -639,5 +680,260 @@ test("the strict HQ entry refuses a missing catalog, and legacy absence is not a
+   assert.equal(strict.cost.networkRequestSent, false);
+   assert.equal(legacyFetches, 1);
+   assert.equal(legacy.ok, true);
++  assert.equal(legacy.accountId, null);
+   assert.equal(legacy.executedModelId, HAIKU);
+ });
++
++test("two subscription accounts of one provider do not collapse, and the bound account is named", async () => {
++  const two = catalog([
++    entry({ accountId: "acct-a", billingKind: "subscription", tariff: null }),
++    entry({ accountId: "acct-b", billingKind: "subscription", tariff: null }),
++  ]);
++  const ambiguous = assessServerEmission({
++    catalog: two,
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    requiresTools: false,
++    nowMs: NOW,
++    invokedProvider: "anthropic",
++  });
++  assert.equal(ambiguous.emit, false);
++  assert.equal(ambiguous.block, "account_ambiguous");
++  assert.equal(assess({ accountId: "anthropic" }).block, "not_listed");
++
++  const counters = { reserves: 0, marks: 0, releases: 0 };
++  let fetches = 0;
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const sent = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-two-accounts",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: two,
++    approved: approved({ accountId: "acct-b", billingKind: "subscription" }),
++    reservationGate: closedGate(counters),
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("fetch must not run");
++      },
++      openai: async () => {
++        fetches += 1;
++        throw new Error("fetch must not run");
++      },
++    },
++  });
++  delete process.env.HQ_CALL_RESERVATION;
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(fetches, 0);
++  assert.equal(counters.reserves, 0);
++  assert.equal(counters.marks, 0);
++  assert.equal(sent.ok, false);
++  assert.equal(sent.errorCode, "non_api_authorized");
++  assert.equal(sent.fallbackReason, "subscription");
++  assert.equal(sent.accountId, "acct-b");
++  assert.notEqual(sent.accountId, "acct-a");
++  assert.equal(sent.reservation.accessClass, "subscription");
++  assert.notEqual(sent.reservation.accessClass, "api");
++  assert.equal(sent.executedModelId, null);
++  assert.equal(sent.cost.monetaryUsd, null);
++  assert.notEqual(sent.cost.monetaryUsd, 0);
++  assert.equal(sent.cost.networkRequestSent, false);
++  assert.equal(sent.reservation.networkEmitted, false);
++
++  const unnamed = chooseModel({
++    message: "bonjour",
++    requestedMode: "economy",
++    nowMs: NOW,
++    workspaceId: WORKSPACE,
++    serverCatalog: catalog([
++      entry({ accountId: "acct-a", modelId: "gpt-4o-mini", provider: "openai", billingKind: "subscription", tariff: null }),
++      entry({ accountId: "acct-b", modelId: "gpt-4o-mini", provider: "openai", billingKind: "subscription", tariff: null }),
++    ]),
++  });
++  assert.equal(unnamed.execution, "refused");
++  assert.equal(unnamed.refusalReason, "account_ambiguous");
++  assert.equal(unnamed.executedModelId, null);
++  const named = chooseModel({
++    message: "bonjour",
++    requestedMode: "economy",
++    nowMs: NOW,
++    workspaceId: WORKSPACE,
++    accountId: "acct-b",
++    serverCatalog: catalog([
++      entry({ accountId: "acct-a", modelId: "gpt-4o-mini", provider: "openai", billingKind: "subscription", tariff: null }),
++      entry({ accountId: "acct-b", modelId: "gpt-4o-mini", provider: "openai", billingKind: "subscription", tariff: null }),
++    ]),
++  });
++  assert.equal(named.execution, "refused");
++  assert.equal(named.refusalReason, "subscription");
++  assert.equal(named.executedModelId, null);
++});
++
++test("a call that diverges from the approved binding does not reserve or fetch", async () => {
++  const sub = catalog([
++    entry({ accountId: "acct-a", billingKind: "subscription", tariff: null }),
++  ]);
++  const counters = { reserves: 0, marks: 0, releases: 0 };
++  let fetches = 0;
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const fetchFns = {
++    anthropic: async () => {
++      fetches += 1;
++      throw new Error("fetch must not run");
++    },
++    openai: async () => {
++      fetches += 1;
++      throw new Error("fetch must not run");
++    },
++  };
++  const held = approved({ accountId: "acct-a", billingKind: "subscription" });
++  const first = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-binding",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: sub,
++    approved: held,
++    reservationGate: closedGate(counters),
++    fetchFns,
++  });
++  assert.equal(first.errorCode, "non_api_authorized");
++  assert.equal(first.accountId, "acct-a");
++  assert.equal(first.reservation.accessClass, "subscription");
++
++  const cases = [
++    {
++      name: "model",
++      call: {
++        modelId: "gpt-4o-mini",
++        serverCatalog: sub,
++        approved: held,
++      },
++      reason: "binding_mismatch",
++    },
++    {
++      name: "account",
++      call: {
++        modelId: HAIKU,
++        serverCatalog: sub,
++        approved: approved({ accountId: "acct-b", billingKind: "subscription" }),
++      },
++      reason: "account_mismatch",
++    },
++    {
++      name: "revision",
++      call: {
++        modelId: HAIKU,
++        serverCatalog: catalog(sub.entries, "rev-2"),
++        approved: held,
++      },
++      reason: "binding_mismatch",
++    },
++    {
++      name: "billing",
++      call: {
++        modelId: HAIKU,
++        serverCatalog: sub,
++        approved: approved({ accountId: "acct-a", billingKind: "api" }),
++      },
++      reason: "binding_mismatch",
++    },
++  ];
++  for (const item of cases) {
++    const result = await generateHqStructuredJson({
++      providerPreference: "anthropic",
++      workspaceId: WORKSPACE,
++      callSubjectId: "subject-binding",
++      systemPrompt: "sys",
++      userPrompt: "user",
++      nowMs: NOW,
++      reservationGate: closedGate(counters),
++      fetchFns,
++      ...item.call,
++    });
++    assert.equal(result.ok, false, item.name);
++    assert.equal(result.errorCode, "capability_blocked", item.name);
++    assert.equal(result.fallbackReason, item.reason, item.name);
++    assert.equal(result.executedModelId, null, item.name);
++    assert.equal(result.cost.monetaryUsd, null, item.name);
++    assert.notEqual(result.cost.monetaryUsd, 0, item.name);
++    assert.equal(result.cost.networkRequestSent, false, item.name);
++    assert.equal(result.reservation.networkEmitted, false, item.name);
++  }
++
++  const missing = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-binding",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: sub,
++    reservationGate: closedGate(counters),
++    fetchFns,
++  });
++  delete process.env.HQ_CALL_RESERVATION;
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(fetches, 0);
++  assert.equal(counters.reserves, 0);
++  assert.equal(counters.marks, 0);
++  assert.equal(counters.releases, 0);
++  assert.equal(missing.fallbackReason, "binding_required");
++  assert.equal(missing.executedModelId, null);
++  assert.equal(missing.cost.monetaryUsd, null);
++});
++
++test("a callable api id billed as subscription is not an api emission", async () => {
++  const assessed = assess({ billingKind: "subscription", tariff: null });
++  assert.equal(assessed.emit, false);
++  assert.equal(assessed.disposition, "non_api");
++  assert.equal(assessed.billingKind, "subscription");
++
++  const counters = { reserves: 0, marks: 0, releases: 0 };
++  let fetches = 0;
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const sent = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-subscription-class",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: catalog([entry({ billingKind: "subscription", tariff: null })]),
++    approved: approved({ billingKind: "subscription" }),
++    reservationGate: closedGate(counters),
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("subscription must not fetch");
++      },
++    },
++  });
++  delete process.env.HQ_CALL_RESERVATION;
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(fetches, 0);
++  assert.equal(counters.reserves, 0);
++  assert.equal(counters.marks, 0);
++  assert.equal(sent.errorCode, "non_api_authorized");
++  assert.equal(sent.fallbackReason, "subscription");
++  assert.equal(sent.reservation.reason, "subscription");
++  assert.equal(sent.reservation.accessClass, "subscription");
++  assert.notEqual(sent.reservation.accessClass, "api");
++  assert.equal(sent.accountId, ACCOUNT);
++  assert.equal(sent.executedModelId, null);
++  assert.equal(sent.cost.monetaryUsd, null);
++  assert.notEqual(sent.cost.monetaryUsd, 0);
++  assert.equal(sent.cost.networkRequestSent, false);
++});
+diff --git a/src/server/ai/server-capability-catalog.ts b/src/server/ai/server-capability-catalog.ts
+index 0248369..d3fe4de 100644
+--- a/src/server/ai/server-capability-catalog.ts
++++ b/src/server/ai/server-capability-catalog.ts
+@@ -25,6 +25,8 @@ export type ServerTariff = {
+ export type ServerBillingKind = "api" | "verified_free" | "subscription";
+ 
+ export type ServerCapability = {
++  /** Server account. Never a provider name and never a browser label. */
++  accountId: string;
+   modelId: string;
+   provider: string;
+   state: CapabilityState;
+@@ -40,9 +42,20 @@ export type ServerCapability = {
+ export type ServerCapabilityCatalog = {
+   source: string;
+   observedAt: string;
++  /** Server revision the approved binding must repeat. Not a browser cache key. */
++  revision: string;
+   entries: readonly ServerCapability[];
+ };
+ 
++/** Tuple fixed at approval. The strict entry refuses if the call diverges. */
++export type ApprovedServerBinding = {
++  accountId: string;
++  workspaceId: string;
++  modelId: string;
++  billingKind: ServerBillingKind;
++  catalogRevision: string;
++};
++
+ export type ServerEmissionBlock =
+   | "not_listed"
+   | "public_catalog_only"
+@@ -53,7 +66,11 @@ export type ServerEmissionBlock =
+   | "tools_unavailable"
+   | "tariff_unknown"
+   | "tariff_stale"
+-  | "catalog_required";
++  | "catalog_required"
++  | "account_mismatch"
++  | "account_ambiguous"
++  | "binding_required"
++  | "binding_mismatch";
+ 
+ export type ServerEmissionAssessment =
+   | {
+@@ -64,9 +81,12 @@ export type ServerEmissionAssessment =
+       notToExceedCents: number;
+     }
+   | {
+-      emit: true;
++      /** Authorized billing that this JSON path must not execute. */
++      emit: false;
++      disposition: "non_api";
+       capability: ServerCapability;
+       billingKind: "verified_free" | "subscription";
++      requestedModelId: string;
+     }
+   | { emit: false; block: ServerEmissionBlock; requestedModelId: string };
+ 
+@@ -78,6 +98,8 @@ export function assessServerEmission(input: {
+   nowMs: number;
+   /** Adapter that would actually be called. A different catalog provider is not a match. */
+   invokedProvider?: string;
++  /** When set, only this server account matches. When omitted, two accounts are ambiguous. */
++  accountId?: string;
+ }): ServerEmissionAssessment {
+   const requestedModelId = input.modelId;
+   const entries = Array.isArray(input.catalog?.entries) ? input.catalog.entries : [];
+@@ -104,7 +126,20 @@ export function assessServerEmission(input: {
+     return { emit: false, block: "provider_mismatch", requestedModelId };
+   }
+ 
+-  const entry = matchingProvider[0];
++  const accountId = input.accountId ?? "";
++  const forAccount = accountId.length > 0
++    ? matchingProvider.filter((entry) => entry.accountId === accountId)
++    : matchingProvider;
++  if (accountId.length > 0 && forAccount.length === 0) {
++    return { emit: false, block: "account_mismatch", requestedModelId };
++  }
++  const accounts = new Set(forAccount.map((entry) => entry.accountId));
++  const billings = new Set(forAccount.map((entry) => entry.billingKind));
++  if (accounts.size !== 1 || billings.size !== 1) {
++    return { emit: false, block: "account_ambiguous", requestedModelId };
++  }
++
++  const entry = forAccount[0];
+   if (readObservedAt(entry.observedAt, input.nowMs)) {
+     return { emit: false, block: "capability_stale", requestedModelId };
+   }
+@@ -125,7 +160,13 @@ export function assessServerEmission(input: {
+     if (entry.tariff !== null) {
+       return { emit: false, block: "tariff_unknown", requestedModelId };
+     }
+-    return { emit: true, capability: entry, billingKind: entry.billingKind };
++    return {
++      emit: false,
++      disposition: "non_api",
++      capability: entry,
++      billingKind: entry.billingKind,
++      requestedModelId,
++    };
+   }
+   if (entry.billingKind !== "api") {
+     return { emit: false, block: "tariff_unknown", requestedModelId };
+@@ -145,10 +186,13 @@ export function assessServerEmission(input: {
+ 
+ function verifiedEntry(entry: ServerCapability): boolean {
+   return (
+-    typeof entry.modelId === "string"
+-    && entry.modelId.length > 0
++    typeof entry.accountId === "string"
++    && entry.accountId.length > 0
+     && typeof entry.provider === "string"
+     && entry.provider.length > 0
++    && entry.accountId !== entry.provider
++    && typeof entry.modelId === "string"
++    && entry.modelId.length > 0
+     && (entry.state === "listed" || entry.state === "connected" || entry.state === "authorized")
+     && (entry.billingKind === "api" || entry.billingKind === "verified_free" || entry.billingKind === "subscription")
+     && typeof entry.source === "string"
+-- 
+2.43.0
+
