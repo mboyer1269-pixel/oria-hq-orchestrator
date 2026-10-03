@@ -1,2 +1,3 @@
 # Preserve Linux-compatible line endings for VPS entry points.
 *.sh text eol=lf
+integrations/openhands-claude-runtime/claude-agent-acp text eol=lf
