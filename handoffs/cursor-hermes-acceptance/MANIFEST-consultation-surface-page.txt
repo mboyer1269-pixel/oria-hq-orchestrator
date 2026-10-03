@@ -1,0 +1,27 @@
+Delta de livraison. À appliquer sur un arbre qui contient déjà le contenu de 34f0fc527fc08fbb81b9fa2a951150ba90de8b11.
+Les tests produit ne lancent pas git et n'ont pas besoin de la révision 63bc22b.
+
+Produit 0309b8d5d85678faa8944e5d829c2c3f295f798d
+Parent 34f0fc527fc08fbb81b9fa2a951150ba90de8b11
+Arbre 555be6588cdd435e881f85a4a4f3ff6a1b9721ca
+Patch cursor-consultation-surface-page-delta.patch
+SHA256 f57218712e6b1a68dc261d5b6fe3fb7f194b236d7e3b2d5d2186b2c80fd466f2
+git am reproduit l'arbre (commit appliqué 31b7df3611bdf4e88d43411a9614aeed52c4ba6a)
+
+Fichiers du delta
+src/app/hq/runtime/page.tsx
+src/server/ai/hq-model-catalog.ts
+src/server/ai/hq-model-catalog.test.mjs
+
+Hors delta
+src/server/ai/model-router.ts
+src/server/ai/model-config.ts
+src/features/hq/seed.ts
+src/server/ai/cost-ladder.ts
+src/server/ai/call-accounting.ts
+src/server/ai/call-reservation.ts
+src/server/ai/llm-json-provider.ts
+src/server/ai/gateway-catalog.ts
+src/server/ai/model-catalog-consultation.ts
+
+Le périmètre est ce diff. La suite produit vérifie le comportement : refus avant réseau, erreur partielle, pages par fournisseur, unités, et absence de mutation du choix approuvé et des journaux de coût.
