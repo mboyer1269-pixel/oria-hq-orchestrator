@@ -1,0 +1,1314 @@
+From b340a5745037b094bfd7c907476962fa77a15881 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 3 Oct 2026 03:13:05 +0000
+Subject: [PATCH] Consult the gateway catalog without attributing one
+ provider's cache to another.
+
+Parent 2ed003a. One bounded GET refreshes a stale provider-scoped snapshot. A failed refresh keeps the original timestamp. Paid and unknown prices stay non-executable. chooseModel does not call this read.
+---
+ src/server/ai/free-model-catalog.ts           |  45 +-
+ .../ai/model-catalog-consultation.test.mjs    | 641 ++++++++++++++++++
+ src/server/ai/model-catalog-consultation.ts   | 511 ++++++++++++++
+ src/server/ai/model-config.ts                 |  12 +
+ src/server/ai/model-router.ts                 |  11 +
+ 5 files changed, 1208 insertions(+), 12 deletions(-)
+ create mode 100644 src/server/ai/model-catalog-consultation.test.mjs
+ create mode 100644 src/server/ai/model-catalog-consultation.ts
+
+diff --git a/src/server/ai/free-model-catalog.ts b/src/server/ai/free-model-catalog.ts
+index f64e684..cdf7e50 100644
+--- a/src/server/ai/free-model-catalog.ts
++++ b/src/server/ai/free-model-catalog.ts
+@@ -2,7 +2,7 @@ import "server-only";
+ import { readFileSync } from "node:fs";
+ import { join } from "node:path";
+ import {
+-  parseFreeModelCatalogText,
++  parseFreeModelCatalog,
+   type FreeModelEntry,
+ } from "@/server/ai/cost-ladder";
+ 
+@@ -16,26 +16,47 @@ import {
+ 
+ const CONFIG_RELATIVE_PATH = "config/openrouter.free-models.json";
+ 
+-let cached: FreeModelEntry[] | null = null;
++export type FreeModelCatalogSnapshot = {
++  /** File timestamp. Never rewritten to "now". */
++  generatedAt: string | null;
++  /** Gateway that owns this file. Absent means the snapshot must not be attributed. */
++  provider: string | null;
++  entries: FreeModelEntry[];
++};
++
++let cachedSnapshot: FreeModelCatalogSnapshot | null = null;
++
++function readSnapshotFromDisk(): FreeModelCatalogSnapshot {
++  try {
++    const raw = readFileSync(join(process.cwd(), CONFIG_RELATIVE_PATH), "utf-8");
++    const withoutBom = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
++    const json = JSON.parse(withoutBom) as { generated_at?: unknown; provider?: unknown };
++    const generatedAt = typeof json.generated_at === "string" ? json.generated_at : null;
++    const provider = typeof json.provider === "string" && json.provider.length > 0 ? json.provider : null;
++    return { generatedAt, provider, entries: parseFreeModelCatalog(json) };
++  } catch {
++    return { generatedAt: null, provider: null, entries: [] };
++  }
++}
++
++/** Cached snapshot, including the original generated_at. A later read does not refresh that date. */
++export function loadFreeModelCatalogSnapshot(): FreeModelCatalogSnapshot {
++  if (cachedSnapshot) return cachedSnapshot;
++  cachedSnapshot = readSnapshotFromDisk();
++  return cachedSnapshot;
++}
+ 
+ /** Reads + parses the free-model catalog from disk. Cached after first read. */
+ export function loadFreeModelCatalog(): FreeModelEntry[] {
+-  if (cached) return cached;
+-  cached = readFreeModelCatalog();
+-  return cached;
++  return loadFreeModelCatalogSnapshot().entries;
+ }
+ 
+ /** Uncached read — used by the doctor organ to validate the live file. */
+ export function readFreeModelCatalog(): FreeModelEntry[] {
+-  try {
+-    const raw = readFileSync(join(process.cwd(), CONFIG_RELATIVE_PATH), "utf-8");
+-    return parseFreeModelCatalogText(raw);
+-  } catch {
+-    return [];
+-  }
++  return readSnapshotFromDisk().entries;
+ }
+ 
+ /** Clears the cache (tests / after a Market Watch refresh). */
+ export function resetFreeModelCatalogCache(): void {
+-  cached = null;
++  cachedSnapshot = null;
+ }
+diff --git a/src/server/ai/model-catalog-consultation.test.mjs b/src/server/ai/model-catalog-consultation.test.mjs
+new file mode 100644
+index 0000000..a546ad7
+--- /dev/null
++++ b/src/server/ai/model-catalog-consultation.test.mjs
+@@ -0,0 +1,641 @@
++#!/usr/bin/env node
++
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import path from "node:path";
++import test, { after } from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..");
++
++process.env.NODE_ENV = "test";
++delete process.env.NEXT_PUBLIC_SUPABASE_URL;
++delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++delete process.env.SUPABASE_SERVICE_ROLE_KEY;
++delete process.env.OPENROUTER_API_KEY;
++delete process.env.NARA_API_KEY;
++
++const { createJiti } = await import("jiti");
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(projectRoot, "src"),
++    "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++  },
++});
++
++const consultationPath = path.join(projectRoot, "src/server/ai/model-catalog-consultation.ts");
++const catalogPath = path.join(projectRoot, "src/server/ai/free-model-catalog.ts");
++const gatewayPath = path.join(projectRoot, "src/server/ai/gateway-catalog.ts");
++
++const {
++  consultHqModelCatalog,
++  boundedCatalogFetch,
++  nodeCatalogTransport,
++} = await jiti.import(consultationPath);
++const { chooseModel, readRouterModelCatalog } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/model-router.ts"),
++);
++const { loadFreeModelCatalogSnapshot, resetFreeModelCatalogCache } = await jiti.import(catalogPath);
++const {
++  OPENROUTER_PUBLIC_MODELS_URL,
++  OPENROUTER_ACCOUNT_MODELS_URL,
++  NARA_PUBLIC_PLANS_URL,
++  NARA_ACCOUNT_MODELS_URL,
++} = await jiti.import(gatewayPath);
++
++const NOW = Date.parse("2026-10-02T12:00:00.000Z");
++const OBSERVED = new Date(NOW).toISOString();
++const SECRET = "synthetic-catalog-secret";
++const FILE_DATE = "2026-06-12T10:08:29.7657332-04:00";
++
++const realFetch = globalThis.fetch;
++globalThis.fetch = async () => {
++  throw new Error("global fetch must not run");
++};
++after(() => {
++  globalThis.fetch = realFetch;
++});
++
++function paidModel(id = "openai/gpt-4o-mini") {
++  return {
++    id,
++    pricing: { prompt: "0.000003", completion: "0.000015", request: "0.002" },
++    supported_parameters: ["tools"],
++  };
++}
++
++function feeOnlyModel() {
++  return {
++    id: "vendor/fee-only",
++    pricing: { prompt: "0", completion: "0", request: "0.002" },
++    supported_parameters: ["tools"],
++  };
++}
++
++function unknownModel() {
++  return { id: "vendor/mystery", pricing: { prompt: "0" } };
++}
++
++function zeroModel(id = "poolside/laguna-s.2:free") {
++  return {
++    id,
++    pricing: { prompt: "0", completion: "0", request: "0" },
++    supported_parameters: ["tools"],
++  };
++}
++
++function consult(overrides = {}) {
++  return consultHqModelCatalog({
++    gateway: "openrouter",
++    nowMs: NOW,
++    accountId: "acct-server-1",
++    workspaceId: "hq",
++    readCache: () => null,
++    authorize: async () => null,
++    readSecret: () => undefined,
++    ...overrides,
++  });
++}
++
++function assertDisplaySafe(value) {
++  const json = JSON.stringify(value);
++  assert.equal(json.includes(SECRET), false);
++  assert.equal(json.includes("authorization"), false);
++  assert.equal(json.includes("Bearer"), false);
++  assert.equal(json.includes("https://"), false);
++  assert.equal(json.includes("notToExceedCents"), false);
++  assert.equal(json.includes("billingKind"), false);
++  assert.equal(json.includes("OPENROUTER_API_KEY"), false);
++  assert.equal(json.includes("NARA_API_KEY"), false);
++}
++
++test("response contract returns paid and unknown rows without making them executable", async () => {
++  const calls = [];
++  const result = await consult({
++    sourceUrl: "https://evil.example/models",
++    baseUrl: "https://evil.example/v1",
++    transport: async (url, init) => {
++      calls.push({ url, method: init.method, redirect: init.redirect, authorization: init.headers.authorization ?? null });
++      assert.equal(init.signal.aborted, false);
++      return {
++        status: 200,
++        body: { data: [paidModel(), feeOnlyModel(), unknownModel(), zeroModel()] },
++      };
++    },
++  });
++
++  assert.equal(result.ok, true);
++  assert.equal(result.source, "catalog_get");
++  assert.equal(result.fetchCount, 1);
++  assert.equal(result.stale, false);
++  assert.deepEqual(result.access, {
++    public: true,
++    configured: false,
++    verified: false,
++    executionAuthorized: false,
++  });
++  assert.deepEqual(calls.map((call) => call.url), [OPENROUTER_PUBLIC_MODELS_URL]);
++  assert.equal(calls[0].method, "GET");
++  assert.equal(calls[0].redirect, "manual");
++  assert.equal(calls[0].authorization, null);
++
++  const paid = result.rows.find((row) => row.modelId === "openai/gpt-4o-mini");
++  const fee = result.rows.find((row) => row.modelId === "vendor/fee-only");
++  const unknown = result.rows.find((row) => row.modelId === "vendor/mystery");
++  const zero = result.rows.find((row) => row.modelId === "poolside/laguna-s.2:free");
++  assert.ok(paid && fee && unknown && zero);
++
++  assert.equal(paid.provider, "openrouter");
++  assert.equal(paid.label, "openai/gpt-4o-mini");
++  assert.equal(paid.price.kind, "positive_quote");
++  assert.equal(paid.price.promptUsdPerMTok, 3);
++  assert.equal(paid.price.completionUsdPerMTok, 15);
++  assert.equal(paid.price.perRequestUsd, 0.002);
++  assert.deepEqual(paid.units, {
++    prompt: "usd_per_million_tokens",
++    completion: "usd_per_million_tokens",
++    request: "usd_per_request",
++  });
++  assert.equal(paid.observedAt, OBSERVED);
++  assert.deepEqual(paid.quota, { kind: "unknown" });
++  assert.equal(paid.unavailableReason, "price_not_a_capability");
++  assert.equal(paid.access, "public");
++  assert.equal(paid.executable, false);
++  assert.equal(paid.executionAuthorized, false);
++  assert.equal(paid.stale, false);
++
++  assert.equal(fee.price.kind, "positive_quote");
++  assert.equal(fee.price.perRequestUsd, 0.002);
++  assert.equal(fee.units.request, "usd_per_request");
++  assert.equal(fee.units.prompt, "usd_per_million_tokens");
++  assert.equal(fee.executable, false);
++  assert.equal(fee.unavailableReason, "price_not_a_capability");
++
++  assert.equal(unknown.price.kind, "unknown");
++  assert.deepEqual(unknown.units, { prompt: "unknown", completion: "unknown", request: "unknown" });
++  assert.equal(unknown.unavailableReason, "price_unknown");
++  assert.equal(unknown.executable, false);
++  assert.equal(unknown.executionAuthorized, false);
++
++  assert.equal(zero.price.kind, "proven_zero");
++  assert.equal(zero.unavailableReason, "public_catalog_only");
++  assert.equal(zero.executable, false);
++  assert.equal(zero.executionAuthorized, false);
++  assertDisplaySafe(result);
++});
++
++test("existing owner gate refuses 401 and 403 before any catalog read", async () => {
++  let fetches = 0;
++  const fetch = async () => {
++    fetches += 1;
++    throw new Error("fetch must not run");
++  };
++  try {
++    globalThis.__ownerApiSessionTestResult = new Response(null, { status: 401 });
++    const unauthenticated = await consultHqModelCatalog({
++      gateway: "openrouter",
++      nowMs: NOW,
++      readCache: () => ({ provider: "openrouter", generatedAt: FILE_DATE, entries: [{ id: "vendor/hidden", name: "Hidden" }] }),
++      fetch,
++    });
++    assert.equal(unauthenticated.ok, false);
++    assert.equal(unauthenticated.reason, "unauthenticated");
++    assert.equal(unauthenticated.fetchCount, 0);
++    assert.deepEqual(unauthenticated.rows, []);
++
++    globalThis.__ownerApiSessionTestResult = new Response(null, { status: 403 });
++    const forbidden = await consultHqModelCatalog({
++      gateway: "openrouter",
++      nowMs: NOW,
++      fetch,
++    });
++    assert.equal(forbidden.ok, false);
++    assert.equal(forbidden.reason, "forbidden");
++    assert.equal(forbidden.fetchCount, 0);
++
++    globalThis.__ownerApiSessionTestResult = null;
++    const authorized = await consultHqModelCatalog({
++      gateway: "openrouter",
++      nowMs: NOW,
++      readCache: () => ({
++        provider: "openrouter",
++        generatedAt: new Date(NOW - 1000).toISOString(),
++        entries: [{ id: "vendor/from-cache", name: "Cache" }],
++      }),
++      fetch,
++    });
++    assert.equal(authorized.ok, true);
++    assert.equal(authorized.rows[0].modelId, "vendor/from-cache");
++    assert.equal(authorized.rows[0].observedAt, new Date(NOW - 1000).toISOString());
++    assert.equal(authorized.rows[0].provider, "openrouter");
++    assert.equal(fetches, 0);
++    assertDisplaySafe(unauthenticated);
++    assertDisplaySafe(forbidden);
++    assertDisplaySafe(authorized);
++  } finally {
++    delete globalThis.__ownerApiSessionTestResult;
++  }
++});
++
++test("absent secret still returns the public catalog and does not call the account URL", async () => {
++  const calls = [];
++  const result = await consult({
++    readSecret: () => undefined,
++    transport: async (url, init) => {
++      calls.push({ url, authorization: init.headers.authorization ?? null });
++      return { status: 200, body: { data: [paidModel(), unknownModel()] } };
++    },
++  });
++  assert.equal(result.ok, true);
++  assert.equal(result.access.configured, false);
++  assert.equal(result.access.verified, false);
++  assert.equal(result.access.executionAuthorized, false);
++  assert.deepEqual(calls.map((call) => call.url), [OPENROUTER_PUBLIC_MODELS_URL]);
++  assert.equal(calls[0].authorization, null);
++  assert.equal(result.rows.length, 2);
++  assert.equal(result.rows.every((row) => row.access === "public" && row.executable === false), true);
++  assertDisplaySafe(result);
++});
++
++test("unknown provider is refused before fetch or secret lookup", async () => {
++  let fetches = 0;
++  let secrets = 0;
++  const fetch = async () => {
++    fetches += 1;
++    throw new Error("fetch must not run");
++  };
++  const readSecret = () => {
++    secrets += 1;
++    return SECRET;
++  };
++  for (const gateway of ["anthropic", "mystery", ""]) {
++    const result = await consult({ gateway, fetch, readSecret });
++    assert.equal(result.ok, false);
++    assert.equal(result.reason, "unknown_provider");
++    assert.equal(result.fetchCount, 0);
++    assert.deepEqual(result.rows, []);
++    assertDisplaySafe(result);
++  }
++  assert.equal(fetches, 0);
++  assert.equal(secrets, 0);
++});
++
++test("timeout closes the consultation without a model call", { timeout: 5_000 }, async () => {
++  let calls = 0;
++  const result = await consult({
++    fetch: (_url, init) => new Promise((_resolve, reject) => {
++      calls += 1;
++      init.signal.addEventListener("abort", () => {
++        const error = new Error("aborted");
++        error.name = "AbortError";
++        reject(error);
++      });
++    }),
++  });
++  assert.equal(calls, 1);
++  assert.equal(result.ok, false);
++  assert.equal(result.reason, "timeout");
++  assert.equal(result.fetchCount, 1);
++  assert.deepEqual(result.rows, []);
++  assertDisplaySafe(result);
++});
++
++test("redirects are refused and not followed", async () => {
++  let calls = 0;
++  const redirected = await consult({
++    transport: async (url, init) => {
++      calls += 1;
++      assert.equal(url, OPENROUTER_PUBLIC_MODELS_URL);
++      assert.equal(init.method, "GET");
++      assert.equal(init.redirect, "manual");
++      return { status: 302, body: { data: [paidModel()] }, redirected: true };
++    },
++  });
++  assert.equal(calls, 1);
++  assert.equal(redirected.ok, false);
++  assert.equal(redirected.reason, "redirect_refused");
++  assert.deepEqual(redirected.rows, []);
++
++  const fetch = boundedCatalogFetch(async () => {
++    calls += 1;
++    return { status: 200, body: { data: [paidModel()] } };
++  });
++  const signal = new AbortController().signal;
++  const blocked = await fetch("https://evil.example/models", { method: "GET", headers: {}, signal });
++  const posted = await fetch(OPENROUTER_PUBLIC_MODELS_URL, { method: "POST", headers: {}, signal });
++  const chat = await fetch("https://openrouter.ai/api/v1/chat/completions", { method: "GET", headers: {}, signal });
++  assert.equal(blocked.status, 400);
++  assert.equal(posted.status, 400);
++  assert.equal(chat.status, 400);
++  assert.equal(calls, 1);
++});
++
++test("a configured account can be verified without authorizing execution", async () => {
++  const calls = [];
++  const result = await consult({
++    readSecret: (envName) => {
++      assert.equal(envName, "OPENROUTER_API_KEY");
++      return SECRET;
++    },
++    transport: async (url, init) => {
++      calls.push({ url, authorization: init.headers.authorization ?? null });
++      if (url === OPENROUTER_ACCOUNT_MODELS_URL) {
++        return { status: 200, body: { data: [zeroModel("acct/zero"), paidModel("acct/paid"), unknownModel()] } };
++      }
++      return { status: 200, body: { data: [paidModel()] } };
++    },
++  });
++  assert.equal(result.ok, true);
++  assert.equal(result.fetchCount, 2);
++  assert.deepEqual(result.access, {
++    public: true,
++    configured: true,
++    verified: true,
++    executionAuthorized: false,
++  });
++  assert.deepEqual(calls.map((call) => call.url), [OPENROUTER_PUBLIC_MODELS_URL, OPENROUTER_ACCOUNT_MODELS_URL]);
++  assert.equal(calls[0].authorization, null);
++  assert.equal(calls[1].authorization, `Bearer ${SECRET}`);
++
++  const publicPaid = result.rows.find((row) => row.modelId === "openai/gpt-4o-mini");
++  const verified = result.rows.find((row) => row.modelId === "acct/zero");
++  const configuredPaid = result.rows.find((row) => row.modelId === "acct/paid");
++  const configuredUnknown = result.rows.find((row) => row.modelId === "vendor/mystery");
++  assert.equal(publicPaid.access, "public");
++  assert.equal(verified.access, "verified");
++  assert.equal(verified.unavailableReason, "not_authorized");
++  assert.equal(verified.executable, false);
++  assert.equal(verified.executionAuthorized, false);
++  assert.equal(configuredPaid.access, "configured");
++  assert.equal(configuredPaid.unavailableReason, "price_not_a_capability");
++  assert.equal(configuredPaid.executable, false);
++  assert.equal(configuredUnknown.access, "configured");
++  assert.equal(configuredUnknown.price.kind, "unknown");
++  assert.equal(result.rows.every((row) => row.executionAuthorized === false && row.executable === false), true);
++  assertDisplaySafe(result);
++});
++
++test("Nara public plan announcement stays unknown quota and is not executable", async () => {
++  const calls = [];
++  const result = await consult({
++    gateway: "nara",
++    transport: async (url, init) => {
++      calls.push({ url, method: init.method, redirect: init.redirect });
++      return {
++        status: 200,
++        body: {
++          data: [{ code: "free", token_cap_daily: 7000000, rpm_limit: 15, models: ["auto/bynara"] }],
++        },
++      };
++    },
++  });
++  assert.equal(result.ok, true);
++  assert.deepEqual(calls, [{ url: NARA_PUBLIC_PLANS_URL, method: "GET", redirect: "manual" }]);
++  assert.equal(result.rows.length, 1);
++  assert.equal(result.rows[0].provider, "nara");
++  assert.equal(result.rows[0].modelId, "auto/bynara");
++  assert.equal(result.rows[0].price.kind, "unknown");
++  assert.deepEqual(result.rows[0].units, { prompt: "unknown", completion: "unknown", request: "unknown" });
++  assert.equal(result.rows[0].observedAt, OBSERVED);
++  assert.deepEqual(result.rows[0].quota, { kind: "unknown" });
++  assert.equal(result.rows[0].announcedQuotas.some((quota) => quota.amount === 7000000 && quota.unit === "tokens_per_day" && quota.source === "public-plan:free"), true);
++  assert.equal(result.rows[0].unavailableReason, "price_unknown");
++  assert.equal(result.rows[0].executable, false);
++  assert.equal(result.access.executionAuthorized, false);
++  assert.equal(result.access.verified, false);
++  assert.equal(JSON.stringify(result).includes(NARA_ACCOUNT_MODELS_URL), false);
++  assertDisplaySafe(result);
++});
++
++test("the router catalog read keeps providers apart and refreshes only a stale cache", async () => {
++  resetFreeModelCatalogCache();
++  const snapshot = loadFreeModelCatalogSnapshot();
++  assert.equal(snapshot.provider, "openrouter");
++  assert.equal(snapshot.generatedAt, FILE_DATE);
++  const openRouterIds = new Set(snapshot.entries.map((entry) => entry.id));
++  assert.ok(openRouterIds.size > 0);
++
++  let naraCalls = 0;
++  const nara = await readRouterModelCatalog({
++    gateway: "nara",
++    nowMs: NOW,
++    authorize: async () => null,
++    transport: async (url, init) => {
++      naraCalls += 1;
++      assert.equal(url, NARA_PUBLIC_PLANS_URL);
++      assert.equal(init.method, "GET");
++      assert.equal(init.redirect, "manual");
++      return {
++        status: 200,
++        body: { data: [{ code: "free", token_cap_daily: 7000000, rpm_limit: 15, models: ["auto/bynara"] }] },
++      };
++    },
++  });
++  assert.equal(naraCalls, 1);
++  assert.equal(nara.ok, true);
++  assert.equal(nara.refresh, "refreshed");
++  assert.equal(nara.rows.length, 1);
++  assert.equal(nara.rows[0].provider, "nara");
++  assert.equal(nara.rows[0].modelId, "auto/bynara");
++  assert.equal(openRouterIds.has(nara.rows[0].modelId), false);
++  assert.equal(nara.rows.every((row) => row.provider === "nara"), true);
++
++  const staleCalls = [];
++  const refreshed = await readRouterModelCatalog({
++    gateway: "openrouter",
++    nowMs: NOW,
++    authorize: async () => null,
++    readCache: () => ({
++      provider: "openrouter",
++      generatedAt: FILE_DATE,
++      entries: [{ id: "openrouter/old", name: "Old" }],
++    }),
++    transport: async (url, init) => {
++      staleCalls.push({ url, method: init.method, redirect: init.redirect });
++      return { status: 200, body: { data: [paidModel("openai/live")] } };
++    },
++  });
++  assert.deepEqual(staleCalls, [{ url: OPENROUTER_PUBLIC_MODELS_URL, method: "GET", redirect: "manual" }]);
++  assert.equal(refreshed.ok, true);
++  assert.equal(refreshed.refresh, "refreshed");
++  assert.equal(refreshed.stale, false);
++  assert.equal(refreshed.source, "catalog_get");
++  assert.equal(refreshed.fetchCount, 1);
++  assert.equal(refreshed.rows.some((row) => row.modelId === "openrouter/old"), false);
++  assert.equal(refreshed.rows[0].modelId, "openai/live");
++  assert.equal(refreshed.rows[0].provider, "openrouter");
++  assert.equal(refreshed.rows[0].observedAt, OBSERVED);
++  assert.equal(refreshed.rows[0].executable, false);
++
++  let freshCalls = 0;
++  const freshAt = new Date(NOW - 1000).toISOString();
++  const fresh = await readRouterModelCatalog({
++    gateway: "openrouter",
++    nowMs: NOW,
++    authorize: async () => null,
++    readCache: () => ({
++      provider: "openrouter",
++      generatedAt: freshAt,
++      entries: [{ id: "vendor/fresh", name: "Fresh" }],
++    }),
++    transport: async () => {
++      freshCalls += 1;
++      throw new Error("fresh cache must not fetch");
++    },
++  });
++  assert.equal(freshCalls, 0);
++  assert.equal(fresh.ok, true);
++  assert.equal(fresh.refresh, "not_needed");
++  assert.equal(fresh.stale, false);
++  assert.equal(fresh.fetchCount, 0);
++  assert.equal(fresh.rows[0].modelId, "vendor/fresh");
++  assert.equal(fresh.rows[0].provider, "openrouter");
++  assert.equal(fresh.rows[0].observedAt, freshAt);
++  assert.equal(fresh.rows[0].unavailableReason, "not_executable");
++  assert.deepEqual(fresh.rows[0].units, { prompt: "unknown", completion: "unknown", request: "unknown" });
++
++  let failedCalls = 0;
++  const failed = await readRouterModelCatalog({
++    gateway: "openrouter",
++    nowMs: NOW,
++    authorize: async () => null,
++    readSecret: () => SECRET,
++    readCache: () => ({
++      provider: "openrouter",
++      generatedAt: FILE_DATE,
++      entries: [{ id: "openrouter/old", name: "Old" }],
++    }),
++    transport: async (url, init) => {
++      failedCalls += 1;
++      assert.equal(url, OPENROUTER_PUBLIC_MODELS_URL);
++      assert.equal(init.method, "GET");
++      assert.equal(init.redirect, "manual");
++      return { status: 503, body: { data: [paidModel("openai/live")] } };
++    },
++  });
++  assert.equal(failedCalls, 1);
++  assert.equal(failed.ok, true);
++  assert.equal(failed.refresh, "failed");
++  assert.equal(failed.stale, true);
++  assert.equal(failed.source, "cache");
++  assert.equal(failed.fetchCount, 1);
++  assert.equal(failed.rows.length, 1);
++  assert.equal(failed.rows[0].modelId, "openrouter/old");
++  assert.equal(failed.rows[0].provider, "openrouter");
++  assert.equal(failed.rows[0].observedAt, FILE_DATE);
++  assert.equal(failed.rows[0].unavailableReason, "refresh_failed");
++  assert.equal(failed.rows[0].executable, false);
++  assert.equal(failed.access.verified, false);
++  assert.equal(failed.access.executionAuthorized, false);
++  assert.equal(JSON.stringify(failed).includes(OBSERVED), false);
++  assert.equal(JSON.stringify(failed).includes(SECRET), false);
++  assert.equal(loadFreeModelCatalogSnapshot().generatedAt, FILE_DATE);
++
++  const held = chooseModel({
++    message: "Reformule cette phrase simplement.",
++    requestedMode: "economy",
++  });
++  assert.equal(held.executedModelId, null);
++  assert.equal(held.accountingEffect, "none");
++  assert.equal(naraCalls, 1);
++});
++
++test("a cache reader exception stays closed and does not fetch", async () => {
++  let fetches = 0;
++  const result = await consult({
++    readCache: () => {
++      throw new Error(`cache leaked ${SECRET}`);
++    },
++    fetch: async () => {
++      fetches += 1;
++      return { status: 200, body: { data: [paidModel()] } };
++    },
++  });
++  assert.equal(result.ok, false);
++  assert.equal(result.reason, "unreadable");
++  assert.equal(result.fetchCount, 0);
++  assert.deepEqual(result.rows, []);
++  assert.equal(fetches, 0);
++  assertDisplaySafe(result);
++});
++
++test("synchronous reader and fetch failures stay closed", async () => {
++  let fetches = 0;
++  const secretFailure = await consult({
++    readSecret: () => {
++      throw new Error(`reader leaked ${SECRET}`);
++    },
++    fetch: async () => {
++      fetches += 1;
++      return { status: 200, body: { data: [paidModel()] } };
++    },
++  });
++  assert.equal(secretFailure.ok, false);
++  assert.equal(secretFailure.reason, "unreadable");
++  assert.equal(secretFailure.fetchCount, 0);
++  assert.equal(fetches, 0);
++  assertDisplaySafe(secretFailure);
++
++  const fetchFailure = await consult({
++    fetch: () => {
++      throw new Error(`fetch leaked ${SECRET}`);
++    },
++  });
++  assert.equal(fetchFailure.ok, false);
++  assert.equal(fetchFailure.reason, "unreadable");
++  assert.equal(fetchFailure.fetchCount, 1);
++  assertDisplaySafe(fetchFailure);
++
++  const clock = await consult({
++    nowMs: Number.NaN,
++    fetch: async () => {
++      fetches += 1;
++      return { status: 200, body: { data: [] } };
++    },
++  });
++  assert.equal(clock.ok, false);
++  assert.equal(clock.reason, "unreadable");
++  assert.equal(fetches, 0);
++
++  const noTransport = await consult({ fetch: undefined, transport: undefined });
++  assert.equal(noTransport.ok, false);
++  assert.equal(noTransport.reason, "unreadable");
++  assert.equal(noTransport.fetchCount, 0);
++});
++
++test("the real catalog transport is GET-only and does not follow redirects", async () => {
++  let seen = null;
++  const transport = nodeCatalogTransport(async (url, init) => {
++    seen = { url: String(url), method: init.method, redirect: init.redirect };
++    return new Response(JSON.stringify({ data: [unknownModel()] }), {
++      status: 200,
++      headers: { "content-type": "application/json" },
++    });
++  });
++  const result = await consult({ transport });
++  assert.equal(seen.method, "GET");
++  assert.equal(seen.redirect, "manual");
++  assert.equal(seen.url, OPENROUTER_PUBLIC_MODELS_URL);
++  assert.equal(result.ok, true);
++  assert.equal(result.rows[0].price.kind, "unknown");
++  assert.equal(result.rows[0].executable, false);
++
++  const opaque = nodeCatalogTransport(async () => ({
++    status: 0,
++    type: "opaqueredirect",
++    redirected: false,
++    async text() {
++      return JSON.stringify({ data: [paidModel()] });
++    },
++  }));
++  const refused = await consult({ transport: opaque });
++  assert.equal(refused.ok, false);
++  assert.equal(refused.reason, "redirect_refused");
++  assert.deepEqual(refused.rows, []);
++
++  const source = readFileSync(consultationPath, "utf8");
++  assert.equal(source.includes("process.env"), false);
++  assert.equal(source.includes("chat/completions"), false);
++  assert.equal(source.includes("/v1/messages"), false);
++});
+diff --git a/src/server/ai/model-catalog-consultation.ts b/src/server/ai/model-catalog-consultation.ts
+new file mode 100644
+index 0000000..a2d1898
+--- /dev/null
++++ b/src/server/ai/model-catalog-consultation.ts
+@@ -0,0 +1,511 @@
++/**
++ * Server consultation of the gateway catalog for the existing HQ model surfaces.
++ *
++ * There is no AI-model HTTP route. Inventory `/api/inventory/vehicle-catalog`
++ * is a vehicle make/model list and is not this catalog. This function is the
++ * connection point: the existing owner gate, the existing provider registry,
++ * the existing free-catalog cache, and `normalizeGatewayCatalog`.
++ *
++ * It does not add a route, a router, or an execution right. Paid rows and
++ * unknown prices are returned for display and stay non-executable.
++ * The free-model file belongs to OpenRouter only. A stale snapshot can be
++ * refreshed by one bounded catalog GET. If that GET fails, the original
++ * timestamp is kept and the rows stay stale.
++ */
++
++import "server-only";
++
++import { requireOwnerApiSession } from "@/server/auth/owner";
++import {
++  createStaticProviderRegistry,
++  type ProviderRegistry,
++} from "@/server/agents/models/provider-registry-contract";
++import {
++  OPENROUTER_MODELS_API_ENDPOINT,
++  type ModelProviderDescriptor,
++  type RuntimeAdapterDescriptor,
++} from "@/server/agents/models/model-provider-contract";
++import { TARIFF_MAX_AGE_MS } from "@/server/ai/server-capability-catalog";
++import { loadFreeModelCatalogSnapshot } from "@/server/ai/free-model-catalog";
++import {
++  NARA_ACCOUNT_MODELS_URL,
++  NARA_API_KEY_ENV,
++  NARA_BASE_URL,
++  NARA_PUBLIC_PLANS_URL,
++  OPENROUTER_ACCOUNT_MODELS_URL,
++  OPENROUTER_API_KEY_ENV,
++  OPENROUTER_BASE_URL,
++  OPENROUTER_PUBLIC_MODELS_URL,
++  normalizeGatewayCatalog,
++  type GatewayCatalogRequest,
++  type GatewayFetch,
++  type GatewayId,
++  type GatewayModelObservation,
++  type PriceObservation,
++} from "@/server/ai/gateway-catalog";
++
++export type CatalogConsultationRow = {
++  provider: string;
++  modelId: string;
++  label: string;
++  price: PriceObservation;
++  /** Prompt and completion are USD per million tokens. The request fee is USD per request. */
++  units: CatalogPriceUnits;
++  observedAt: string | null;
++  quota: { kind: "unknown" };
++  announcedQuotas: readonly { amount: number; unit: string; source: string }[];
++  unavailableReason: string;
++  /** public list, configured secret, or verified account observation. Never execution. */
++  access: "public" | "configured" | "verified";
++  executable: false;
++  executionAuthorized: false;
++  stale: boolean;
++};
++
++export type CatalogConsultation =
++  | {
++      ok: true;
++      rows: readonly CatalogConsultationRow[];
++      access: {
++        public: true;
++        configured: boolean;
++        verified: boolean;
++        executionAuthorized: false;
++      };
++      stale: boolean;
++      source: "cache" | "catalog_get";
++      /** Fresh cache is not refetched. A failed refresh keeps the previous rows. */
++      refresh: "not_needed" | "cache_only" | "refreshed" | "failed";
++      fetchCount: number;
++    }
++  | {
++      ok: false;
++      reason: "unauthenticated" | "forbidden" | "unknown_provider" | "timeout" | "redirect_refused" | "unreadable" | "source_rejected";
++      rows: readonly [];
++      fetchCount: number;
++    };
++
++export type CatalogTransport = (
++  url: string,
++  init: {
++    method: "GET";
++    redirect: "manual";
++    headers: Readonly<Record<string, string>>;
++    signal: AbortSignal;
++  },
++) => Promise<{ status: number; body: unknown; redirected?: boolean }>;
++
++export type CatalogPriceUnits = {
++  prompt: "usd_per_million_tokens" | "unknown";
++  completion: "usd_per_million_tokens" | "unknown";
++  request: "usd_per_request" | "unknown";
++};
++
++const KNOWN_PRICE_UNITS: CatalogPriceUnits = {
++  prompt: "usd_per_million_tokens",
++  completion: "usd_per_million_tokens",
++  request: "usd_per_request",
++};
++
++const UNKNOWN_PRICE_UNITS: CatalogPriceUnits = {
++  prompt: "unknown",
++  completion: "unknown",
++  request: "unknown",
++};
++
++type CacheView = {
++  provider: GatewayId;
++  generatedAt: string | null;
++  entries: readonly { id: string; name?: string }[];
++};
++
++export type CatalogRefreshPolicy = "if-stale" | "cache-only";
++
++const OPENROUTER_CONNECTOR: ModelProviderDescriptor = {
++  id: "openrouter",
++  label: "OpenRouter",
++  kind: "router",
++  trustLevel: "allowlisted",
++  apiKeyEnvVar: OPENROUTER_API_KEY_ENV,
++  baseUrl: OPENROUTER_BASE_URL,
++  catalogSource: {
++    kind: "openrouter-models-api",
++    endpoint: OPENROUTER_MODELS_API_ENDPOINT,
++    refreshPolicy: "manual-refresh",
++  },
++  supportsMcp: false,
++  supportsToolUse: true,
++};
++
++const NARA_CONNECTOR: ModelProviderDescriptor = {
++  id: "nara",
++  label: "NaraRouter",
++  kind: "router",
++  trustLevel: "allowlisted",
++  apiKeyEnvVar: NARA_API_KEY_ENV,
++  baseUrl: NARA_BASE_URL,
++  catalogSource: {
++    kind: "manual",
++    refreshPolicy: "manual-refresh",
++  },
++  supportsMcp: false,
++  supportsToolUse: false,
++};
++
++/** Existing HTTP adapter shape. Registered for lookup only — consult never invokes it. Nara has no execution adapter. */
++const OPENROUTER_ADAPTER: RuntimeAdapterDescriptor = {
++  id: "openrouter-http",
++  label: "OpenRouter HTTP",
++  kind: "http-api",
++  providerId: "openrouter",
++  sentinelle: { defaultZone: "green", requiresApprovalForToolUse: false },
++  ledgerRequired: true,
++};
++
++function catalogRegistry(): ProviderRegistry | null {
++  const created = createStaticProviderRegistry({
++    providers: [OPENROUTER_CONNECTOR, NARA_CONNECTOR],
++    models: [],
++    adapters: [OPENROUTER_ADAPTER],
++  });
++  return created.ok ? created.registry : null;
++}
++
++function failure(reason: Extract<CatalogConsultation, { ok: false }>["reason"], fetchCount: number): CatalogConsultation {
++  return { ok: false, reason, rows: [], fetchCount };
++}
++
++function isStale(observedAt: string | null, nowMs: number): boolean {
++  if (!observedAt) return true;
++  const parsed = Date.parse(observedAt);
++  if (!Number.isFinite(parsed) || parsed > nowMs) return true;
++  return nowMs - parsed > TARIFF_MAX_AGE_MS;
++}
++
++function unitsFor(price: PriceObservation): CatalogPriceUnits {
++  return price.kind === "unknown" ? UNKNOWN_PRICE_UNITS : KNOWN_PRICE_UNITS;
++}
++
++function unavailableReason(observation: GatewayModelObservation): string {
++  if (observation.price.kind === "unknown") return "price_unknown";
++  if (observation.price.kind === "positive_quote") return "price_not_a_capability";
++  if (observation.state === "listed") return "public_catalog_only";
++  if (observation.state === "connected") return "not_authorized";
++  return observation.withheld ?? "not_executable";
++}
++
++function rowFromObservation(
++  observation: GatewayModelObservation,
++  provider: string,
++  observedAt: string,
++  access: CatalogConsultationRow["access"],
++  stale: boolean,
++): CatalogConsultationRow {
++  return {
++    provider,
++    modelId: observation.modelId,
++    label: observation.modelId,
++    price: observation.price,
++    units: unitsFor(observation.price),
++    observedAt,
++    quota: { kind: "unknown" },
++    announcedQuotas: observation.announcedQuotas,
++    unavailableReason: unavailableReason(observation),
++    access,
++    executable: false,
++    executionAuthorized: false,
++    stale,
++  };
++}
++
++function allowlisted(url: string): boolean {
++  try {
++    const parsed = new URL(url);
++    if (parsed.username !== "" || parsed.password !== "") return false;
++    const path = `${parsed.origin}${parsed.pathname}`;
++    return path === OPENROUTER_PUBLIC_MODELS_URL
++      || path === OPENROUTER_ACCOUNT_MODELS_URL
++      || path === NARA_PUBLIC_PLANS_URL
++      || path === NARA_ACCOUNT_MODELS_URL;
++  } catch {
++    return false;
++  }
++}
++
++/**
++ * GET catalog transport. Redirects are not followed. The URL must already be
++ * on the server allowlist. Tests inject the transport; this does not run by itself.
++ */
++export function boundedCatalogFetch(transport: CatalogTransport): GatewayFetch {
++  return async (url, init) => {
++    if (init.method !== "GET" || !allowlisted(url)) {
++      return { status: 400, body: null };
++    }
++    const response = await transport(url, {
++      method: "GET",
++      redirect: "manual",
++      headers: init.headers,
++      signal: init.signal,
++    });
++    if (response.redirected || (response.status >= 300 && response.status < 400)) {
++      return { status: 302, body: null };
++    }
++    return { status: response.status, body: response.body };
++  };
++}
++
++function accessFor(
++  observation: GatewayModelObservation,
++  account: boolean,
++): CatalogConsultationRow["access"] {
++  if (!account) return "public";
++  return observation.state === "connected" ? "verified" : "configured";
++}
++
++async function authorizeOwner(): Promise<{ status: number } | null> {
++  const response = await requireOwnerApiSession();
++  if (!response) return null;
++  return { status: typeof response.status === "number" ? response.status : 401 };
++}
++
++/**
++ * Real catalog GET. Redirects are not followed: opaque redirects and 3xx
++ * become a refused redirect with no second request. Callers must pass this
++ * transport explicitly. Consultation does not call it on its own.
++ */
++export function nodeCatalogTransport(fetchImpl: typeof fetch = globalThis.fetch): CatalogTransport {
++  return async (url, init) => {
++    const response = await fetchImpl(url, {
++      method: "GET",
++      redirect: "manual",
++      headers: { ...init.headers },
++      signal: init.signal,
++    });
++    const redirected = response.redirected
++      || response.type === "opaqueredirect"
++      || response.status === 0
++      || (response.status >= 300 && response.status < 400);
++    if (redirected) return { status: 302, body: null, redirected: true };
++    const text = await response.text();
++    let body: unknown = null;
++    if (text.length > 0) {
++      try {
++        body = JSON.parse(text);
++      } catch {
++        body = null;
++      }
++    }
++    return { status: response.status, body, redirected: false };
++  };
++}
++
++function sourceUrl(gateway: GatewayId, account: boolean): string {
++  if (gateway === "openrouter") {
++    return account ? OPENROUTER_ACCOUNT_MODELS_URL : OPENROUTER_PUBLIC_MODELS_URL;
++  }
++  return account ? NARA_ACCOUNT_MODELS_URL : NARA_PUBLIC_PLANS_URL;
++}
++
++export async function consultHqModelCatalog(input: {
++  gateway: string;
++  nowMs: number;
++  accountId?: string | null;
++  workspaceId?: string;
++  fetch?: GatewayFetch;
++  transport?: CatalogTransport;
++  readSecret?: (envName: string) => string | undefined;
++  /** Scoped by gateway. A snapshot for another provider is ignored. */
++  readCache?: (gateway: string) => CacheView | null;
++  /**
++   * `if-stale` performs one bounded catalog GET when the scoped cache is missing or older than 24h.
++   * `cache-only` never fetches. The default is `if-stale` when a transport is supplied, otherwise `cache-only`.
++   */
++  refresh?: CatalogRefreshPolicy;
++  authorize?: () => Promise<{ status: number } | null>;
++}): Promise<CatalogConsultation> {
++  const authorize = input.authorize ?? authorizeOwner;
++  let auth: { status: number } | null;
++  try {
++    auth = await authorize();
++  } catch {
++    return failure("unreadable", 0);
++  }
++  if (auth) return failure(auth.status === 403 ? "forbidden" : "unauthenticated", 0);
++
++  const registry = catalogRegistry();
++  const provider = registry?.getProvider(input.gateway);
++  if (!provider || (provider.id !== "openrouter" && provider.id !== "nara")) {
++    return failure("unknown_provider", 0);
++  }
++  if (provider.baseUrl !== (provider.id === "openrouter" ? OPENROUTER_BASE_URL : NARA_BASE_URL)) {
++    return failure("source_rejected", 0);
++  }
++  if (!Number.isFinite(input.nowMs)) return failure("unreadable", 0);
++  const gateway = provider.id === "nara" ? "nara" : "openrouter";
++
++  let secret: string | undefined;
++  try {
++    secret = input.readSecret?.(provider.apiKeyEnvVar ?? "");
++  } catch {
++    return failure("unreadable", 0);
++  }
++  const configured = typeof secret === "string" && secret.length > 0;
++
++  let cache: CacheView | null;
++  try {
++    const readCache = input.readCache ?? defaultCache;
++    cache = scopedCache(gateway, readCache(gateway));
++  } catch {
++    return failure("unreadable", 0);
++  }
++  const cacheIsFresh = cache !== null && !isStale(cache.generatedAt, input.nowMs);
++  if (cache && cacheIsFresh) {
++    return cacheConsultation(cache, configured, false, "not_executable", 0, "not_needed");
++  }
++
++  const canRefresh = input.transport !== undefined || input.fetch !== undefined;
++  const refresh = input.refresh ?? (canRefresh ? "if-stale" : "cache-only");
++  if (refresh === "cache-only" || !canRefresh) {
++    if (cache) return cacheConsultation(cache, configured, true, "stale_cache", 0, "cache_only");
++    return failure("unreadable", 0);
++  }
++
++  const injected = input.fetch;
++  const inner: CatalogTransport | null = input.transport
++    ?? (injected
++      ? async (url, init) => injected(url, { method: "GET", headers: init.headers, signal: init.signal })
++      : null);
++  if (!inner) return failure("unreadable", 0);
++  const catalogFetch = boundedCatalogFetch(inner);
++
++  let redirectSeen = false;
++  const guarded: GatewayFetch = async (url, init) => {
++    const response = await catalogFetch(url, init);
++    if (response.status >= 300 && response.status < 400) redirectSeen = true;
++    return response;
++  };
++
++  const observedAt = new Date(input.nowMs).toISOString();
++  const common: Omit<GatewayCatalogRequest, "sourceUrl" | "observationClass"> = {
++    gateway,
++    baseUrl: provider.baseUrl ?? "",
++    apiKeyEnvVar: provider.apiKeyEnvVar ?? OPENROUTER_API_KEY_ENV,
++    accountId: input.accountId ?? null,
++    workspaceId: input.workspaceId ?? "hq",
++    catalogRevision: "consultation",
++    observedAt,
++    timeoutMs: 1000,
++    fetch: guarded,
++    readSecret: input.readSecret,
++  };
++
++  const pub = await normalizeGatewayCatalog({
++    ...common,
++    sourceUrl: sourceUrl(gateway, false),
++    observationClass: "public_list",
++  });
++  if (!pub.ok) {
++    const reason = redirectSeen
++      ? "redirect_refused"
++      : pub.reason === "timeout"
++        ? "timeout"
++        : pub.reason === "source_rejected"
++          ? "source_rejected"
++          : "unreadable";
++    if (cache) return cacheConsultation(cache, configured, true, "refresh_failed", pub.fetchCount, "failed");
++    return failure(reason, pub.fetchCount);
++  }
++
++  let fetchCount = pub.fetchCount;
++  let verified = false;
++  const rows = pub.observations.map((observation) =>
++    rowFromObservation(observation, gateway, observedAt, "public", false));
++
++  if (configured) {
++    const account = await normalizeGatewayCatalog({
++      ...common,
++      sourceUrl: sourceUrl(gateway, true),
++      observationClass: "account_entitlement",
++    });
++    fetchCount += account.fetchCount;
++    if (!account.ok) {
++      if (cache) return cacheConsultation(cache, configured, true, "refresh_failed", fetchCount, "failed");
++      if (redirectSeen) return failure("redirect_refused", fetchCount);
++      if (account.reason === "timeout") return failure("timeout", fetchCount);
++      return failure("unreadable", fetchCount);
++    }
++    verified = account.observations.some((observation) => observation.state === "connected");
++    for (const observation of account.observations) {
++      rows.push(rowFromObservation(
++        observation,
++        gateway,
++        observedAt,
++        accessFor(observation, true),
++        false,
++      ));
++    }
++  }
++
++  return {
++    ok: true,
++    rows,
++    access: { public: true, configured, verified, executionAuthorized: false },
++    stale: false,
++    source: "catalog_get",
++    refresh: "refreshed",
++    fetchCount,
++  };
++}
++
++function scopedCache(gateway: GatewayId, cache: CacheView | null): CacheView | null {
++  if (!cache || cache.provider !== gateway) return null;
++  if (!cache.generatedAt && cache.entries.length === 0) return null;
++  return cache;
++}
++
++function cacheConsultation(
++  cache: CacheView,
++  configured: boolean,
++  stale: boolean,
++  unavailableReason: string,
++  fetchCount: number,
++  refresh: "not_needed" | "cache_only" | "failed",
++): CatalogConsultation {
++  const rows = cache.entries.map((entry): CatalogConsultationRow => ({
++    provider: cache.provider,
++    modelId: entry.id,
++    label: entry.name && entry.name.length > 0 ? entry.name : entry.id,
++    price: { kind: "unknown" },
++    units: UNKNOWN_PRICE_UNITS,
++    observedAt: cache.generatedAt,
++    quota: { kind: "unknown" },
++    announcedQuotas: [],
++    unavailableReason,
++    access: "public",
++    executable: false,
++    executionAuthorized: false,
++    stale,
++  }));
++  return {
++    ok: true,
++    rows,
++    access: { public: true, configured, verified: false, executionAuthorized: false },
++    stale,
++    source: "cache",
++    refresh,
++    fetchCount,
++  };
++}
++
++/** OpenRouter file only. Nara has no snapshot here, so the file is not relabeled. */
++function defaultCache(gateway: string): CacheView | null {
++  if (gateway !== "openrouter") return null;
++  const snapshot = loadFreeModelCatalogSnapshot();
++  if (snapshot.provider !== "openrouter") return null;
++  if (!snapshot.generatedAt && snapshot.entries.length === 0) return null;
++  return {
++    provider: "openrouter",
++    generatedAt: snapshot.generatedAt,
++    entries: snapshot.entries.map((entry) => ({ id: entry.id, name: entry.name })),
++  };
++}
+diff --git a/src/server/ai/model-config.ts b/src/server/ai/model-config.ts
+index 2d659da..495c9ee 100644
+--- a/src/server/ai/model-config.ts
++++ b/src/server/ai/model-config.ts
+@@ -1,5 +1,6 @@
+ import type { ModelProfile } from "@/core/types";
+ import { modelProfiles } from "@/features/hq/seed";
++import type { consultHqModelCatalog } from "@/server/ai/model-catalog-consultation";
+ 
+ /**
+  * OpenRouter gateway — unified access to 200+ models via a single API key.
+@@ -38,6 +39,17 @@ export function resolveModelProfileOrFallback(
+  * Availability is a yes/no on the requested id. An unavailable model is not
+  * replaced by another paid model.
+  */
++/**
++ * Read-only catalog of the model service. Loaded only when a caller asks for
++ * the catalog. `chooseModel` does not call this and does not execute the rows.
++ */
++export async function readServerModelCatalog(
++  input: Parameters<typeof consultHqModelCatalog>[0],
++): Promise<Awaited<ReturnType<typeof consultHqModelCatalog>>> {
++  const { consultHqModelCatalog: consult } = await import("@/server/ai/model-catalog-consultation");
++  return consult(input);
++}
++
+ export function pickAvailableModelId(
+   primaryId: string,
+   unavailableModelIds: ReadonlySet<string> = new Set(),
+diff --git a/src/server/ai/model-router.ts b/src/server/ai/model-router.ts
+index e5c7cd4..b0bc435 100644
+--- a/src/server/ai/model-router.ts
++++ b/src/server/ai/model-router.ts
+@@ -3,6 +3,7 @@ import {
+   ECONOMY_MODEL_ID,
+   LONG_CONTEXT_MODEL_ID,
+   PREMIUM_MODEL_ID,
++  readServerModelCatalog,
+   resolveModelProfile,
+ } from "@/server/ai/model-config";
+ import {
+@@ -436,6 +437,16 @@ function isNonApiRefusal(
+   return "disposition" in assessment && assessment.disposition === "non_api";
+ }
+ 
++/**
++ * Catalog read for the existing model service. Selection does not call this.
++ * Rows stay non-executable; this function does not send a model request.
++ */
++export function readRouterModelCatalog(
++  input: Parameters<typeof readServerModelCatalog>[0],
++): ReturnType<typeof readServerModelCatalog> {
++  return readServerModelCatalog(input);
++}
++
+ export function chooseModel(input: ModelRouteInput): ModelRouteDecision {
+   const unavailable = new Set(input.unavailableModelIds ?? []);
+   const keywordRoute = routeByKeywords(input);
+-- 
+2.43.0
+

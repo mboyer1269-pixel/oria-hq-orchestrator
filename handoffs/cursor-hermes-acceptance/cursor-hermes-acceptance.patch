@@ -1,0 +1,486 @@
+From ba1c208bf7b99a9d5ff42d6f760871d17b3763fc Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 18:19:55 +0000
+Subject: [PATCH 1/2] Add an executable Hermes admission recipe without
+ changing HQ services.
+
+The recipe observes the existing development and OpenHands contracts and leaves the missing adapter blocked.
+---
+ docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md |  38 ++
+ proofs/hermes-hq-acceptance.mjs             | 393 ++++++++++++++++++++
+ 2 files changed, 431 insertions(+)
+ create mode 100644 docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
+ create mode 100644 proofs/hermes-hq-acceptance.mjs
+
+diff --git a/docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md b/docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
+new file mode 100644
+index 0000000..834245f
+--- /dev/null
++++ b/docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
+@@ -0,0 +1,38 @@
++# Recette adversariale — raccordement Hermes/HQ
++
++Base produit `f0e42a531c1a1e2d47726f870d15f0f905f367d8`, arbre `12f387bccc0687f92c28e6e1abf11f9cb4a4365e`. Aucun service, routeur, UI ni migration n'est modifié. Le lot RLS accepté n'est pas rejoué. Ceci n'est pas une session OAuth, un JWT, une infrastructure OpenHands, ni un modèle.
++
++Hermes orchestre. HQ autorise et conserve la mission. OpenHands exécute. Un argument du modèle ne confirme pas.
++
++## Commande
++
++Depuis la racine produit :
++
++`node --test --test-concurrency=1 proofs/hermes-hq-acceptance.mjs`
++
++Le verdict honnête de cette commande, tant que `HERMES_HQ_ADAPTER` est absent, est :
++
++`HERMES_HQ_RECETTE contrat_simule=ok adapter=bloque infrastructure=non_execute modele_reel=non_execute`
++
++Exit 0 signifie que les effets HQ simulés tiennent et que l'adaptateur n'a pas tourné. Ce n'est pas un raccordement qualifié. L'injection est le chemin `HERMES_HQ_ADAPTER` vers un module qui exporte `runHermesHqJoin`. Fichier absent ou export absent : `blocked`. Cette recette ne l'appelle pas.
++
++## Matrice
++
++| Scénario | Appel réel | Effet attendu | Preuve |
++| --- | --- | --- | --- |
++| Identité du modèle contre le contexte de confiance | `POST /api/missions/development` avec `createdBy`, `workspaceId`, `actorId` ou `confirm` ; `POST /api/orchestration/openhands` `prepare` avec `actorId`, `workspaceId` ou `endpoint` | HTTP 400, zéro mission, le service de confirmation n'est pas appelé | `proofs/hermes-hq-acceptance.mjs`, handlers et services réels, session synthétique |
++| Création distincte de la confirmation | POST développement valide, puis `prepare`, puis `confirm` avec un hash qui n'est pas celui préparé | Brouillon, `executionRequested` false, `createdBy` égal à l'id de session, zéro ledger ; préparation `externalEffectAllowed` false ; hash étranger HTTP 409 `dossier_changed`, toujours zéro ledger | même fichier |
++| Réponse perdue après effet | l'écriture du brouillon réussit puis lève une erreur | HTTP 200, corps `outcome_unknown`, une ligne reste, GET retrouve le même id, le nouvel essai ne crée pas une seconde ligne, le secret n'apparaît pas | même fichier |
++| Deux confirmations simultanées | deux `confirm` avec le hash préparé | une seule `reserved`, les deux `externalEffectAllowed` false, une ligne d'autorité liée à l'acteur et au workspace de session, rejeu `already_reserved`, aucune clé de lancement | même fichier |
++| Workspace, destination ou exécuteur imposés | champs en trop ; configuration serveur `executorVersion` `9.9.9` | HTTP 400 avant le service ; lancement configuré `unavailable`, magasin non touché, la version absente du résultat | même fichier |
++| Deadline sur le corps | corps OpenHands qui ne se termine pas | HTTP 400 `invalid_request` entre 4,5 s et 8 s, service et lancement non appelés | même fichier, durée observée 5023 ms |
++| Secret dans l'erreur | la configuration lève une erreur contenant un secret synthétique, ou un JSON invalide le contient | `unavailable` ou `reconciliation_required`, `externalEffectAllowed` false, secret absent, zéro lecture du magasin | même fichier |
++| Coût hors autorisation | dossier réservé à 100 cents, configuration serveur à 40 cents, confirmation avec le hash de la prévisualisation concordante | prévisualisation concordante `prepared` sans écriture ; écart `ineligible_mission`, `externalEffectAllowed` false, zéro écriture | même fichier |
++| Adaptateur Hermes | variable absente, chemin absent | `blocked`. Un fichier factice qui exporte la fonction est seulement détecté, pas exécuté comme raccordement | même fichier |
++| Infrastructure et modèle | aucun | `fetch` n'est pas appelé | même fichier, `networkCalls` 0 |
++
++Les tests déjà qualifiés des handlers injectés, de la frontière propriétaire et des services de confirmation ou de lancement ne sont pas recopiés ici.
++
++## Hors de cette recette
++
++Pas de VPS, pas de compte réel, pas de modèle payant, pas de nouveau secret, pas de port public, pas de déploiement. L'image Hermes `sha256:374874de079dc821db4cf9e67df8c8eee8064deb51c5b64524d3b130967045c1` et les capacités annoncées ne sont pas rejouées. Le verdict sur le commit du constructeur attend ce commit.
+diff --git a/proofs/hermes-hq-acceptance.mjs b/proofs/hermes-hq-acceptance.mjs
+new file mode 100644
+index 0000000..dbcaf10
+--- /dev/null
++++ b/proofs/hermes-hq-acceptance.mjs
+@@ -0,0 +1,393 @@
++#!/usr/bin/env node
++// Adversarial recipe for the existing HQ admission and launch contracts.
++// Synthetic identities only. No OAuth, JWT, VPS, model, or Docker.
++// A missing Hermes adapter stays blocked. It is not a passed connection.
++
++import assert from "node:assert/strict";
++import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import test from "node:test";
++import { pathToFileURL } from "node:url";
++import { createJiti } from "jiti";
++
++const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(root, "src"),
++    "server-only": path.join(root, "src/scripts/smoke/server-only-stub.mjs"),
++  },
++});
++const source = (relative) => path.join(root, relative);
++const { createDevelopmentHandlers } = await jiti.import(source("src/app/api/missions/development/handlers.ts"));
++const { createDevelopmentService } = await jiti.import(source("src/server/missions/development-mission.ts"));
++const { createOpenHandsHandler } = await jiti.import(source("src/app/api/orchestration/openhands/handler.ts"));
++const { createOpenHandsConfirmationService } = await jiti.import(source("src/server/missions/openhands-confirmation.ts"));
++const { createOpenHandsAuthorityStore } = await jiti.import(source("src/server/missions/openhands-authority-store.ts"));
++const { OPENHANDS_RESERVATION_KEY } = await jiti.import(source("src/server/missions/openhands-reservation.ts"));
++const { buildOpenHandsSubmission } = await jiti.import(source("src/server/missions/openhands-submission.ts"));
++const { createConfiguredOpenHandsLaunch } = await jiti.import(source("src/server/missions/openhands-configured-launch.ts"));
++const { OPENHANDS_LAUNCH_KEY } = await jiti.import(source("src/server/missions/openhands-launch.ts"));
++
++const origin = "https://hq.test";
++const trust = { actorId: "synthetic-session-owner", workspaceId: "synthetic-workspace", modeId: "hq" };
++const secret = "synthetic-hermes-secret-do-not-leak";
++const serverConfig = {
++  imageDigest: `sha256:${"ab".repeat(32)}`,
++  executorVersion: "1.50.0",
++  runnerId: "synthetic-runner",
++  permissionPolicy: "deny",
++  maxCostCents: 100,
++  maxTokens: 1000,
++  maxIterations: 2,
++  timeoutSeconds: 30,
++  hardTokenLimitEnforced: false,
++};
++const budget = { maxCostCents: 100, maxTokens: 1000, maxIterations: 2, timeoutSeconds: 30 };
++
++let networkCalls = 0;
++globalThis.fetch = () => {
++  networkCalls += 1;
++  throw new Error("network_forbidden");
++};
++
++function ledger() {
++  const rows = new Map();
++  return {
++    rows,
++    from(table) {
++      if (table !== "action_ledger") throw new Error(`unexpected table ${table}`);
++      return {
++        upsert(row, options) {
++          if (!(options?.ignoreDuplicates && rows.has(row.id))) rows.set(row.id, structuredClone(row));
++          return Promise.resolve({ error: null });
++        },
++        select() {
++          const preds = [];
++          const api = {
++            eq(column, value) { preds.push([column, value]); return api; },
++            maybeSingle() {
++              const found = [...rows.values()].filter((row) => preds.every(([column, value]) => row[column] === value));
++              return Promise.resolve({ data: found.length === 1 ? structuredClone(found[0]) : null, error: null });
++            },
++          };
++          return api;
++        },
++      };
++    },
++  };
++}
++
++function developmentInput(requestId) {
++  return {
++    requestId,
++    title: "Synthetic mission",
++    objective: "Observe the existing admission contract",
++    scope: "One existing service",
++    acceptanceCriteria: "No model call and no second row",
++  };
++}
++
++function postDevelopment(body, handlers) {
++  return handlers.POST(new Request("http://internal/api/missions/development", {
++    method: "POST",
++    headers: { origin, "content-type": "application/json" },
++    body: JSON.stringify(body),
++  }));
++}
++
++function postOpenHands(body, handler) {
++  return handler(new Request("http://internal/api/orchestration/openhands", {
++    method: "POST",
++    headers: { origin, "content-type": "application/json" },
++    body: JSON.stringify(body),
++  }));
++}
++
++export async function resolveHermesAdapter(env = process.env) {
++  const spec = env.HERMES_HQ_ADAPTER;
++  if (!spec) return { level: "blocked", reason: "adapter_absent" };
++  if (!existsSync(spec)) return { level: "blocked", reason: "adapter_missing" };
++  const loaded = await import(pathToFileURL(spec).href);
++  if (typeof loaded.runHermesHqJoin !== "function") return { level: "blocked", reason: "adapter_export_missing" };
++  return { level: "present", run: loaded.runHermesHqJoin };
++}
++
++test("a stalled OpenHands body stops at five seconds and writes nothing", { timeout: 12000 }, async () => {
++  let calls = 0;
++  const handler = createOpenHandsHandler({
++    authenticate: async () => ({ actorId: trust.actorId }),
++    enabled: () => true,
++    workspaceId: () => trust.workspaceId,
++    publicOrigin: () => origin,
++    service: async () => { calls += 1; return { status: "reserved", externalEffectAllowed: false }; },
++    launch: async () => { calls += 1; return { status: "claimed", externalEffectAllowed: false }; },
++  });
++  let released = false;
++  const stream = new ReadableStream({
++    pull(controller) {
++      return new Promise((resolve) => {
++        const finish = () => { if (!released) { released = true; controller.close(); } resolve(); };
++        setTimeout(finish, 20000).unref?.();
++      });
++    },
++    cancel() { released = true; },
++  });
++  const started = Date.now();
++  const response = await handler(new Request("http://internal/api/orchestration/openhands", {
++    method: "POST",
++    headers: { origin, "content-type": "application/json" },
++    body: stream,
++    duplex: "half",
++  }));
++  const elapsed = Date.now() - started;
++  assert.equal(response.status, 400);
++  assert.deepEqual(await response.json(), { status: "invalid_request" });
++  assert.equal(calls, 0);
++  assert.ok(elapsed >= 4500 && elapsed < 8000, `deadline elapsed ${elapsed}ms`);
++});
++
++test("configured launch errors do not echo a synthetic secret or touch the store", async () => {
++  let reads = 0;
++  const throwing = createConfiguredOpenHandsLaunch({
++    enabled: () => true,
++    configuration: () => { throw new Error(secret); },
++    store: () => { reads += 1; return null; },
++  });
++  const context = { workspaceId: trust.workspaceId, actorId: trust.actorId };
++  const preview = await throwing(context, "11111111-1111-4111-8111-111111111111");
++  const confirmation = await throwing(context, "11111111-1111-4111-8111-111111111111", {
++    confirm: true,
++    expectedLaunchHash: "c".repeat(64),
++  });
++  assert.equal(preview.status, "unavailable");
++  assert.equal(confirmation.status, "reconciliation_required");
++  assert.equal(preview.externalEffectAllowed, false);
++  assert.equal(confirmation.externalEffectAllowed, false);
++  assert.equal(JSON.stringify(preview).includes(secret), false);
++  assert.equal(JSON.stringify(confirmation).includes(secret), false);
++  const invalid = createConfiguredOpenHandsLaunch({
++    enabled: () => true,
++    configuration: () => JSON.stringify({ ...serverConfig, token: secret }),
++    store: () => { reads += 1; return null; },
++  });
++  const parsed = await invalid(context, "11111111-1111-4111-8111-111111111111");
++  assert.equal(parsed.status, "unavailable");
++  assert.equal(parsed.externalEffectAllowed, false);
++  assert.equal(JSON.stringify(parsed).includes(secret), false);
++  assert.equal(reads, 0);
++});
++
++test("a server cost or executor that differs from the reserved dossier does not claim", async () => {
++  let mission;
++  const created = await createDevelopmentService({
++    enabled: () => true,
++    store: () => ({ save: async (value) => { mission = value; return value; }, load: async () => mission }),
++  }).create(developmentInput("12345678-1234-4234-8234-123456789abc"), trust);
++  assert.equal(created.status, "saved");
++  assert.equal(created.executionRequested, false);
++  const submission = {
++    missionId: mission.id,
++    expectedUpdatedAt: mission.updatedAt,
++    commitSha: "a".repeat(40),
++    executorVersion: "1.50.0",
++    budget,
++  };
++  const prepared = buildOpenHandsSubmission(mission, trust.workspaceId, submission);
++  assert.equal(prepared.status, "prepared");
++  mission = {
++    ...mission,
++    input: {
++      ...mission.input,
++      [OPENHANDS_RESERVATION_KEY]: {
++        version: 1,
++        reservationId: "22222222-2222-4222-8222-222222222222",
++        state: "audit_recorded",
++        workspaceId: trust.workspaceId,
++        missionId: mission.id,
++        missionVersion: mission.updatedAt,
++        idempotencyKey: prepared.dossier.idempotencyKey,
++        payloadHash: prepared.dossier.payloadHash,
++        authorizationId: "33333333-3333-4333-8333-333333333333",
++        actorId: trust.actorId,
++        reservedAt: mission.updatedAt,
++        authorizationExpiresAt: new Date(Date.now() + 600000).toISOString(),
++        auditId: "synthetic-audit",
++      },
++    },
++  };
++  let writes = 0;
++  const store = {
++    readSubmission: async () => structuredClone(prepared.dossier),
++    load: async () => structuredClone(mission),
++    persistAuthority: async () => { writes += 1; throw new Error(secret); },
++    readAuthority: async () => null,
++    compareAndSwap: async () => { writes += 1; return null; },
++  };
++  const matched = createConfiguredOpenHandsLaunch({
++    enabled: () => true,
++    configuration: () => JSON.stringify(serverConfig),
++    store: () => store,
++  });
++  const preview = await matched(trust, mission.id);
++  assert.equal(preview.status, "prepared");
++  assert.equal(preview.externalEffectAllowed, false);
++  assert.equal(writes, 0);
++  assert.equal(mission.input[OPENHANDS_LAUNCH_KEY], undefined);
++  const costly = createConfiguredOpenHandsLaunch({
++    enabled: () => true,
++    configuration: () => JSON.stringify({ ...serverConfig, maxCostCents: 40 }),
++    store: () => store,
++  });
++  const refused = await costly(trust, mission.id, { confirm: true, expectedLaunchHash: preview.binding.launchHash });
++  assert.equal(refused.status, "ineligible_mission");
++  assert.equal(refused.externalEffectAllowed, false);
++  assert.equal(writes, 0);
++  const otherExecutor = createConfiguredOpenHandsLaunch({
++    enabled: () => true,
++    configuration: () => JSON.stringify({ ...serverConfig, executorVersion: "9.9.9" }),
++    store: () => store,
++  });
++  const blockedExecutor = await otherExecutor(trust, mission.id, { confirm: true, expectedLaunchHash: preview.binding.launchHash });
++  assert.equal(blockedExecutor.status, "unavailable");
++  assert.equal(blockedExecutor.externalEffectAllowed, false);
++  assert.equal(JSON.stringify(blockedExecutor).includes("9.9.9"), false);
++  assert.equal(writes, 0);
++});
++
++test("Hermes arguments do not choose identity, skip confirmation, duplicate a lost create, or double-reserve", async () => {
++  const missions = new Map();
++  let loseNext = false;
++  const devStore = {
++    save: async (mission) => {
++      if (!missions.has(mission.id)) missions.set(mission.id, structuredClone(mission));
++      if (loseNext) { loseNext = false; throw new Error(secret); }
++      return structuredClone(missions.get(mission.id));
++    },
++    load: async (workspaceId, missionId) => {
++      const mission = missions.get(missionId);
++      return mission?.workspaceId === workspaceId ? structuredClone(mission) : null;
++    },
++  };
++  const development = createDevelopmentHandlers({
++    authenticate: async () => ({ actorId: trust.actorId }),
++    context: () => ({ workspaceId: trust.workspaceId, modeId: trust.modeId }),
++    publicOrigin: () => origin,
++    create: createDevelopmentService({ enabled: () => true, store: () => devStore }).create,
++    lookup: createDevelopmentService({ enabled: () => true, store: () => devStore }).lookup,
++  });
++  const input = developmentInput("22345678-1234-4234-8234-123456789abc");
++  for (const extra of [{ createdBy: "model-actor" }, { workspaceId: "foreign-workspace" }, { confirm: true }, { actorId: "model-actor" }]) {
++    assert.equal((await postDevelopment({ ...input, ...extra }, development)).status, 400);
++  }
++  assert.equal(missions.size, 0);
++  loseNext = true;
++  const lost = await postDevelopment(input, development);
++  assert.equal(lost.status, 200);
++  assert.deepEqual(await lost.json(), { status: "outcome_unknown" });
++  assert.equal(JSON.stringify(await postDevelopment(input, development).then((response) => response.json())).includes(secret), false);
++  assert.equal(missions.size, 1);
++  const recovered = await development.GET(new Request(`https://hq.test/api/missions/development?requestId=${input.requestId}`));
++  const recoveredBody = await recovered.json();
++  assert.equal(recovered.status, 200);
++  assert.equal(recoveredBody.status, "saved");
++  assert.equal(recoveredBody.executionRequested, false);
++  const stored = [...missions.values()][0];
++  assert.equal(stored.input.development.createdBy, trust.actorId);
++  assert.equal(stored.workspaceId, trust.workspaceId);
++  assert.equal(stored.status, "draft");
++  assert.equal(stored.input[OPENHANDS_RESERVATION_KEY], undefined);
++  const again = await postDevelopment(input, development);
++  assert.equal((await again.json()).missionId, recoveredBody.missionId);
++  assert.equal(missions.size, 1);
++
++  const authority = ledger();
++  let current = stored;
++  let reservations = 0;
++  const confirmation = createOpenHandsConfirmationService({
++    store: () => ({
++      load: async (workspaceId, missionId) => current?.workspaceId === workspaceId && current.id === missionId ? structuredClone(current) : null,
++      compareAndSwap: async (mission, receipt) => {
++        if (current.updatedAt !== mission.updatedAt || JSON.stringify(current.input) !== JSON.stringify(mission.input)) return null;
++        reservations += 1;
++        current = { ...current, input: { ...current.input, [OPENHANDS_RESERVATION_KEY]: receipt }, updatedAt: new Date().toISOString() };
++        return structuredClone(current);
++      },
++      audit: async () => "synthetic-audit",
++    }),
++    authority: () => createOpenHandsAuthorityStore(authority),
++  });
++  let serviceCalls = 0;
++  const openhands = createOpenHandsHandler({
++    authenticate: async () => ({ actorId: trust.actorId }),
++    enabled: () => true,
++    workspaceId: () => trust.workspaceId,
++    publicOrigin: () => origin,
++    service: async (...args) => { serviceCalls += 1; return confirmation(...args); },
++    launch: async () => { throw new Error("launch must stay uncalled"); },
++  });
++  const request = {
++    missionId: stored.id,
++    expectedUpdatedAt: stored.updatedAt,
++    commitSha: "b".repeat(40),
++    executorVersion: "1.2.3",
++    budget: { maxCostCents: 10, maxTokens: 20, maxIterations: 1, timeoutSeconds: 30 },
++  };
++  for (const extra of [{ actorId: "model-actor" }, { workspaceId: "foreign-workspace" }, { endpoint: "https://model.invalid" }]) {
++    assert.equal((await postOpenHands({ ...request, action: "prepare", ...extra }, openhands)).status, 400);
++  }
++  assert.equal(serviceCalls, 0);
++  assert.equal(authority.rows.size, 0);
++  const prepare = await postOpenHands({ ...request, action: "prepare" }, openhands);
++  assert.equal(prepare.status, 200);
++  const prepareBody = await prepare.json();
++  assert.equal(prepareBody.status, "prepared");
++  assert.equal(prepareBody.externalEffectAllowed, false);
++  assert.equal(authority.rows.size, 0);
++  assert.equal(reservations, 0);
++  const wrong = await postOpenHands({
++    ...request, action: "confirm", confirm: true, expectedPayloadHash: "f".repeat(64),
++  }, openhands);
++  assert.equal(wrong.status, 409);
++  assert.equal((await wrong.json()).status, "dossier_changed");
++  assert.equal(authority.rows.size, 0);
++  assert.equal(reservations, 0);
++  const hash = prepareBody.dossier.payloadHash;
++  const pair = await Promise.all([
++    postOpenHands({ ...request, action: "confirm", confirm: true, expectedPayloadHash: hash }, openhands),
++    postOpenHands({ ...request, action: "confirm", confirm: true, expectedPayloadHash: hash }, openhands),
++  ]);
++  const bodies = await Promise.all(pair.map((response) => response.json()));
++  assert.equal(bodies.filter((body) => body.status === "reserved").length, 1);
++  assert.ok(bodies.every((body) => body.externalEffectAllowed === false));
++  assert.equal(authority.rows.size, 1);
++  assert.equal([...authority.rows.values()][0].user_id, trust.actorId);
++  assert.equal([...authority.rows.values()][0].workspace_id, trust.workspaceId);
++  assert.equal(current.input[OPENHANDS_RESERVATION_KEY].state, "audit_recorded");
++  assert.equal(current.input[OPENHANDS_LAUNCH_KEY], undefined);
++  const replay = await postOpenHands({ ...request, action: "confirm", confirm: true, expectedPayloadHash: hash }, openhands);
++  assert.equal((await replay.json()).status, "already_reserved");
++  assert.equal(authority.rows.size, 1);
++});
++
++test("the Hermes adapter is blocked and this recipe opens no network", async () => {
++  const absent = await resolveHermesAdapter({ HERMES_HQ_ADAPTER: "" });
++  assert.deepEqual(absent, { level: "blocked", reason: "adapter_absent" });
++  const missing = await resolveHermesAdapter({ HERMES_HQ_ADAPTER: path.join(root, "proofs/missing-hermes-adapter.mjs") });
++  assert.deepEqual(missing, { level: "blocked", reason: "adapter_missing" });
++  const dir = mkdtempSync(path.join(tmpdir(), "hermes-adapter-"));
++  const file = path.join(dir, "adapter.mjs");
++  writeFileSync(file, "export function runHermesHqJoin(){ return { externalEffectAllowed: true }; }\n");
++  try {
++    const present = await resolveHermesAdapter({ HERMES_HQ_ADAPTER: file });
++    assert.equal(present.level, "present");
++    assert.equal(typeof present.run, "function");
++  } finally {
++    rmSync(dir, { recursive: true, force: true });
++  }
++  const live = await resolveHermesAdapter();
++  assert.equal(process.env.HERMES_HQ_ADAPTER, undefined);
++  assert.deepEqual(live, { level: "blocked", reason: "adapter_absent" });
++  assert.equal(networkCalls, 0);
++  console.log("HERMES_HQ_RECETTE contrat_simule=ok adapter=bloque infrastructure=non_execute modele_reel=non_execute");
++});
+-- 
+2.43.0
+
+
+From 4bfd061ac5ddc4bd1ed3f003de0d3f92e3ed891d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 1 Oct 2026 18:20:10 +0000
+Subject: [PATCH 2/2] Record the observed Hermes recipe result.
+
+---
+ docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md b/docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
+index 834245f..398e6d3 100644
+--- a/docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
++++ b/docs/CURSOR-HERMES-HQ-RECETTE-2026-10-01.md
+@@ -14,7 +14,7 @@ Le verdict honnête de cette commande, tant que `HERMES_HQ_ADAPTER` est absent,
+ 
+ `HERMES_HQ_RECETTE contrat_simule=ok adapter=bloque infrastructure=non_execute modele_reel=non_execute`
+ 
+-Exit 0 signifie que les effets HQ simulés tiennent et que l'adaptateur n'a pas tourné. Ce n'est pas un raccordement qualifié. L'injection est le chemin `HERMES_HQ_ADAPTER` vers un module qui exporte `runHermesHqJoin`. Fichier absent ou export absent : `blocked`. Cette recette ne l'appelle pas.
++Ici : 5 tests, 0 échec, 5274 ms, exit 0. Exit 0 signifie que les effets HQ simulés tiennent et que l'adaptateur n'a pas tourné. Ce n'est pas un raccordement qualifié. L'injection est le chemin `HERMES_HQ_ADAPTER` vers un module qui exporte `runHermesHqJoin`. Fichier absent ou export absent : `blocked`. Cette recette ne l'appelle pas.
+ 
+ ## Matrice
+ 
+-- 
+2.43.0
+

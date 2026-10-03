@@ -1,0 +1,104 @@
+From 7fb41bbd9743da89dc8089f106ff03e8cc15a655 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Oct 2026 06:03:04 +0000
+Subject: [PATCH] Keep one accounting journal when Jiti evaluates the module
+ twice.
+
+Windows does not collapse the alias path and the absolute path, so the
+test was reading an empty copy of the process-local log.
+---
+ src/server/ai/call-accounting.ts         | 20 ++++++++++++++++--
+ src/server/ai/routing-execution.test.mjs | 26 ++++++++++++++++++++++--
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/src/server/ai/call-accounting.ts b/src/server/ai/call-accounting.ts
+index 27229a2..993d45d 100644
+--- a/src/server/ai/call-accounting.ts
++++ b/src/server/ai/call-accounting.ts
+@@ -27,20 +27,36 @@ export type CallAccountingEvent = {
+   note: string;
+ };
+ 
+-const log: CallAccountingEvent[] = [];
++/**
++ * One journal per process. Jiti can evaluate this file twice when the alias
++ * path and the absolute path differ, which Windows does not collapse.
++ * Both evaluations must read and clear the same array.
++ */
++const JOURNAL = Symbol.for("oria.hq.callAccountingJournal");
++
++function journal(): CallAccountingEvent[] {
++  const host = globalThis as typeof globalThis & { [JOURNAL]?: CallAccountingEvent[] };
++  const existing = host[JOURNAL];
++  if (existing) return existing;
++  const created: CallAccountingEvent[] = [];
++  host[JOURNAL] = created;
++  return created;
++}
+ 
+ export function recordCallAccounting(event: CallAccountingEvent): CallAccountingEvent {
++  const log = journal();
+   log.push(event);
+   return event;
+ }
+ 
+ export function getCallAccountingLog(workspaceId?: string): readonly CallAccountingEvent[] {
++  const log = journal();
+   if (!workspaceId) return log.slice();
+   return log.filter((event) => event.workspaceId === workspaceId);
+ }
+ 
+ export function clearCallAccountingLog(): void {
+-  log.length = 0;
++  journal().length = 0;
+ }
+ 
+ /** No hold. Selection and refusal do not reserve money. */
+diff --git a/src/server/ai/routing-execution.test.mjs b/src/server/ai/routing-execution.test.mjs
+index ddbaea3..f351267 100644
+--- a/src/server/ai/routing-execution.test.mjs
++++ b/src/server/ai/routing-execution.test.mjs
+@@ -11,12 +11,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ const projectRoot = path.resolve(__dirname, "..", "..", "..");
+ 
+ const { createJiti } = await import("jiti");
+-const jiti = createJiti(import.meta.url, {
++const jitiOptions = {
+   alias: {
+     "@": path.join(projectRoot, "src"),
+     "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
+   },
+-});
++};
++const jiti = createJiti(import.meta.url, jitiOptions);
+ 
+ const { chooseModel, resetLadderBudget } = await jiti.import(
+   path.join(projectRoot, "src/server/ai/model-router.ts"),
+@@ -588,3 +589,24 @@ test("when every authorized attempt fails, none is recorded as zero dollars", as
+     delete process.env.OPENAI_API_KEY;
+   }
+ });
++
++test("a second jiti evaluation shares the accounting journal", async () => {
++  const reloaded = createJiti(import.meta.url, { ...jitiOptions, moduleCache: false });
++  const viaAlias = await reloaded.import("@/server/ai/call-accounting.ts");
++  const viaPath = await reloaded.import(path.join(projectRoot, "src/server/ai/call-accounting.ts"));
++  viaAlias.clearCallAccountingLog();
++  const event = {
++    kind: "estimation",
++    monetaryUsd: null,
++    networkRequestSent: false,
++    note: "same process journal",
++  };
++  viaAlias.recordCallAccounting({ ...event, workspaceId: "ws-a", agentId: "a" });
++  viaAlias.recordCallAccounting({ ...event, workspaceId: "ws-b", agentId: "b" });
++  assert.notEqual(viaAlias.recordCallAccounting, viaPath.recordCallAccounting);
++  assert.equal(viaPath.getCallAccountingLog("ws-a").length, 1);
++  assert.equal(viaPath.getCallAccountingLog("ws-b").length, 1);
++  assert.equal(viaPath.getCallAccountingLog("ws-a")[0].agentId, "a");
++  viaPath.clearCallAccountingLog();
++  assert.equal(viaAlias.getCallAccountingLog().length, 0);
++});
+-- 
+2.43.0
+

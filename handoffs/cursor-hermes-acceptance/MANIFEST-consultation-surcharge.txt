@@ -1,0 +1,36 @@
+Delta depuis 71814d76f99965d10599a53b34dc5a9e5f6ab3b9.
+Produit 2aeebfd4be72f4732a6fae3b3bfc16a0594cbbf3
+Arbre 92974bf30612e54b8c5c76197c611ea9ee45d48d
+git am sur 71814d7 : ffea140388cffcde36ff38534f17c0326aad03d1, même arbre.
+Patch cursor-consultation-surcharge-delta.patch
+SHA256 17477eb0eb1f75cf07bb48b90b1f72f1da91304891fc09ffd9f9f75590e78995
+
+Une surcharge optionnelle non nulle ne renvoie plus le prix entier en unknown.
+Les composantes prompt, completion et request déjà lisibles restent.
+Chaque surcharge présente est listée avec son montant et son unité.
+Une clé absente n'est pas écrite 0. Un montant illisible reste null.
+Aucun total n'est calculé. proven_zero réutilise isProvenZeroPricing
+et exige en plus que chaque surcharge présente soit un zéro connu.
+
+Fichiers
+src/server/ai/gateway-catalog.ts
+src/server/ai/gateway-catalog.test.mjs
+src/server/ai/hq-model-catalog.ts
+src/server/ai/hq-model-catalog.test.mjs
+
+Hors delta : chooseModel, budgets, autorisations, page runtime, identité Claude, Atelier.
+model-catalog-consultation.ts inchangé : les unités prompt/completion/request existantes suffisent.
+Les surcharges sont dans le tarif déjà affiché.
+
+Node v22.14.0.
+npx tsc --noEmit --pretty false : exit 0, fichier vide.
+node --test --test-concurrency=1 gateway-catalog.test.mjs hq-model-catalog.test.mjs model-catalog-consultation.test.mjs
+47 tests, 0 échec, 0 skip, duration_ms 1994.254592.
+Pas de suite complète.
+
+Limites
+pricing.overrides non vide laisse encore le devis entier unknown.
+image est le décimal USD brut, unité unknown : pas de conversion par million.
+web_search reste USD par requête (0.01, pas 10000).
+cache et internal_reasoning sont USD par million de tokens.
+Pas d'appel modèle. Page non re-rendue. Ce cloud n'a pas vu un localhost Windows.
