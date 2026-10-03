@@ -34,3 +34,117 @@ Tous vérifient la fermeture du processus et l'absence de prompt/authentificatio
 Les assertions d'initialisation ont été remplacées par des contrôles explicites
 pour rester actifs sous Python optimisé. Le véritable adaptateur a ensuite
 repassé l'initialisation et la création de session sans réseau ni modèle.
+
+## Reprise opérationnelle — comparaison avec une installation Docker ancienne (2 octobre 2026)
+
+Mandat : `docs/CLAUDE-REPRISE-OPENHANDS-OPERATIONNELLE.md`. Ce lot compare ce
+candidat à `ghcr.io/openhands/agent-canvas:1.0.0-rc.11`, une image OFFICIELLE
+différente (all-in-one agent-server + automation + frontend), déjà présente
+sur cette machine (pas ce candidat, pas la même construction) sous trois
+conteneurs arrêtés : `openhands-agent-canvas` (a tourné du 2026-07-09 au
+2026-07-30, exit255), `-old` et `-backup` (quelques heures chacun, exit137 —
+tués, pas arrêtés proprement). Les trois montent les mêmes répertoires hôte
+persistants : `C:\Users\micha\.openhands` (état session/automation),
+`C:\Users\micha\Dev\openhands-projects`, et
+`C:\Users\micha\Dev\openhands-credentials\{claude,codex,gcloud-adc,gemini}`.
+
+**Risque de reprise automatique évalué avant tout démarrage** : l'entrypoint
+réel (`tini -- /opt/agent-canvas/entrypoint.sh`, extrait en lecture seule
+via `docker create`+`docker cp`+`docker rm`, jamais exécuté) démarre sans
+condition trois services — agent-server, automation server (base SQLite
+`automations.db` sous `~/.openhands`), frontend — dès qu'il est lancé,
+indépendamment de toute connexion ultérieure de l'opérateur. Si `.openhands`
+est monté, l'automation server y trouve son état persistant et peut
+reprendre un travail planifié de façon autonome. **Mitigation retenue** :
+la sonde de ce lot ne monte jamais `.openhands`, jamais `openhands-projects`,
+jamais le socket Docker, et remplace entièrement l'entrypoint par un script
+shell de diagnostic — aucun des trois services ne démarre, donc aucune
+reprise n'est possible, par construction et non par une simple convention.
+
+**Sonde isolée exécutée** (`qualify_existing_image_account.sh` +
+`qualify_existing_image_account_probe.sh`, dans ce dossier) : conteneur
+`--rm`, réseau `bridge` (nécessaire pour un contrôle d'authentification
+réel), `--read-only`, `--cap-drop ALL`, UID réel de l'image (10001), seul
+montage réel : `openhands-credentials/claude` → `~/.claude`, **en lecture
+seule** — originaux jamais modifiés, aucune copie de credentials ailleurs.
+Résultat, redigéré (valeurs des quatre champs déjà whitelistés ailleurs dans
+ce dépôt ; email/orgId/orgName jamais affichés, ici de toute façon `null`) :
+
+```
+claude-agent-acp --cli --version → 2.1.114 (Claude Code)
+claude-agent-acp --cli auth status --json → exit 0
+  loggedIn = true
+  authMethod = "claude.ai"      (abonnement, pas une clé API)
+  apiProvider = "firstParty"
+  subscriptionType = "pro"
+  email / orgId / orgName : absents (type null)
+stderr (texte d'aide officiel, pas un secret) : fichier de profil
+  ~/.claude.json introuvable ; une sauvegarde horodatée existe sous
+  ~/.claude/backups/ avec la commande cp exacte pour la restaurer —
+  non exécutée par ce lot (préserve l'original).
+```
+
+`loggedIn: true` établit une CONNEXION réelle via abonnement — pas une
+autorisation HQ, pas une identité de compte (conforme à la correction du
+lot précédent : aucune identité par-utilisateur n'est extraite ni
+fabriquée ici, et `orgId` reste absent de toute façon). `codex-acp` dans
+cette image n'a aucune sous-commande `login`/`doctor`/`auth` (confirmé par
+`--help` : seulement `-c/--config` et `-h/--help`, aucun binaire `codex`
+nu sur le PATH) — aucune tentative, rien à rediger.
+
+Conteneur supprimé après l'unique exécution (`--rm`) ; aucune image ni
+volume laissé. Aucun login interactif, aucun appel modèle, aucune
+production/VPS touchée.
+
+**Anomalie observée, non liée à ce mandat** : après ces commandes, trois
+conteneurs supplémentaires aux noms Docker auto-générés
+(`festive_ardinghelli`, `suspicious_chatelet`, `unruffled_rosalind`)
+existaient, utilisant cette même image avec des volumes anonymes Docker
+(jamais mes montages hôte) et des commandes comme `git --version`/
+`python3 --version` — signature d'un mécanisme de vérification interne de
+l'environnement d'exécution (harness), pas de ce lot. Non modifiés, non
+supprimés (hors de mon périmètre et de ma compréhension de cet outillage) ;
+signalé pour transparence.
+
+### Delta minimal de réutilisation vs ce candidat
+
+| | Image ancienne (agent-canvas) | Ce candidat (`openhands-claude-runtime`) |
+|---|---|---|
+| Adaptateur ACP Claude | `@agentclientprotocol/claude-agent-acp@0.30.0` | `0.84.0` |
+| CLI Claude embarqué | `2.1.114` | `2.1.284` |
+| Connexion abonnement | **Déjà active** (claude.ai, pro, firstParty) | Jamais tentée |
+| codex-acp | `@zed-industries/codex-acp@0.15.0`, déprécié, sans surface auth | Non applicable (candidat Codex séparé) |
+
+Le seul élément réellement réutilisable sans reconstruction : le répertoire
+de credentials hôte `C:\Users\micha\Dev\openhands-credentials\claude`
+contient déjà une session d'abonnement Claude fonctionnelle. Rien n'indique
+qu'elle soit liée à la version 2.1.114 spécifiquement — les jetons OAuth
+Claude sont conçus pour être indépendants de la version du CLI — mais ceci
+n'est PAS vérifié pour ce candidat (0.84.0/2.1.284) et doit l'être
+séparément avant toute réutilisation réelle.
+
+### Recette d'une mission de qualification (non exécutée)
+
+1. Construire réellement ce candidat localement ou retrouver le manifest
+   VPS déjà construit (`PERMISSION_BASE` manquant sur cette machine,
+   documenté dans `RESULTS.md` ci-dessus).
+2. Monter `openhands-credentials/claude` en LECTURE SEULE dans l'image
+   construite (jamais `.openhands`, jamais `openhands-projects`) et
+   rejouer exactement la même sonde `--cli auth status --json` que
+   ci-dessus, pour vérifier que la session existante reste valide sous
+   l'adaptateur/CLI plus récent de ce candidat.
+3. Si incompatible : lancer `claude-agent-acp --cli auth login --claudeai`
+   officiel et indépendant (jamais une copie de jeton) dans ce même
+   environnement candidat.
+4. Obtenir l'approbation écrite explicite de Michael pour : (a) un montage
+   en lecture-écriture si un rafraîchissement de jeton s'avère nécessaire,
+   (b) une policy/compte approuvés dans le registre existant
+   (`provider_policy.py`, `validate_authorization`), (c) un budget borné
+   (`maxCostCents`/`maxTokens`/`maxIterations` déjà existants, jamais
+   élargis).
+5. Seulement alors : une mission réelle unique, bornée et minimale, pour
+   observer coût/usage réels et clore la qualification — pas avant.
+
+Aucun remplacement général des contrôles HQ existants ; aucune désactivation
+de `provider_policy.py` ni du gate `model-emission-launch-gate.ts`. Aucune
+vraie mission modèle exécutée par ce lot.
