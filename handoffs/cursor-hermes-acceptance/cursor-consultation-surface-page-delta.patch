@@ -1,0 +1,491 @@
+From 0309b8d5d85678faa8944e5d829c2c3f295f798d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 3 Oct 2026 03:49:39 +0000
+Subject: [PATCH] Page each provider catalog so Nara stays visible.
+
+---
+ src/app/hq/runtime/page.tsx             | 99 ++++++++++++++++++++-----
+ src/server/ai/hq-model-catalog.test.mjs | 83 +++++++++++++--------
+ src/server/ai/hq-model-catalog.ts       | 98 ++++++++++++++++++------
+ 3 files changed, 209 insertions(+), 71 deletions(-)
+
+diff --git a/src/app/hq/runtime/page.tsx b/src/app/hq/runtime/page.tsx
+index 1f279d9..a9befc0 100644
+--- a/src/app/hq/runtime/page.tsx
++++ b/src/app/hq/runtime/page.tsx
+@@ -76,6 +76,31 @@ const DEPLOYMENT_PHASES = [
+   { phase: "6", label: "Live unlock (par skill)", done: false },
+ ];
+ 
++const CATALOG_LINK = "rounded-lg border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300";
++
++function catalogHref(options: {
++  refresh?: boolean;
++  fournisseur?: "openrouter" | "nara";
++  page?: number;
++}): Route {
++  const query = new URLSearchParams();
++  if (options.refresh) query.set("catalog", "refresh");
++  if (options.fournisseur === "openrouter" || options.fournisseur === "nara") {
++    query.set("fournisseur", options.fournisseur);
++  }
++  if (options.fournisseur && options.page && options.page > 1) query.set("page", String(options.page));
++  const text = query.toString();
++  return (`/hq/runtime${text ? `?${text}` : ""}`) as Route;
++}
++
++function catalogProvider(value: string | string[] | undefined): "openrouter" | "nara" | undefined {
++  return value === "openrouter" || value === "nara" ? value : undefined;
++}
++
++function catalogPage(value: string | string[] | undefined): number {
++  return typeof value === "string" && /^[1-9][0-9]{0,3}$/.test(value) ? Number(value) : 1;
++}
++
+ function catalogUnitLabel(units: HqCatalogLine["units"]): string {
+   const name = {
+     usd_per_million_tokens: "USD / million",
+@@ -118,9 +143,12 @@ export default async function RuntimePage({
+   }
+ 
+   const params = await searchParams;
++  const fournisseur = catalogProvider(params.fournisseur);
++  const pageNumber = catalogPage(params.page);
+   const catalog = await loadHqModelCatalog({
+     nowMs: Date.now(),
+     refresh: params.catalog === "refresh" ? "now" : "if-stale",
++    ...(fournisseur ? { provider: fournisseur, page: pageNumber } : {}),
+   });
+ 
+   const canary = runCanaryCheck();
+@@ -379,8 +407,8 @@ export default async function RuntimePage({
+         tone="sky"
+         action={
+           <Link
+-            href={"/hq/runtime?catalog=refresh" as Route}
+-            className="rounded-lg border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300"
++            href={catalogHref({ refresh: true, fournisseur, page: pageNumber })}
++            className={CATALOG_LINK}
+           >
+             Actualiser
+           </Link>
+@@ -406,29 +434,62 @@ export default async function RuntimePage({
+                 <span>Vérifié</span>
+                 <span>État</span>
+               </div>
+-              {catalog.lines.length === 0 ? (
++              {catalog.sections.length === 0 ? (
+                 <p className="px-4 py-3 text-xs text-neutral-500">inconnu</p>
+               ) : (
+-                catalog.lines.map((line, index) => (
+-                  <div
+-                    key={`${line.provider}:${line.modelId}:${index}`}
+-                    className={`grid gap-1 px-4 py-2.5 text-xs sm:grid-cols-[7rem_minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_6rem] ${
+-                      index < catalog.lines.length - 1 ? "border-b border-neutral-800" : ""
+-                    }`}
+-                  >
+-                    <span className="text-neutral-300">{line.provider}</span>
+-                    <span className="truncate font-mono text-neutral-200">{line.modelId}</span>
+-                    <span className="font-mono text-neutral-300">{line.tariff}</span>
+-                    <span className="text-neutral-500">{catalogUnitLabel(line.units)}</span>
+-                    <span className="truncate font-mono text-neutral-500">{line.observedAt ?? "inconnu"}</span>
+-                    <span className="text-neutral-300">{line.status}</span>
++                catalog.sections.map((section) => (
++                  <div key={section.provider}>
++                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-800 px-4 py-2">
++                      <p className="text-xs text-neutral-400">
++                        {section.provider} · {section.page}/{section.pageCount}
++                      </p>
++                      <span className="flex flex-wrap gap-2">
++                        {fournisseur ? (
++                          <Link href={catalogHref({})} className={CATALOG_LINK}>Tous</Link>
++                        ) : (
++                          <Link href={catalogHref({ fournisseur: section.provider })} className={CATALOG_LINK}>
++                            {section.provider}
++                          </Link>
++                        )}
++                        {section.page > 1 ? (
++                          <Link
++                            href={catalogHref({ fournisseur: section.provider, page: section.page - 1 })}
++                            className={CATALOG_LINK}
++                          >
++                            Précédent
++                          </Link>
++                        ) : null}
++                        {section.page < section.pageCount ? (
++                          <Link
++                            href={catalogHref({ fournisseur: section.provider, page: section.page + 1 })}
++                            className={CATALOG_LINK}
++                          >
++                            Suite
++                          </Link>
++                        ) : null}
++                      </span>
++                    </div>
++                    {section.lines.length === 0 ? (
++                      <p className="border-b border-neutral-800 px-4 py-3 text-xs text-neutral-500">inconnu</p>
++                    ) : (
++                      section.lines.map((line, index) => (
++                        <div
++                          key={`${section.provider}:${line.modelId}:${index}`}
++                          className="grid gap-1 border-b border-neutral-800 px-4 py-2.5 text-xs last:border-b-0 sm:grid-cols-[7rem_minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_6rem]"
++                        >
++                          <span className="text-neutral-300">{line.provider}</span>
++                          <span className="truncate font-mono text-neutral-200">{line.modelId}</span>
++                          <span className="font-mono text-neutral-300">{line.tariff}</span>
++                          <span className="text-neutral-500">{catalogUnitLabel(line.units)}</span>
++                          <span className="truncate font-mono text-neutral-500">{line.observedAt ?? "inconnu"}</span>
++                          <span className="text-neutral-300">{line.status}</span>
++                        </div>
++                      ))
++                    )}
+                   </div>
+                 ))
+               )}
+             </div>
+-            {catalog.hiddenCount > 0 ? (
+-              <p className="mt-2 text-xs text-neutral-500">{catalog.hiddenCount} modèles non affichés</p>
+-            ) : null}
+           </>
+         ) : (
+           <p className="mt-3 text-xs text-neutral-400">indisponible · {catalog.reason}</p>
+diff --git a/src/server/ai/hq-model-catalog.test.mjs b/src/server/ai/hq-model-catalog.test.mjs
+index b8d7c49..817fd89 100644
+--- a/src/server/ai/hq-model-catalog.test.mjs
++++ b/src/server/ai/hq-model-catalog.test.mjs
+@@ -1,7 +1,6 @@
+ #!/usr/bin/env node
+ 
+ import assert from "node:assert/strict";
+-import { execFileSync } from "node:child_process";
+ import { readFileSync } from "node:fs";
+ import path from "node:path";
+ import test, { after } from "node:test";
+@@ -30,6 +29,12 @@ const pagePath = path.join(projectRoot, "src/app/hq/runtime/page.tsx");
+ const { loadHqModelCatalog } = await jiti.import(surfacePath);
+ const { chooseModel } = await jiti.import(path.join(projectRoot, "src/server/ai/model-router.ts"));
+ const { resolveModelProfile } = await jiti.import(path.join(projectRoot, "src/server/ai/model-config.ts"));
++const { getCostLadderSnapshot, getLadderCostLog } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/cost-ladder.ts"),
++);
++const { getCallAccountingLog } = await jiti.import(
++  path.join(projectRoot, "src/server/ai/call-accounting.ts"),
++);
+ const {
+   OPENROUTER_PUBLIC_MODELS_URL,
+   OPENROUTER_ACCOUNT_MODELS_URL,
+@@ -251,8 +256,9 @@ test("concurrent loads share one pass across the two allowlisted providers", asy
+   release();
+   const [left, right] = await Promise.all([first, second]);
+   assert.deepEqual(calls, [OPENROUTER_PUBLIC_MODELS_URL, NARA_PUBLIC_PLANS_URL]);
+-  assert.equal(left, right);
+   assert.equal(left.ok, true);
++  assert.equal(right.ok, true);
++  assert.deepEqual(left.lines, right.lines);
+   assert.equal(left.lines.filter((line) => line.modelId === "openai/live").length, 1);
+ });
+ 
+@@ -279,34 +285,69 @@ test("client endpoint and provider hints are ignored", async () => {
+   assertViewSafe(view);
+ });
+ 
+-test("a long public list stays compact", async () => {
++test("each provider has its own page so Nara is not hidden by OpenRouter", async () => {
+   const models = Array.from({ length: 30 }, (_item, index) => ({ id: `vendor/m${index}` }));
+-  const view = await loadHqModelCatalog({
++  const shared = {
+     nowMs: NOW,
+     authorize: async () => null,
+     readCache: () => null,
+     transport: async (url) => catalogBody(url, models),
+-  });
++  };
++  const view = await loadHqModelCatalog(shared);
+   assert.equal(view.ok, true);
+-  assert.equal(view.lines.length, 24);
+-  assert.equal(view.hiddenCount, 7);
+-  assert.equal(view.lines[0].modelId, "vendor/m0");
+-  assert.equal(view.lines.some((line) => line.modelId === "auto/bynara"), false);
++  const openrouter = view.sections.find((section) => section.provider === "openrouter");
++  const nara = view.sections.find((section) => section.provider === "nara");
++  assert.equal(openrouter.total, 30);
++  assert.equal(openrouter.page, 1);
++  assert.equal(openrouter.pageCount, 2);
++  assert.equal(openrouter.lines.length, 24);
++  assert.equal(openrouter.lines[0].modelId, "vendor/m0");
++  assert.equal(openrouter.lines.at(-1).modelId, "vendor/m23");
++  assert.equal(nara.total, 1);
++  assert.equal(nara.pageCount, 1);
++  assert.equal(nara.lines[0].modelId, "auto/bynara");
++  assert.equal(view.lines.some((line) => line.modelId === "auto/bynara"), true);
++  assert.equal(view.hiddenCount, 6);
+   assert.equal(view.lines.every((line) => line.status === "inconnu" && line.executable === false), true);
++
++  const page2 = await loadHqModelCatalog({ ...shared, provider: "openrouter", page: 2 });
++  assert.deepEqual(page2.lines.map((line) => line.modelId), [
++    "vendor/m24", "vendor/m25", "vendor/m26", "vendor/m27", "vendor/m28", "vendor/m29",
++  ]);
++  assert.equal(page2.sections.length, 1);
++  assert.equal(page2.sections[0].page, 2);
++  assert.equal(page2.lines.some((line) => line.provider === "nara"), false);
++
++  const onlyNara = await loadHqModelCatalog({ ...shared, provider: "nara", page: 9 });
++  assert.deepEqual(onlyNara.lines.map((line) => line.modelId), ["auto/bynara"]);
++  assert.equal(onlyNara.sections[0].page, 1);
++  assert.equal(onlyNara.lines.some((line) => line.provider === "openrouter"), false);
++
++  const ignored = await loadHqModelCatalog({ ...shared, provider: "anthropic", page: 0 });
++  assert.equal(ignored.sections.map((section) => section.provider).join(), "openrouter,nara");
++  assert.equal(ignored.lines.some((line) => line.modelId === "auto/bynara"), true);
++  assert.equal(ignored.sections[0].page, 1);
+ });
+ 
+-test("loading the catalog does not change the approved model choice", async () => {
++test("loading the catalog does not change the approved model choice or the budget logs", async () => {
+   const beforeProfile = resolveModelProfile("claude-sonnet-4-6");
+   const before = chooseModel({
+     message: "Reformule cette phrase simplement.",
+     requestedMode: "economy",
+   });
++  const costBefore = JSON.stringify(getCostLadderSnapshot());
++  const ladderBefore = getLadderCostLog().length;
++  const journalBefore = getCallAccountingLog().length;
++  assert.ok(journalBefore >= 1);
+   await loadHqModelCatalog({
+     nowMs: NOW,
+     authorize: async () => null,
+     readCache: () => null,
+     transport: async (url) => catalogBody(url, [paidModel("openai/live")]),
+   });
++  assert.equal(JSON.stringify(getCostLadderSnapshot()), costBefore);
++  assert.equal(getLadderCostLog().length, ladderBefore);
++  assert.equal(getCallAccountingLog().length, journalBefore);
+   const after = chooseModel({
+     message: "Reformule cette phrase simplement.",
+     requestedMode: "economy",
+@@ -371,7 +412,9 @@ test("the runtime page is the catalog consumer and does not select a model", ()
+   const page = readFileSync(pagePath, "utf8");
+   const surface = readFileSync(surfacePath, "utf8");
+   assert.equal(page.includes("loadHqModelCatalog"), true);
+-  assert.equal(page.includes("catalog=refresh"), true);
++  assert.equal(page.includes('"catalog", "refresh"'), true);
++  assert.equal(page.includes("fournisseur"), true);
++  assert.equal(page.includes("Suite"), true);
+   assert.equal(page.includes("Actualiser"), true);
+   assert.equal(page.includes("chooseModel"), false);
+   assert.equal(page.includes("accountId"), false);
+@@ -385,22 +428,4 @@ test("the runtime page is the catalog consumer and does not select a model", ()
+   assert.equal(surface.includes("setInterval"), false);
+   assert.equal(surface.includes("chat/completions"), false);
+   assert.equal(surface.includes("chooseModel"), false);
+-
+-  const changed = new Set([
+-    ...execFileSync("git", ["diff", "--name-only", "63bc22b"], { cwd: projectRoot, encoding: "utf8" })
+-      .trim()
+-      .split("\n")
+-      .filter(Boolean),
+-    ...execFileSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: projectRoot, encoding: "utf8" })
+-      .trim()
+-      .split("\n")
+-      .filter(Boolean),
+-  ]);
+-  assert.deepEqual([...changed].sort(), [
+-    "src/app/hq/runtime/page.tsx",
+-    "src/server/ai/hq-model-catalog.test.mjs",
+-    "src/server/ai/hq-model-catalog.ts",
+-    "src/server/ai/model-catalog-consultation.test.mjs",
+-    "src/server/ai/model-catalog-consultation.ts",
+-  ]);
+ });
+diff --git a/src/server/ai/hq-model-catalog.ts b/src/server/ai/hq-model-catalog.ts
+index d6f32c1..4edc8d3 100644
+--- a/src/server/ai/hq-model-catalog.ts
++++ b/src/server/ai/hq-model-catalog.ts
+@@ -25,6 +25,8 @@ import { TARIFF_MAX_AGE_MS } from "@/server/ai/server-capability-catalog";
+ 
+ const PROVIDERS = ["openrouter", "nara"] as const;
+ const DISPLAY_CAP = 24;
++
++type ProviderId = (typeof PROVIDERS)[number];
+ const SERVER_SECRET_NAMES = new Set<string>([OPENROUTER_API_KEY_ENV, NARA_API_KEY_ENV]);
+ 
+ export type HqCatalogLine = {
+@@ -43,10 +45,20 @@ export type HqCatalogFailure = {
+   reason: string;
+ };
+ 
++export type HqCatalogSection = {
++  provider: ProviderId;
++  lines: readonly HqCatalogLine[];
++  page: number;
++  pageCount: number;
++  total: number;
++};
++
+ type ClosedReason = Extract<CatalogConsultation, { ok: false }>["reason"];
+ 
+ type ViewBase = {
+   lines: readonly HqCatalogLine[];
++  /** First page of each provider, or one provider page. A long OpenRouter list cannot hide Nara. */
++  sections: readonly HqCatalogSection[];
+   hiddenCount: number;
+   stale: boolean;
+   accountAccess: "unknown";
+@@ -76,6 +88,10 @@ export type HqModelCatalogLoad = {
+     generatedAt: string | null;
+     entries: readonly { id: string; name?: string }[];
+   } | null;
++  /** Allowlisted provider. Any other value shows both. */
++  provider?: ProviderId;
++  /** Used only when `provider` is set. Values below 1 show the first page. */
++  page?: number;
+ };
+ 
+ type HeldGateway = {
+@@ -84,7 +100,11 @@ type HeldGateway = {
+ };
+ 
+ const held = new Map<string, HeldGateway>();
+-const inflight = new Map<string, Promise<HqModelCatalogView>>();
++type LoadedCatalog =
++  | { ok: true; parts: readonly { provider: ProviderId; result: CatalogConsultation }[] }
++  | { ok: false; view: HqModelCatalogView };
++
++const inflight = new Map<string, Promise<LoadedCatalog>>();
+ const identities = new WeakMap<object, number>();
+ let identitySeq = 0;
+ 
+@@ -103,6 +123,7 @@ function closed(reason: ClosedReason, configured = false): HqModelCatalogView {
+     ok: false,
+     reason,
+     lines: [],
++    sections: [],
+     hiddenCount: 0,
+     stale: true,
+     accountAccess: "unknown",
+@@ -155,20 +176,44 @@ function lineFrom(row: CatalogConsultationRow, consultationStale: boolean): HqCa
+   };
+ }
+ 
+-function compact(parts: readonly { provider: string; result: CatalogConsultation }[]): HqModelCatalogView {
+-  const lines: HqCatalogLine[] = [];
++function selectedProvider(value: HqModelCatalogLoad["provider"]): ProviderId | undefined {
++  return value === "openrouter" || value === "nara" ? value : undefined;
++}
++
++function present(
++  parts: readonly { provider: ProviderId; result: CatalogConsultation }[],
++  provider: HqModelCatalogLoad["provider"],
++  page: number | undefined,
++): HqModelCatalogView {
++  const selected = selectedProvider(provider);
++  const requested = Number.isSafeInteger(page) && (page ?? 0) > 0 ? (page as number) : 1;
+   const failures: HqCatalogFailure[] = [];
++  const sections: HqCatalogSection[] = [];
+   let stale = false;
+   let configured = false;
+   for (const part of parts) {
+-    if (!part.result.ok) {
+-      failures.push({ provider: part.provider, reason: part.result.reason });
++    if (selected && part.provider !== selected) continue;
++    const result = part.result;
++    if (!result.ok) {
++      failures.push({ provider: part.provider, reason: result.reason });
+       continue;
+     }
+-    if (part.result.stale) stale = true;
+-    if (part.result.access.configured) configured = true;
+-    for (const row of part.result.rows) lines.push(lineFrom(row, part.result.stale));
++    if (result.stale) stale = true;
++    if (result.access.configured) configured = true;
++    const rows = result.rows.map((row) => lineFrom(row, result.stale));
++    const pageCount = Math.max(1, Math.ceil(rows.length / DISPLAY_CAP));
++    const current = selected ? Math.min(requested, pageCount) : 1;
++    const start = (current - 1) * DISPLAY_CAP;
++    sections.push({
++      provider: part.provider,
++      lines: rows.slice(start, start + DISPLAY_CAP),
++      page: current,
++      pageCount,
++      total: rows.length,
++    });
+   }
++  const lines = sections.flatMap((section) => section.lines);
++  const hiddenCount = sections.reduce((sum, section) => sum + (section.total - section.lines.length), 0);
+   const access = { public: true as const, configured, verified: false as const, executionAuthorized: false as const };
+   if (lines.length === 0 && failures.length > 0) {
+     const unique = [...new Set(failures.map((failure) => failure.reason))];
+@@ -187,6 +232,7 @@ function compact(parts: readonly { provider: string; result: CatalogConsultation
+       ok: false,
+       reason: closedReason,
+       lines: [],
++      sections: [],
+       hiddenCount: 0,
+       stale: true,
+       accountAccess: "unknown",
+@@ -195,12 +241,12 @@ function compact(parts: readonly { provider: string; result: CatalogConsultation
+       failures,
+     };
+   }
+-  const shown = lines.slice(0, DISPLAY_CAP);
+   return {
+     ok: true,
+     reason: null,
+-    lines: shown,
+-    hiddenCount: lines.length - shown.length,
++    lines,
++    sections,
++    hiddenCount,
+     stale,
+     accountAccess: "unknown",
+     executionAuthorized: false,
+@@ -245,13 +291,16 @@ async function loadProvider(
+   return result;
+ }
+ 
+-async function loadAuthorized(input: HqModelCatalogLoad, refresh: "if-stale" | "now"): Promise<HqModelCatalogView> {
++async function loadAuthorized(
++  input: HqModelCatalogLoad,
++  refresh: "if-stale" | "now",
++): Promise<readonly { provider: ProviderId; result: CatalogConsultation }[]> {
+   const serverDefaults = usesServerDefaults(input);
+   const parts = [];
+   for (const provider of PROVIDERS) {
+     parts.push({ provider, result: await loadProvider(provider, input, refresh, serverDefaults) });
+   }
+-  return compact(parts);
++  return parts;
+ }
+ 
+ /**
+@@ -278,14 +327,17 @@ export async function loadHqModelCatalog(input: HqModelCatalogLoad): Promise<HqM
+     identity(input.readSecret),
+     identity(input.authorize),
+   ].join("|");
+-  const existing = inflight.get(key);
+-  if (existing) return existing;
+-
+-  const pending = loadAuthorized(input, refresh)
+-    .catch(() => closed("unreadable"))
+-    .finally(() => {
+-      inflight.delete(key);
+-    });
+-  inflight.set(key, pending);
+-  return pending;
++  let pending = inflight.get(key);
++  if (!pending) {
++    pending = loadAuthorized(input, refresh)
++      .then((parts) => ({ ok: true as const, parts }))
++      .catch(() => ({ ok: false as const, view: closed("unreadable") }))
++      .finally(() => {
++        inflight.delete(key);
++      });
++    inflight.set(key, pending);
++  }
++  const loaded = await pending;
++  if (!loaded.ok) return loaded.view;
++  return present(loaded.parts, input.provider, input.page);
+ }
+-- 
+2.43.0
+

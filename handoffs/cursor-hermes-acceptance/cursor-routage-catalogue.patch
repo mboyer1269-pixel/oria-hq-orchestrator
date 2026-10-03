@@ -1,0 +1,1115 @@
+From 57f24ac6ebfebf6762ea9a22de800347483625f8 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Oct 2026 05:38:18 +0000
+Subject: [PATCH] Let the existing router consume a server capability catalog.
+
+A listed or connected entry grants no send. An empty free rung no longer
+climbs to a paid model. The executed model id comes only from the provider body.
+---
+ src/server/ai/anthropic-json-client.ts        |   8 +-
+ src/server/ai/cost-ladder.test.mjs            |  10 +-
+ src/server/ai/cost-ladder.ts                  |  10 +-
+ src/server/ai/llm-json-provider.ts            | 147 ++++++-
+ src/server/ai/model-router.test.mjs           |  13 +-
+ src/server/ai/model-router.ts                 |  34 +-
+ src/server/ai/openai-json-client.ts           |   8 +-
+ src/server/ai/routing-execution.test.mjs      |   9 +-
+ .../ai/server-capability-catalog.test.mjs     | 369 ++++++++++++++++++
+ src/server/ai/server-capability-catalog.ts    | 132 +++++++
+ 10 files changed, 714 insertions(+), 26 deletions(-)
+ create mode 100644 src/server/ai/server-capability-catalog.test.mjs
+ create mode 100644 src/server/ai/server-capability-catalog.ts
+
+diff --git a/src/server/ai/anthropic-json-client.ts b/src/server/ai/anthropic-json-client.ts
+index 66faf67..e41a662 100644
+--- a/src/server/ai/anthropic-json-client.ts
++++ b/src/server/ai/anthropic-json-client.ts
+@@ -46,7 +46,10 @@ export type AnthropicJsonSuccess = {
+   ok: true;
+   json: unknown;
+   rawText: string;
++  /** Id placed in the request. Not an observation of the model that ran. */
+   modelId: string;
++  /** `model` from the response body. Null when the body does not say. */
++  observedModelId: string | null;
+   tokenUsage?: { input: number; output: number };
+ };
+ 
+@@ -136,9 +139,12 @@ export async function generateJsonWithAnthropic(
+     }
+ 
+     const data = (await response.json()) as {
++      model?: string;
+       content?: Array<{ type: string; text?: string }>;
+       usage?: { input_tokens?: number; output_tokens?: number };
+     };
++    const observedModelId =
++      typeof data.model === "string" && data.model.length > 0 ? data.model : null;
+ 
+     const rawText = data?.content?.[0]?.text ?? "";
+ 
+@@ -170,7 +176,7 @@ export async function generateJsonWithAnthropic(
+         ? { input: data.usage.input_tokens, output: data.usage.output_tokens }
+         : undefined;
+ 
+-    return { ok: true, json, rawText, modelId, tokenUsage };
++    return { ok: true, json, rawText, modelId, observedModelId, tokenUsage };
+   } catch (err) {
+     if (isAbortError(err)) {
+       return {
+diff --git a/src/server/ai/cost-ladder.test.mjs b/src/server/ai/cost-ladder.test.mjs
+index 139b851..3348f9f 100644
+--- a/src/server/ai/cost-ladder.test.mjs
++++ b/src/server/ai/cost-ladder.test.mjs
+@@ -159,17 +159,19 @@ test("general follows the base route, but budget pressure pulls it to free", ()
+   assert.equal(over.freeModel.id, "qwen/qwen3-coder:free");
+ });
+ 
+-test("a free target with no eligible model degrades honestly to economy", () => {
++test("a free target with no eligible model does not descend to a paid rung", () => {
+   const d = decideLadder({
+     taskClass: "draft",
+     baseRung: "economy",
+     freeCatalog: [],
+     currentSpend: 0,
+   });
+-  assert.equal(d.rung, "economy");
++  assert.equal(d.rung, "free");
++  assert.equal(d.block, "free_unavailable");
+   assert.equal(d.freeModel, undefined);
+-  assert.equal(d.estimatedCost, RUNG_COST_WEIGHT.economy);
+-  assert.match(d.reason, /aucun modèle free/i);
++  assert.equal(d.estimatedCost, RUNG_COST_WEIGHT.free);
++  assert.match(d.reason, /aucune descente payante/);
++  assert.doesNotMatch(d.reason, /repli économie/);
+ });
+ 
+ test("task class floor maps lock the profit lever", () => {
+diff --git a/src/server/ai/cost-ladder.ts b/src/server/ai/cost-ladder.ts
+index 2b1c18c..1db55f1 100644
+--- a/src/server/ai/cost-ladder.ts
++++ b/src/server/ai/cost-ladder.ts
+@@ -203,6 +203,11 @@ export type LadderDecision = {
+   floorBound: boolean;
+   /** Estimated cost of this call at the chosen rung. */
+   estimatedCost: number;
++  /**
++   * The free rung had no eligible model. The rung stays free and nothing
++   * paid is selected in its place.
++   */
++  block?: "free_unavailable";
+   reason: string;
+ };
+ 
+@@ -233,8 +238,6 @@ export function decideLadder(input: LadderInput): LadderDecision {
+   if (rung === "free") {
+     freeModel = selectFreeModel(input.freeCatalog);
+     if (!freeModel) {
+-      // Honest fallback: a free rung with no eligible model becomes economy.
+-      rung = "economy";
+       noFreeAvailable = true;
+     }
+   }
+@@ -255,6 +258,7 @@ export function decideLadder(input: LadderInput): LadderDecision {
+     budgetBound,
+     floorBound,
+     estimatedCost: RUNG_COST_WEIGHT[rung],
++    ...(noFreeAvailable ? { block: "free_unavailable" as const } : {}),
+     reason,
+   };
+ }
+@@ -276,7 +280,7 @@ function buildReason(args: {
+     return `Étage gratuit visé par la tâche: ${args.freeModel.name} (OpenRouter). Poids relatif 0, qui n'est pas un montant en dollars ni un coût observé.`;
+   }
+   if (args.noFreeAvailable) {
+-    return "Étage gratuit visé mais aucun modèle free éligible (enabled+recommended): repli économie.";
++    return "Étage gratuit visé mais aucun modèle free éligible (enabled+recommended): aucune descente payante.";
+   }
+   return "Routage de base conservé sous le plafond de budget.";
+ }
+diff --git a/src/server/ai/llm-json-provider.ts b/src/server/ai/llm-json-provider.ts
+index 3714b31..3f05d09 100644
+--- a/src/server/ai/llm-json-provider.ts
++++ b/src/server/ai/llm-json-provider.ts
+@@ -38,6 +38,11 @@ import {
+   type CallReservationSnapshot,
+ } from "@/server/ai/call-reservation";
+ import { executionTargetForModel } from "@/server/ai/execution-models";
++import {
++  assessServerEmission,
++  type ServerCapabilityCatalog,
++  type ServerEmissionBlock,
++} from "@/server/ai/server-capability-catalog";
+ import { generateJsonWithAnthropic, ANTHROPIC_JSON_DEFAULT_MAX_TOKENS, ANTHROPIC_JSON_DEFAULT_MODEL } from "./anthropic-json-client";
+ import { generateJsonWithOpenAI, OPENAI_JSON_DEFAULT_MAX_TOKENS, OPENAI_JSON_DEFAULT_MODEL } from "./openai-json-client";
+ 
+@@ -73,6 +78,16 @@ export type LlmJsonProviderInput = {
+   callSubjectId?: string;
+   /** Test double. Production uses the durable SQL ledger. */
+   reservationGate?: CallReservationGate;
++  /**
++   * Server-verified capabilities. When present, a model is not sent unless
++   * this workspace's entry is authorized, tooled as required, and tariffed.
++   * Absent: the four static API ids keep the existing path. Not a browser body.
++   */
++  serverCatalog?: ServerCapabilityCatalog;
++  /** When true, an entry with tools false is not sent. */
++  requiresTools?: boolean;
++  /** Clock for tariff age. Defaults to Date.now(). */
++  nowMs?: number;
+   // Per-provider fetch overrides for test injection.
+   fetchFns?: {
+     anthropic?: typeof fetch;
+@@ -92,9 +107,16 @@ export type LlmJsonProviderSuccess = {
+   rawText: string;
+   /** Id actually placed in the provider request. */
+   modelId: string;
++  /** Id the caller asked for. Null when the caller did not name one. */
++  requestedModelId: string | null;
+   chosenModelId?: string;
+-  executedModelId: string;
++  /** Model id from the provider body. Null when the body does not say. Never the request id. */
++  executedModelId: string | null;
++  provider: LlmProvider | null;
+   providerUsed: LlmProvider;
++  usage: { input: number; output: number } | null;
++  /** Consumption source. Estimation stays on chooseModel and is not this field. */
++  costSource: CostSource;
+   /** True only when an authorized second provider produced this success. */
+   fallbackUsed: boolean;
+   failureChain: string[];
+@@ -114,10 +136,13 @@ export type LlmJsonProviderSuccess = {
+   cost: RoutingCostAssessment;
+ };
+ 
++export type CostSource = "provider_usage" | "refused" | "unknown" | "estimation";
++
+ export type LlmJsonProviderErrorCode =
+   | "no_provider_available"
+   | "all_providers_failed"
+   | "model_unsupported"
++  | "capability_blocked"
+   | "reservation_blocked";
+ 
+ export type LlmJsonProviderFailure = {
+@@ -125,9 +150,13 @@ export type LlmJsonProviderFailure = {
+   errorCode: LlmJsonProviderErrorCode;
+   fallbackReason: string;
+   failureChain: string[];
++  requestedModelId: string | null;
+   providerUsed?: LlmProvider;
++  provider: null;
+   chosenModelId?: string;
+   executedModelId: null;
++  usage: null;
++  costSource: CostSource;
+   attempts: LlmAttemptCost[];
+   reservation: CallReservationSnapshot;
+   cost: RoutingCostAssessment;
+@@ -161,6 +190,58 @@ function refused(): RoutingCostAssessment {
+   return { kind: "refused", monetaryUsd: null, networkRequestSent: false };
+ }
+ 
++function costSourceFrom(cost: RoutingCostAssessment): CostSource {
++  if (cost.kind === "observed_usage") return "provider_usage";
++  if (cost.kind === "refused") return "refused";
++  if (cost.kind === "estimation") return "estimation";
++  return "unknown";
++}
++
++function requestedModelIdOf(input: LlmJsonProviderInput): string | null {
++  return typeof input.modelId === "string" && input.modelId.length > 0 ? input.modelId : null;
++}
++
++function observedFrom(result: { observedModelId?: string | null }): string | null {
++  return typeof result.observedModelId === "string" && result.observedModelId.length > 0
++    ? result.observedModelId
++    : null;
++}
++
++function capabilityBlocked(
++  input: LlmJsonProviderInput,
++  block: ServerEmissionBlock,
++  configured: boolean,
++): LlmJsonProviderFailure {
++  const reservation: CallReservationSnapshot = configured
++    ? {
++        configured: true,
++        status: "refused",
++        currency: null,
++        reservedCents: null,
++        networkEmitted: false,
++        reconciliationRequired: false,
++        reason: block,
++        ...(input.modelId ? { accessClass: accessClassForModel(input.modelId) } : {}),
++      }
++    : unavailableReservation();
++  const cost = refused();
++  return {
++    ok: false,
++    errorCode: "capability_blocked",
++    fallbackReason: block,
++    failureChain: [],
++    requestedModelId: requestedModelIdOf(input),
++    provider: null,
++    ...(input.modelId ? { chosenModelId: input.modelId } : {}),
++    executedModelId: null,
++    usage: null,
++    costSource: costSourceFrom(cost),
++    attempts: [],
++    reservation,
++    cost,
++  };
++}
++
+ /**
+  * Global cost across attempts. Does not add dollars and does not drop an
+  * earlier attempt. A later observed usage does not erase a request that may
+@@ -281,9 +362,21 @@ export async function generateStructuredJson(
+   const callerId = randomUUID();
+   let reservation: CallReservationSnapshot = unavailableReservation();
+ 
++  if (input.serverCatalog && input.modelId) {
++    const assessment = assessServerEmission({
++      catalog: input.serverCatalog,
++      modelId: input.modelId,
++      workspaceId: input.workspaceId ?? "",
++      requiresTools: input.requiresTools === true,
++      nowMs: input.nowMs ?? Date.now(),
++    });
++    if (!assessment.emit) return capabilityBlocked(input, assessment.block, configured);
++  }
++
+   if (input.modelId) {
+     const target = executionTargetForModel(input.modelId);
+     if (!target.callable) {
++      const cost = refused();
+       if (configured) {
+         reservation = {
+           configured: true,
+@@ -301,11 +394,15 @@ export async function generateStructuredJson(
+         errorCode: "model_unsupported",
+         fallbackReason: target.reason,
+         failureChain: [],
++        requestedModelId: requestedModelIdOf(input),
++        provider: null,
+         chosenModelId: input.modelId,
+         executedModelId: null,
++        usage: null,
++        costSource: costSourceFrom(cost),
+         attempts: [],
+         reservation,
+-        cost: refused(),
++        cost,
+       };
+     }
+   }
+@@ -318,21 +415,39 @@ export async function generateStructuredJson(
+ 
+   for (const provider of order) {
+     if (provider !== "anthropic" && provider !== "openai") {
++      const cost = aggregateCost(attempts);
+       return {
+         ok: false,
+         errorCode: "model_unsupported",
+         fallbackReason: `${String(provider)} n'est pas un fournisseur pris en charge.`,
+         failureChain,
++        requestedModelId: requestedModelIdOf(input),
++        provider: null,
+         ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+         executedModelId: null,
++        usage: null,
++        costSource: costSourceFrom(cost),
+         attempts,
+         reservation,
+-        cost: aggregateCost(attempts),
++        cost,
+       };
+     }
+     attemptCount++;
+     const isFirstAttempt = attemptCount === 1;
+     const modelId = input.modelId ?? defaultModelFor(provider);
++    if (input.serverCatalog && !input.modelId) {
++      const assessment = assessServerEmission({
++        catalog: input.serverCatalog,
++        modelId,
++        workspaceId: input.workspaceId ?? "",
++        requiresTools: input.requiresTools === true,
++        nowMs: input.nowMs ?? Date.now(),
++      });
++      if (!assessment.emit) {
++        if (attempts.length === 0) return capabilityBlocked(input, assessment.block, configured);
++        break;
++      }
++    }
+     const maxTokens = maxTokensFor(provider, input.maxTokens);
+     const decision = await authorizeCallAttempt({
+       configured,
+@@ -359,16 +474,21 @@ export async function generateStructuredJson(
+       failureChain.push(`${provider}: reservation ${decision.reservation.reason ?? decision.reservation.status}`);
+       attempts.push({ provider, cost: refused() });
+       if (blocking) {
++        const cost = aggregateCost(attempts);
+         return {
+           ok: false,
+           errorCode: "reservation_blocked",
+           fallbackReason: failureChain[failureChain.length - 1],
+           failureChain,
++          requestedModelId: requestedModelIdOf(input),
++          provider: null,
+           ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+           executedModelId: null,
++          usage: null,
++          costSource: costSourceFrom(cost),
+           attempts,
+           reservation,
+-          cost: aggregateCost(attempts),
++          cost,
+         };
+       }
+       continue;
+@@ -422,26 +542,33 @@ export async function generateStructuredJson(
+     attempts.push({ provider, cost: attemptCost });
+ 
+     if (result.ok) {
++      const cost = aggregateCost(attempts);
++      const usage = result.tokenUsage ?? null;
+       return {
+         ok: true,
+         json: result.json,
+         rawText: result.rawText,
+         modelId: result.modelId,
++        requestedModelId: requestedModelIdOf(input),
+         ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+-        executedModelId: result.modelId,
++        executedModelId: observedFrom(result),
++        provider,
+         providerUsed: provider,
++        usage,
++        costSource: costSourceFrom(cost),
+         fallbackUsed: !isFirstAttempt,
+         failureChain,
+-        tokenUsage: result.tokenUsage,
++        ...(usage ? { tokenUsage: usage } : {}),
+         attempts,
+         reservation,
+-        cost: aggregateCost(attempts),
++        cost,
+       };
+     }
+ 
+     failureChain.push(`${provider}: ${result.fallbackReason}`);
+   }
+ 
++  const cost = aggregateCost(attempts);
+   return {
+     ok: false,
+     errorCode: order.length === 0 ? "no_provider_available" : "all_providers_failed",
+@@ -450,10 +577,14 @@ export async function generateStructuredJson(
+         ? failureChain[failureChain.length - 1]
+         : "No providers configured",
+     failureChain,
++    requestedModelId: requestedModelIdOf(input),
++    provider: null,
+     ...(input.modelId ? { chosenModelId: input.modelId } : {}),
+     executedModelId: null,
++    usage: null,
++    costSource: costSourceFrom(cost),
+     attempts,
+     reservation,
+-    cost: aggregateCost(attempts),
++    cost,
+   };
+ }
+diff --git a/src/server/ai/model-router.test.mjs b/src/server/ai/model-router.test.mjs
+index eb668ad..2abbcd9 100644
+--- a/src/server/ai/model-router.test.mjs
++++ b/src/server/ai/model-router.test.mjs
+@@ -198,18 +198,21 @@ test("budget pressure never lowers client_audit below premium", () => {
+   assert.equal(second.modelId, PREMIUM_MODEL_ID); // floor beats budget
+ });
+ 
+-test("shadow tagging does not force a free model when the catalog has no eligible entry", () => {
++test("shadow tagging does not emit a paid model when the free catalog is empty", () => {
+   resetLadderBudget();
+-  // Shadow-tagging default: a free-targeting class is supplied WITHOUT a
+-  // freeCatalog (exactly how the brain call sites tag in this phase). The ladder
+-  // must honestly degrade free → economy rather than invent a free model.
+   const decision = chooseModel({
+     message: "Reformule cette phrase simplement.",
+     taskClass: "classification",
+     agentId: "joris",
+     nowMs: FIXED_NOW,
+   });
+-  assert.equal(decision.modelId, ECONOMY_MODEL_ID);
++  assert.equal(decision.execution, "refused");
++  assert.equal(decision.refusalReason, "free_unavailable");
++  assert.equal(decision.executedModelId, null);
++  assert.equal(decision.estimate.kind, "estimation");
++  assert.equal(decision.estimate.relativeWeight, 0);
++  assert.equal(decision.estimate.monetaryUsd, null);
++  assert.match(decision.reason, /aucune descente payante/);
+   assert.equal(decision.via, "cost-ladder");
+   assert.notEqual(decision.modelId, FREE_MODEL.id);
+ });
+diff --git a/src/server/ai/model-router.ts b/src/server/ai/model-router.ts
+index 7023a6d..a8333e4 100644
+--- a/src/server/ai/model-router.ts
++++ b/src/server/ai/model-router.ts
+@@ -18,6 +18,10 @@ import {
+ } from "@/server/ai/cost-ladder";
+ import { recordCallAccounting } from "@/server/ai/call-accounting";
+ import { executionTargetForModel } from "@/server/ai/execution-models";
++import {
++  assessServerEmission,
++  type ServerCapabilityCatalog,
++} from "@/server/ai/server-capability-catalog";
+ 
+ export type ModelRouteInput = {
+   message: string;
+@@ -40,6 +44,14 @@ export type ModelRouteInput = {
+   budgetStore?: BudgetStore;
+   /** Journal scope only. Selection does not bill this workspace. */
+   workspaceId?: string;
++  /**
++   * Capabilities verified on the server. When present, a callable static id
++   * still has to be authorized for this workspace. Absent: the four API ids
++   * keep the existing path. This object is not a browser price list.
++   */
++  serverCatalog?: ServerCapabilityCatalog;
++  /** A tools-required call cannot select an entry whose tools flag is false. */
++  requiresTools?: boolean;
+ };
+ 
+ export type BrainRouteVia = "keyword" | "semantic-fallback" | "default" | "cost-ladder";
+@@ -315,7 +327,15 @@ function applyCostLadder(
+   let profile: ModelProfile | undefined;
+   const relativeWeight = decision.estimatedCost;
+ 
+-  if (decision.rung === "free" && decision.freeModel && unavailable.has(decision.freeModel.id)) {
++  if (decision.block === "free_unavailable") {
++    candidate = {
++      modelId: baseCandidate.modelId,
++      mode: resolveMode(requested, "economy"),
++      reason: decision.reason,
++      via: "cost-ladder",
++      refused: "free_unavailable",
++    };
++  } else if (decision.rung === "free" && decision.freeModel && unavailable.has(decision.freeModel.id)) {
+     candidate = {
+       modelId: decision.freeModel.id,
+       mode: resolveMode(requested, "economy"),
+@@ -448,6 +468,18 @@ export function chooseModel(input: ModelRouteInput): ModelRouteDecision {
+   } else if (!target.callable) {
+     execution = "refused";
+     refusalReason = target.reason;
++  } else if (input.serverCatalog) {
++    const assessment = assessServerEmission({
++      catalog: input.serverCatalog,
++      modelId: model.id,
++      workspaceId: input.workspaceId ?? "",
++      requiresTools: input.requiresTools === true,
++      nowMs: input.nowMs ?? Date.now(),
++    });
++    if (!assessment.emit) {
++      execution = "refused";
++      refusalReason = assessment.block;
++    }
+   }
+ 
+   const relativeWeight =
+diff --git a/src/server/ai/openai-json-client.ts b/src/server/ai/openai-json-client.ts
+index df0851f..6d104cb 100644
+--- a/src/server/ai/openai-json-client.ts
++++ b/src/server/ai/openai-json-client.ts
+@@ -47,7 +47,10 @@ export type OpenAiJsonSuccess = {
+   ok: true;
+   json: unknown;
+   rawText: string;
++  /** Id placed in the request. Not an observation of the model that ran. */
+   modelId: string;
++  /** `model` from the response body. Null when the body does not say. */
++  observedModelId: string | null;
+   tokenUsage?: { input: number; output: number };
+ };
+ 
+@@ -135,9 +138,12 @@ export async function generateJsonWithOpenAI(
+     }
+ 
+     const data = (await response.json()) as {
++      model?: string;
+       choices?: Array<{ message?: { content?: string } }>;
+       usage?: { prompt_tokens?: number; completion_tokens?: number };
+     };
++    const observedModelId =
++      typeof data.model === "string" && data.model.length > 0 ? data.model : null;
+ 
+     const rawText = data?.choices?.[0]?.message?.content ?? "";
+ 
+@@ -169,7 +175,7 @@ export async function generateJsonWithOpenAI(
+         ? { input: data.usage.prompt_tokens, output: data.usage.completion_tokens }
+         : undefined;
+ 
+-    return { ok: true, json, rawText, modelId, tokenUsage };
++    return { ok: true, json, rawText, modelId, observedModelId, tokenUsage };
+   } catch (err) {
+     if (isAbortError(err)) {
+       return {
+diff --git a/src/server/ai/routing-execution.test.mjs b/src/server/ai/routing-execution.test.mjs
+index c0a068c..ddbaea3 100644
+--- a/src/server/ai/routing-execution.test.mjs
++++ b/src/server/ai/routing-execution.test.mjs
+@@ -294,7 +294,7 @@ test("observed usage keeps token counts and a null monetary amount", async () =>
+   assert.notEqual(result.cost.monetaryUsd, 0);
+ });
+ 
+-test("the executed model id is the id placed in the request, not the client default", async () => {
++test("the request id is sent, and an absent response model stays unknown", async () => {
+   process.env.ANTHROPIC_API_KEY = "synthetic";
+   let sentModel = null;
+   const result = await generateStructuredJson({
+@@ -324,8 +324,8 @@ test("the executed model id is the id placed in the request, not the client defa
+   assert.equal(result.ok, true);
+   assert.equal(sentModel, PREMIUM_MODEL_ID);
+   assert.equal(result.modelId, PREMIUM_MODEL_ID);
+-  assert.equal(result.executedModelId, PREMIUM_MODEL_ID);
+-  assert.notEqual(result.executedModelId, "claude-haiku-4-5-20251001");
++  assert.equal(result.requestedModelId, PREMIUM_MODEL_ID);
++  assert.equal(result.executedModelId, null);
+   assert.equal(result.fallbackUsed, false);
+ });
+ 
+@@ -371,6 +371,7 @@ test("an economy selection stays on gpt-4o-mini and can be executed as that id",
+           ok: true,
+           status: 200,
+           json: async () => ({
++            model: ECONOMY_MODEL_ID,
+             choices: [{ message: { content: JSON.stringify({ reply: "ok" }) } }],
+             usage: { prompt_tokens: 3, completion_tokens: 4 },
+           }),
+@@ -381,7 +382,9 @@ test("an economy selection stays on gpt-4o-mini and can be executed as that id",
+   delete process.env.OPENAI_API_KEY;
+   assert.equal(anthropicCalls, 0);
+   assert.equal(sent, ECONOMY_MODEL_ID);
++  assert.equal(result.requestedModelId, ECONOMY_MODEL_ID);
+   assert.equal(result.executedModelId, ECONOMY_MODEL_ID);
++  assert.equal(result.provider, "openai");
+   assert.equal(result.providerUsed, "openai");
+ });
+ 
+diff --git a/src/server/ai/server-capability-catalog.test.mjs b/src/server/ai/server-capability-catalog.test.mjs
+new file mode 100644
+index 0000000..de68414
+--- /dev/null
++++ b/src/server/ai/server-capability-catalog.test.mjs
+@@ -0,0 +1,369 @@
++#!/usr/bin/env node
++
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..");
++
++const { createJiti } = await import("jiti");
++const jiti = createJiti(import.meta.url, {
++  alias: {
++    "@": path.join(projectRoot, "src"),
++    "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++  },
++});
++
++const catalogPath = path.join(projectRoot, "src/server/ai/server-capability-catalog.ts");
++const providerPath = path.join(projectRoot, "src/server/ai/llm-json-provider.ts");
++const routerPath = path.join(projectRoot, "src/server/ai/model-router.ts");
++
++const { assessServerEmission, TARIFF_MAX_AGE_MS } = await jiti.import(catalogPath);
++const { generateStructuredJson } = await jiti.import(providerPath);
++const { chooseModel } = await jiti.import(routerPath);
++
++const NOW = Date.parse("2026-10-02T12:00:00.000Z");
++const FRESH = new Date(NOW - 60_000).toISOString();
++const HAIKU = "claude-haiku-4-5-20251001";
++const WORKSPACE = "ws-catalogue";
++
++function entry(overrides = {}) {
++  return {
++    modelId: HAIKU,
++    provider: "anthropic",
++    state: "authorized",
++    source: "server-discovery",
++    observedAt: FRESH,
++    tools: true,
++    tariff: {
++      currency: "USD",
++      notToExceedCents: 40,
++      source: "server-quote",
++      observedAt: FRESH,
++    },
++    workspaceId: WORKSPACE,
++    ...overrides,
++  };
++}
++
++function catalog(entries) {
++  return { source: "server-discovery", observedAt: FRESH, entries };
++}
++
++function assess(overrides = {}, call = {}) {
++  return assessServerEmission({
++    catalog: catalog([entry(overrides)]),
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    requiresTools: false,
++    nowMs: NOW,
++    ...call,
++  });
++}
++
++test("listed, connected, and a foreign workspace grant no send", () => {
++  assert.equal(assess({ state: "listed" }).block, "public_catalog_only");
++  assert.equal(assess({ state: "connected" }).block, "not_authorized");
++  assert.equal(assess({}, { workspaceId: "other-workspace" }).block, "workspace_mismatch");
++  assert.equal(assessServerEmission({
++    catalog: catalog([entry()]),
++    modelId: "openrouter/free",
++    workspaceId: WORKSPACE,
++    requiresTools: false,
++    nowMs: NOW,
++  }).block, "not_listed");
++});
++
++test("tools, an unknown tariff, and a stale tariff stay explicit", () => {
++  assert.equal(assess({ tools: false }, { requiresTools: true }).block, "tools_unavailable");
++  assert.equal(assess({ tariff: null }).block, "tariff_unknown");
++  assert.equal(assess({
++    tariff: {
++      currency: "USD",
++      notToExceedCents: 40,
++      source: "server-quote",
++      observedAt: new Date(NOW - TARIFF_MAX_AGE_MS - 1).toISOString(),
++    },
++  }).block, "tariff_stale");
++  assert.equal(assess({
++    tariff: {
++      currency: "USD",
++      notToExceedCents: 40,
++      source: "server-quote",
++      observedAt: "pas-une-date",
++    },
++  }).block, "tariff_stale");
++  const allowed = assess();
++  assert.equal(allowed.emit, true);
++  assert.equal(allowed.capability.state, "authorized");
++});
++
++test("a catalog block emits nothing and does not reserve", async () => {
++  let fetches = 0;
++  let reserves = 0;
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.HQ_CALL_RESERVATION = "1";
++  const result = await generateStructuredJson({
++    providerPreference: "auto",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-blocked",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: catalog([entry({ state: "listed", source: "openrouter-public" })]),
++    reservationGate: {
++      async reserve() {
++        reserves += 1;
++        throw new Error("reserve must not run");
++      },
++      async markEmitted() {
++        throw new Error("mark must not run");
++      },
++      async release() {
++        throw new Error("release must not run");
++      },
++      async consume() {
++        throw new Error("consume must not run");
++      },
++    },
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("fetch must not run");
++      },
++      openai: async () => {
++        fetches += 1;
++        throw new Error("fetch must not run");
++      },
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  delete process.env.HQ_CALL_RESERVATION;
++  assert.equal(fetches, 0);
++  assert.equal(reserves, 0);
++  assert.equal(result.ok, false);
++  assert.equal(result.errorCode, "capability_blocked");
++  assert.equal(result.fallbackReason, "public_catalog_only");
++  assert.equal(result.attempts.length, 0);
++  assert.equal(result.requestedModelId, HAIKU);
++  assert.equal(result.executedModelId, null);
++  assert.equal(result.provider, null);
++  assert.equal(result.usage, null);
++  assert.equal(result.costSource, "refused");
++  assert.equal(result.cost.kind, "refused");
++  assert.equal(result.cost.networkRequestSent, false);
++  assert.equal(result.cost.monetaryUsd, null);
++});
++
++test("an authorized free id with no client is not replaced by a paid provider", async () => {
++  let fetches = 0;
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  const freeId = "google/gemma-4-31b-it:free";
++  const result = await generateStructuredJson({
++    providerPreference: "auto",
++    modelId: freeId,
++    workspaceId: WORKSPACE,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    requiresTools: true,
++    paidFallback: { authorized: true, workspaceId: WORKSPACE },
++    serverCatalog: catalog([entry({
++      modelId: freeId,
++      provider: "openrouter",
++      tools: true,
++    })]),
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("anthropic must not run");
++      },
++      openai: async () => {
++        fetches += 1;
++        throw new Error("openai must not run");
++      },
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  delete process.env.OPENAI_API_KEY;
++  assert.equal(fetches, 0);
++  assert.equal(result.ok, false);
++  assert.equal(result.errorCode, "model_unsupported");
++  assert.equal(result.attempts.length, 0);
++  assert.equal(result.requestedModelId, freeId);
++  assert.equal(result.executedModelId, null);
++  assert.equal(result.cost.networkRequestSent, false);
++});
++
++test("a present catalog still blocks a static api id that is not authorized", async () => {
++  let fetches = 0;
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const result = await generateStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: catalog([]),
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("fetch must not run");
++      },
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(fetches, 0);
++  assert.equal(result.errorCode, "capability_blocked");
++  assert.equal(result.fallbackReason, "not_listed");
++});
++
++test("observed execution is the response model, and estimation stays on chooseModel", async () => {
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const observed = "claude-haiku-4-5-20251001-observed";
++  const result = await generateStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: catalog([entry()]),
++    fetchFns: {
++      anthropic: async () => ({
++        ok: true,
++        status: 200,
++        json: async () => ({
++          model: observed,
++          content: [{ type: "text", text: JSON.stringify({ reply: "ok" }) }],
++          usage: { input_tokens: 2, output_tokens: 3 },
++        }),
++      }),
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(result.ok, true);
++  assert.equal(result.requestedModelId, HAIKU);
++  assert.equal(result.modelId, HAIKU);
++  assert.equal(result.executedModelId, observed);
++  assert.notEqual(result.executedModelId, result.requestedModelId);
++  assert.equal(result.provider, "anthropic");
++  assert.deepEqual(result.usage, { input: 2, output: 3 });
++  assert.equal(result.costSource, "provider_usage");
++  assert.equal(result.cost.kind, "observed_usage");
++  assert.equal(result.cost.monetaryUsd, null);
++
++  const route = chooseModel({
++    message: "bonjour",
++    requestedMode: "economy",
++    nowMs: NOW,
++    workspaceId: WORKSPACE,
++    serverCatalog: catalog([entry({ modelId: "gpt-4o-mini", provider: "openai" })]),
++  });
++  assert.equal(route.estimate.kind, "estimation");
++  assert.equal(route.executedModelId, null);
++  assert.equal(route.execution, "callable");
++  assert.equal(route.accountingEffect, "none");
++});
++
++test("a lost provider response is followed by a single emission", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  delete process.env.OPENAI_API_KEY;
++  let sockets = 0;
++  let marked = false;
++  const gate = {
++    async reserve() {
++      if (marked) {
++        return {
++          configured: true,
++          status: "lost",
++          reason: "emit_right_held",
++          currency: null,
++          reservedCents: null,
++          networkEmitted: false,
++          reconciliationRequired: false,
++        };
++      }
++      return {
++        configured: true,
++        status: "held",
++        currency: "USD",
++        reservedCents: 40,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++    },
++    async markEmitted() {
++      marked = true;
++      return {
++        configured: true,
++        status: "emitted_unknown",
++        currency: "USD",
++        reservedCents: 40,
++        networkEmitted: true,
++        reconciliationRequired: true,
++      };
++    },
++    async release() {
++      return {
++        configured: true,
++        status: "emitted_unknown",
++        reason: "release_refused",
++        currency: "USD",
++        reservedCents: 40,
++        networkEmitted: true,
++        reconciliationRequired: true,
++      };
++    },
++    async consume() {
++      throw new Error("consume must not run after a lost response");
++    },
++  };
++  const input = {
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-lost-response",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    reservationGate: gate,
++    fetchFns: {
++      anthropic: async () => {
++        sockets += 1;
++        const error = new Error("response lost");
++        error.name = "AbortError";
++        throw error;
++      },
++      openai: async () => {
++        sockets += 1;
++        throw new Error("openai must not run");
++      },
++    },
++  };
++  try {
++    const first = await generateStructuredJson(input);
++    assert.equal(sockets, 1);
++    assert.equal(first.ok, false);
++    assert.equal(first.reservation.status, "emitted_unknown");
++    assert.equal(first.reservation.reservedCents, 40);
++    assert.equal(first.reservation.reconciliationRequired, true);
++    assert.equal(first.executedModelId, null);
++    assert.equal(first.cost.monetaryUsd, null);
++
++    const second = await generateStructuredJson(input);
++    assert.equal(sockets, 1);
++    assert.equal(second.ok, false);
++    assert.equal(second.reservation.status, "lost");
++    assert.equal(second.cost.networkRequestSent, false);
++    assert.equal(second.executedModelId, null);
++  } finally {
++    delete process.env.HQ_CALL_RESERVATION;
++    delete process.env.ANTHROPIC_API_KEY;
++  }
++});
+diff --git a/src/server/ai/server-capability-catalog.ts b/src/server/ai/server-capability-catalog.ts
+new file mode 100644
+index 0000000..a753136
+--- /dev/null
++++ b/src/server/ai/server-capability-catalog.ts
+@@ -0,0 +1,132 @@
++/**
++ * Server capability catalog consumed by the existing router.
++ *
++ * Claude fills this object from a server-side discovery module outside
++ * src/server/ai. This file does not discover accounts, call a provider, or
++ * read a browser payload. A public model list can only be represented as
++ * state "listed". Listed and connected grant no send. Prices and
++ * authorizations are fields of this server object, never of an HTTP body.
++ *
++ * Tariff age is the server constant below. The browser cannot extend it.
++ */
++
++export const TARIFF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
++
++export type CapabilityState = "listed" | "connected" | "authorized";
++
++export type ServerTariff = {
++  currency: "USD";
++  notToExceedCents: number;
++  source: string;
++  observedAt: string;
++};
++
++export type ServerCapability = {
++  modelId: string;
++  provider: string;
++  state: CapabilityState;
++  source: string;
++  observedAt: string;
++  tools: boolean;
++  tariff: ServerTariff | null;
++  workspaceId: string;
++};
++
++export type ServerCapabilityCatalog = {
++  source: string;
++  observedAt: string;
++  entries: readonly ServerCapability[];
++};
++
++export type ServerEmissionBlock =
++  | "not_listed"
++  | "public_catalog_only"
++  | "not_authorized"
++  | "workspace_mismatch"
++  | "tools_unavailable"
++  | "tariff_unknown"
++  | "tariff_stale";
++
++export type ServerEmissionAssessment =
++  | { emit: true; capability: ServerCapability }
++  | { emit: false; block: ServerEmissionBlock; requestedModelId: string };
++
++export function assessServerEmission(input: {
++  catalog: ServerCapabilityCatalog;
++  modelId: string;
++  workspaceId: string;
++  requiresTools: boolean;
++  nowMs: number;
++}): ServerEmissionAssessment {
++  const requestedModelId = input.modelId;
++  const entries = Array.isArray(input.catalog?.entries) ? input.catalog.entries : [];
++  const sameModel = entries.filter(
++    (entry) => entry?.modelId === input.modelId && verifiedEntry(entry),
++  );
++  if (sameModel.length === 0) {
++    return { emit: false, block: "not_listed", requestedModelId };
++  }
++
++  const workspaceId = input.workspaceId;
++  const sameWorkspace = sameModel.filter(
++    (entry) => workspaceId.length > 0 && entry.workspaceId === workspaceId,
++  );
++  if (sameWorkspace.length === 0) {
++    return { emit: false, block: "workspace_mismatch", requestedModelId };
++  }
++
++  const entry = sameWorkspace[0];
++  if (entry.state === "listed") {
++    return { emit: false, block: "public_catalog_only", requestedModelId };
++  }
++  if (entry.state === "connected") {
++    return { emit: false, block: "not_authorized", requestedModelId };
++  }
++  if (entry.state !== "authorized") {
++    return { emit: false, block: "not_listed", requestedModelId };
++  }
++  if (input.requiresTools && entry.tools !== true) {
++    return { emit: false, block: "tools_unavailable", requestedModelId };
++  }
++
++  const tariffBlock = readTariff(entry.tariff, input.nowMs);
++  if (tariffBlock) {
++    return { emit: false, block: tariffBlock, requestedModelId };
++  }
++  return { emit: true, capability: entry };
++}
++
++function verifiedEntry(entry: ServerCapability): boolean {
++  return (
++    typeof entry.modelId === "string"
++    && entry.modelId.length > 0
++    && typeof entry.provider === "string"
++    && entry.provider.length > 0
++    && (entry.state === "listed" || entry.state === "connected" || entry.state === "authorized")
++    && typeof entry.source === "string"
++    && entry.source.length > 0
++    && Number.isFinite(Date.parse(entry.observedAt))
++    && typeof entry.tools === "boolean"
++    && typeof entry.workspaceId === "string"
++  );
++}
++
++function readTariff(
++  tariff: ServerTariff | null,
++  nowMs: number,
++): "tariff_unknown" | "tariff_stale" | null {
++  if (!tariff || typeof tariff !== "object") return "tariff_unknown";
++  if (tariff.currency !== "USD") return "tariff_unknown";
++  if (
++    typeof tariff.notToExceedCents !== "number"
++    || !Number.isSafeInteger(tariff.notToExceedCents)
++    || tariff.notToExceedCents <= 0
++  ) {
++    return "tariff_unknown";
++  }
++  if (typeof tariff.source !== "string" || tariff.source.length === 0) return "tariff_unknown";
++  const observedAt = Date.parse(tariff.observedAt);
++  if (!Number.isFinite(observedAt) || observedAt > nowMs) return "tariff_stale";
++  if (nowMs - observedAt > TARIFF_MAX_AGE_MS) return "tariff_stale";
++  return null;
++}
+-- 
+2.43.0
+
