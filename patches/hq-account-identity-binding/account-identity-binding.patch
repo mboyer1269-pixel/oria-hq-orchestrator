@@ -1,0 +1,248 @@
+diff --git a/src/server/agents/models/account-identity-binding.test.mjs b/src/server/agents/models/account-identity-binding.test.mjs
+new file mode 100644
+index 0000000..adf763b
+--- /dev/null
++++ b/src/server/agents/models/account-identity-binding.test.mjs
+@@ -0,0 +1,125 @@
++#!/usr/bin/env node
++
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..", "..");
++
++test("Account identity binding tests", async (t) => {
++  const { createJiti } = await import("jiti");
++  const jiti = createJiti(import.meta.url, {
++    alias: {
++      "@": path.join(projectRoot, "src"),
++      "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++    },
++  });
++
++  const { resolveOpaqueAccountId, createInMemoryAccountIdentityStore } = await jiti.import(
++    "./account-identity-binding",
++    { default: false },
++  );
++
++  await t.test("the same email always resolves to the same accountId", () => {
++    const store = createInMemoryAccountIdentityStore();
++    const first = resolveOpaqueAccountId("person@example.com", store);
++    const second = resolveOpaqueAccountId("person@example.com", store);
++    assert.equal(first, second);
++  });
++
++  await t.test("different emails resolve to different accountIds", () => {
++    const store = createInMemoryAccountIdentityStore();
++    const a = resolveOpaqueAccountId("a@example.com", store);
++    const b = resolveOpaqueAccountId("b@example.com", store);
++    assert.notEqual(a, b);
++  });
++
++  await t.test("accountId is never derived from the email - it is a random UUID, not a hash", async () => {
++    const store = createInMemoryAccountIdentityStore();
++    const email = "person@example.com";
++    const accountId = resolveOpaqueAccountId(email, store);
++    // A hash of a known input is deterministic and reproducible by the
++    // caller; this proves the result is NOT any such reproducible function
++    // of the email by checking it against a few of the most obvious
++    // candidate derivations a reviewer might worry about.
++    const crypto = await import("node:crypto");
++    const sha256 = crypto.createHash("sha256").update(email).digest("hex");
++    assert.notEqual(accountId, sha256);
++    assert.notEqual(accountId, email);
++    assert.match(accountId, /^[0-9a-f-]{36}$/);
++  });
++
++  await t.test("the SAME email resolved against two INDEPENDENT fresh stores produces DIFFERENT accountIds - proving true randomness, not a swappable deterministic derivation", () => {
++    // Review-caught gap: checking accountId !== sha256(email) only rules out
++    // ONE specific deterministic function. A fresh store each time + two
++    // different results for the identical input is what actually proves
++    // resolveOpaqueAccountId is not any reproducible function of the email
++    // at all - swap randomUUID() for ANY deterministic derivation (hash,
++    // HMAC, reshaped hash) and this specific assertion starts failing,
++    // where the sha256-only check would not have caught it.
++    const email = "determinism-check@example.com";
++    const first = resolveOpaqueAccountId(email, createInMemoryAccountIdentityStore());
++    const second = resolveOpaqueAccountId(email, createInMemoryAccountIdentityStore());
++    assert.notEqual(first, second);
++  });
++
++  await t.test("the real email is never present in the returned accountId value", () => {
++    const store = createInMemoryAccountIdentityStore();
++    const email = "distinctive-marker@example.com";
++    const accountId = resolveOpaqueAccountId(email, store);
++    assert.doesNotMatch(accountId, /distinctive-marker/);
++  });
++
++  await t.test("the stored record carries the email, but resolveOpaqueAccountId's return value never does", () => {
++    const store = createInMemoryAccountIdentityStore();
++    const email = "stored@example.com";
++    const accountId = resolveOpaqueAccountId(email, store);
++    const record = store.findByEmail(email);
++    assert.equal(record.email, email);
++    assert.equal(record.accountId, accountId);
++  });
++
++  await t.test("an empty or non-string email is refused, never silently coerced", () => {
++    const store = createInMemoryAccountIdentityStore();
++    assert.throws(() => resolveOpaqueAccountId("", store), TypeError);
++    assert.throws(() => resolveOpaqueAccountId("   ", store), TypeError);
++    assert.throws(() => resolveOpaqueAccountId(undefined, store), TypeError);
++  });
++
++  await t.test("the same email with different casing or incidental whitespace still resolves to the SAME accountId", () => {
++    // Review-caught gap: without normalization, the exact same human's
++    // email coming back differently-cased or whitespace-padded across two
++    // probes would silently mint a second, different accountId - breaking
++    // the one guarantee this module exists to provide.
++    const store = createInMemoryAccountIdentityStore();
++    const canonical = resolveOpaqueAccountId("Person@Example.com", store);
++    const paddedLower = resolveOpaqueAccountId("  person@example.com  ", store);
++    const upper = resolveOpaqueAccountId("PERSON@EXAMPLE.COM", store);
++    assert.equal(canonical, paddedLower);
++    assert.equal(canonical, upper);
++  });
++
++  await t.test("the stored record's email is the normalized form, never the original differently-cased input", () => {
++    const store = createInMemoryAccountIdentityStore();
++    resolveOpaqueAccountId("Person@Example.com", store);
++    const record = store.findByEmail("person@example.com");
++    assert.ok(record, "a lookup by the normalized form must find the record");
++    assert.equal(record.email, "person@example.com");
++  });
++
++  await t.test("firstObservedAtIso comes from the injected clock, never a hidden Date.now()", () => {
++    const store = createInMemoryAccountIdentityStore();
++    const fixedClock = () => "2026-01-01T00:00:00.000Z";
++    resolveOpaqueAccountId("clocked@example.com", store, fixedClock);
++    const record = store.findByEmail("clocked@example.com");
++    assert.equal(record.firstObservedAtIso, "2026-01-01T00:00:00.000Z");
++  });
++
++  await t.test("a direct duplicate create() on the in-memory store refuses rather than overwriting", () => {
++    const store = createInMemoryAccountIdentityStore();
++    store.create({ email: "dup@example.com", accountId: "x", firstObservedAtIso: "2026-01-01T00:00:00.000Z" });
++    assert.throws(() => store.create({ email: "dup@example.com", accountId: "y", firstObservedAtIso: "2026-01-01T00:00:00.000Z" }));
++  });
++});
+diff --git a/src/server/agents/models/account-identity-binding.ts b/src/server/agents/models/account-identity-binding.ts
+new file mode 100644
+index 0000000..da735d1
+--- /dev/null
++++ b/src/server/agents/models/account-identity-binding.ts
+@@ -0,0 +1,111 @@
++// src/server/agents/models/account-identity-binding.ts
++//
++// Opaque, server-side-only surrogate binding from an officially-returned
++// per-USER identifier (e.g. the `email` field of `claude auth status
++// --json`) to a stable `accountId` - never a hash of that identifier.
++//
++// Why not a hash: local-runtime-probe.ts's own classifyClaudeCodeProbe
++// comment (and the independent review that produced it) correctly rules out
++// hashing email for this purpose - email is a low-entropy personal
++// identifier, so a hash of it is reversible by dictionary/rainbow-table,
++// unlike a hash of a high-entropy value. That reasoning is correct FOR A
++// HASH. It does not make every use of an officially-returned user
++// identifier unsafe - only a *reversible* derivation of it. This module
++// uses a different shape entirely: a randomly generated, non-derived
++// accountId (crypto.randomUUID()), looked up through a private server-side
++// store keyed by the real identifier. The identifier itself never leaves
++// this module or its store; only the random accountId propagates upward
++// into evidence, logs, or ProviderConnectionProbeOutcome.accountId.
++//
++// What this module does NOT do:
++//   - Does not read any credential file. The caller is responsible for
++//     obtaining `email` from a real, already-qualified probe
++//     (classifyClaudeCodeProbe's own `claude auth status --json` call) -
++//     this module never touches the filesystem for that.
++//   - Does not enforce OS-level directory protection itself. The injected
++//     store's backing location must already be protected the same way
++//     provider_policy.py's policy registry is (root-owned, no group/other
++//     write bit) - this module composes with that expectation, it does not
++//     re-implement it.
++//   - Does not decide the email-rotation question (what happens if the
++//     same human's email changes) - see the module doc on
++//     resolveOpaqueAccountId below. That is an explicit operator decision,
++//     not something this module assumes.
++
++import { randomUUID } from "node:crypto";
++
++export type AccountIdentityRecord = {
++  email: string;
++  accountId: string;
++  firstObservedAtIso: string;
++};
++
++export type AccountIdentityStore = {
++  findByEmail(email: string): AccountIdentityRecord | undefined;
++  create(record: AccountIdentityRecord): void;
++};
++
++/**
++ * Resolves a stable, opaque accountId for a real, officially-returned
++ * email. The SAME email always resolves to the SAME accountId (looked up
++ * by exact match before creating a new one) - stable across repeated
++ * probes, as model-emission-launch-gate.ts's attestedAccountStillMatches
++ * re-check requires.
++ *
++ * Rotation is intentionally NOT handled: a different email is always a
++ * different accountId, even if it is the same human under a changed
++ * Anthropic account email. This is the deliberately cautious default -
++ * never silently treating two different emails as a continuous identity.
++ * An operator-approved migration path (carrying an old accountId forward
++ * across a known email change) is a separate, explicit decision this
++ * function does not make on its own.
++ *
++ * Never returns or logs the email itself - only ever the accountId.
++ *
++ * The email is normalized (trimmed, lower-cased) BEFORE being used as the
++ * store's lookup/storage key. Caught in independent review before this was
++ * ever wired anywhere: without this, the exact same human's email coming
++ * back with incidental whitespace or different casing across two probes
++ * (plausible across a JSON/CLI round-trip) would silently mint a SECOND,
++ * different accountId for one account - breaking the "same email -> same
++ * accountId" stability model-emission-launch-gate.ts's
++ * attestedAccountStillMatches depends on. The normalized form is also what
++ * gets persisted - never the original, differently-cased input - so every
++ * later lookup for any casing/whitespace variant of the same address
++ * converges on one record.
++ */
++export function resolveOpaqueAccountId(
++  email: string,
++  store: AccountIdentityStore,
++  clock: () => string = () => new Date().toISOString(),
++): string {
++  if (typeof email !== "string" || email.trim() === "") {
++    throw new TypeError("resolveOpaqueAccountId requires a non-empty email");
++  }
++  const normalizedEmail = email.trim().toLowerCase();
++  const existing = store.findByEmail(normalizedEmail);
++  if (existing) return existing.accountId;
++  const accountId = randomUUID();
++  store.create({ email: normalizedEmail, accountId, firstObservedAtIso: clock() });
++  return accountId;
++}
++
++/**
++ * An in-memory store for tests and short-lived callers - never a real
++ * persistence mechanism. A real deployment must inject a store backed by
++ * the same protected-path class as provider_policy.py's policy registry;
++ * none is provided by this module, so a caller cannot reach for a default
++ * that is not actually protected.
++ */
++export function createInMemoryAccountIdentityStore(): AccountIdentityStore {
++  const byEmail = new Map<string, AccountIdentityRecord>();
++  return {
++    findByEmail: (email) => byEmail.get(email),
++    create: (record) => {
++      if (byEmail.has(record.email)) {
++        throw new Error("Duplicate account identity record for the same email");
++      }
++      byEmail.set(record.email, record);
++    },
++  };
++}

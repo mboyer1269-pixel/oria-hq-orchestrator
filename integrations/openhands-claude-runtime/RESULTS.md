@@ -84,10 +84,15 @@ stderr (texte d'aide officiel, pas un secret) : fichier de profil
   non exécutée par ce lot (préserve l'original).
 ```
 
-`loggedIn: true` établit une CONNEXION réelle via abonnement — pas une
+**Correction (lot suivant, `docs/CLAUDE-SUITE-QUALIFICATION-REELLE.md`)** :
+`loggedIn: true` indique qu'un identifiant de session d'abonnement est
+PRÉSENT et structurellement lisible localement par ce CLI — pas une
 autorisation HQ, pas une identité de compte (conforme à la correction du
-lot précédent : aucune identité par-utilisateur n'est extraite ni
-fabriquée ici, et `orgId` reste absent de toute façon). `codex-acp` dans
+lot précédent). Le réseau `bridge` était atteignable pendant cette sonde,
+mais aucune preuve n'a été recueillie qu'un appel réseau réel de validation
+ait eu lieu (ni capture, ni log réseau conservé) : ne pas lire ce résultat
+comme une validation distante confirmée, seulement comme une reconnaissance
+locale cohérente. `codex-acp` dans
 cette image n'a aucune sous-commande `login`/`doctor`/`auth` (confirmé par
 `--help` : seulement `-c/--config` et `-h/--help`, aucun binaire `codex`
 nu sur le PATH) — aucune tentative, rien à rediger.
@@ -252,15 +257,26 @@ exactement, jamais un nombre arbitraire) ; un test de non-régression prouve
 qu'un troisième répétition reste refusée. Aucune valeur brute de ce stderr
 n'a été imprimée à aucun moment, dans le script ni dans cette investigation.
 
-### 4. Statut réellement observé — identité toujours inconnue
+### 4. Statut réellement observé — reconnaissance locale, pas une validation distante
 
-**Connexion réelle par abonnement établie avec CE candidat** (0.84.0/CLI
+**Correction par rapport à la rédaction initiale de ce lot**
+(`docs/CLAUDE-SUITE-QUALIFICATION-REELLE.md`, point 1) : cette sonde a
+tourné sous `--network none` — aucun appel réseau n'est possible, donc
+`auth status --json` n'a pu lire QUE l'état local déjà persisté sur disque
+(fichier de credentials existant), jamais contacté un serveur Anthropic.
+**Session d'abonnement reconnue LOCALEMENT** par ce candidat (0.84.0/CLI
 2.1.284) : `loggedIn=true`, `authMethod="claude.ai"`,
-`apiProvider="firstParty"`, `subscriptionType="pro"`. Ceci répond à la
-question laissée ouverte par la section précédente : les jetons OAuth de la
-session existante **sont compatibles** avec l'adaptateur/CLI plus récents de
-ce candidat — vérifié, pas supposé. Aucun login interactif n'a été
-nécessaire. Identité utilisateur (email, orgId, orgName) : présente dans la
+`apiProvider="firstParty"`, `subscriptionType="pro"`. Ceci prouve que le
+CLI plus récent de ce candidat PARSE et ACCEPTE STRUCTURELLEMENT le même
+format de fichier de credentials que l'ancien, sans erreur — PAS que le
+jeton OAuth qu'il contient est toujours valide ou accepté par le
+fournisseur distant aujourd'hui. Cette question (compatibilité OAuth
+réellement acceptée côté serveur) reste OUVERTE et n'est volontairement pas
+testée ici : le mandat interdit tout appel modèle/API, donc le réseau a été
+supprimé par construction, pas seulement par promesse. Ne plus annoncer une
+« connexion fournisseur vérifiée » sur la seule base de ce résultat. Aucun
+login interactif n'a été nécessaire. Identité utilisateur (email, orgId,
+orgName) : présente dans la
 réponse mais jamais lue ni imprimée par valeur — reste explicitement
 inconnue pour ce rapport, conformément à la correction du lot précédent
 (un `orgId` n'est pas un identifiant utilisateur). Codex : toujours aucune
@@ -281,8 +297,9 @@ dans la section précédente) toujours non touchés.
 ### Recette d'une première mission (mise à jour, toujours NON exécutée)
 
 Les étapes 1 et 2 de la recette précédente sont maintenant faites (build
-réel, sonde rejouée, compatibilité de session vérifiée). Restant avant toute
-mission réelle :
+réel, sonde rejouée, session locale reconnue — compatibilité OAuth distante
+réellement acceptée toujours NON vérifiée, volontairement, par absence de
+réseau). Restant avant toute mission réelle :
 
 1. Obtenir l'approbation écrite explicite de Michael pour : (a) une policy/
    compte approuvés dans le registre existant (`provider_policy.py`,

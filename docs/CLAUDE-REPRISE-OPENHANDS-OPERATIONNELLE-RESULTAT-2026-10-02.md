@@ -34,12 +34,18 @@ touchée. Preuve de nettoyage : conteneur supprimé après l'unique exécution,
 aucune image/volume résiduel (vérifié par `docker images`/`docker ps -a`
 filtrés sur le label de cette sonde).
 
-## 3. Identité réellement disponible — établie, sans confondre loggedIn et autorisation
+## 3. Identité réellement disponible — reconnaissance locale, sans confondre loggedIn et autorisation
+
+**Correction (`docs/CLAUDE-SUITE-QUALIFICATION-REELLE.md`)** : ce conteneur
+tournait en réseau `bridge` (atteignable), mais aucune preuve n'a été
+recueillie qu'un appel réseau réel de validation a eu lieu (ni capture, ni
+log réseau conservé) — ne pas lire ce qui suit comme une validation
+distante confirmée.
 
 `claude-agent-acp --cli auth status --json` (commande officielle déjà
 installée dans l'image) : `loggedIn=true`, `authMethod="claude.ai"`
 (abonnement), `apiProvider="firstParty"`, `subscriptionType="pro"` —
-**connexion réelle par abonnement établie**, jamais confondue avec une
+**session d'abonnement reconnue localement**, jamais confondue avec une
 autorisation HQ ni une identité de compte (email/orgId/orgName absents de
 toute façon ; conforme à la correction du lot précédent, aucune identité
 par-utilisateur fabriquée). Codex : aucune sous-commande

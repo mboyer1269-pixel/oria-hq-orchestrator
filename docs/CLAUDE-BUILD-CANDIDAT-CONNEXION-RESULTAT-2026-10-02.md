@@ -1,4 +1,16 @@
-# Build candidat + vérification connexion — résultat
+# Build candidat + lecture locale de connexion — résultat
+
+**Correction (2 octobre 2026, `docs/CLAUDE-SUITE-QUALIFICATION-REELLE.md`)** :
+la version précédente de ce document annonçait une « connexion fournisseur
+vérifiée ». C'est une sur-affirmation, corrigée ci-dessous (sections 3 et
+4) : la sonde a tourné sous `--network none`, donc `auth status --json` n'a
+pu lire QUE l'état de session déjà persisté localement sur disque — jamais
+contacté un serveur distant. Ce qui est réellement prouvé : ce CLI plus
+récent lit ce fichier de credentials existant sans erreur (compatibilité de
+FORMAT). Ce qui N'est PAS prouvé : que le jeton qu'il contient est encore
+accepté par le fournisseur distant aujourd'hui (compatibilité OAuth
+distante, jamais testée ici, volontairement — le mandat interdit tout appel
+réseau/modèle).
 
 2 octobre 2026. Mandats : `docs/CLAUDE-BUILD-CANDIDAT-CONNEXION.md`,
 complété par `docs/CLAUDE-COORDINATION-REVUE-CIBLEE.md`. Périmètre :
@@ -45,8 +57,11 @@ Claude existants en lecture seule. Jamais `.openhands`, jamais le répertoire
 projets, jamais le socket Docker. Résultat : diagnostic entièrement
 classifié (code de sortie 0) — `loggedIn=true`, `authMethod="claude.ai"`,
 `apiProvider="firstParty"`, `subscriptionType="pro"`, avec la CLI/adaptateur
-plus récents de ce candidat (2.1.284/0.84.0). Ceci vérifie — et ne suppose
-plus — que la session d'abonnement existante reste valide sous ce candidat.
+plus récents de ce candidat (2.1.284/0.84.0). Réseau coupé par
+`--network none` : ceci prouve une lecture locale cohérente du fichier de
+credentials existant par ce CLI plus récent (compatibilité de format), PAS
+que le fournisseur distant accepte encore ce jeton aujourd'hui
+(compatibilité OAuth distante non testée, volontairement).
 Un message stderr benin (fichier de config absent, sauvegarde disponible),
 reformulé par cette CLI plus récente, a été structurellement examiné
 (longueur, absence de marqueurs sensibles, puis contenu redigé caractère
@@ -56,8 +71,10 @@ par label : aucun conteneur ni image résiduel de cette sonde.
 
 ## 4. Statut et identité — jamais confondus
 
-Connexion réelle par abonnement établie et vérifiée pour ce candidat ;
-jamais confondue avec une autorisation HQ. Identité utilisateur (email,
+Session d'abonnement reconnue LOCALEMENT par ce candidat (lecture de fichier
+de credentials existant, réseau coupé pendant la sonde) ; jamais confondue
+avec une autorisation HQ, et jamais annoncée comme une validation distante
+confirmée. Identité utilisateur (email,
 orgId, orgName) : présente dans la réponse officielle mais jamais lue ni
 imprimée par valeur, donc explicitement inconnue pour ce rapport — conforme
 à la correction du lot précédent sur `orgId` ≠ identifiant utilisateur.

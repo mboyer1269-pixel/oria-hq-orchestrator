@@ -1,3 +1,5 @@
 # Preserve Linux-compatible line endings for VPS entry points.
 *.sh text eol=lf
 integrations/openhands-claude-runtime/claude-agent-acp text eol=lf
+# git apply is line-ending sensitive; CRLF mangling would corrupt the diff.
+*.patch text eol=lf
