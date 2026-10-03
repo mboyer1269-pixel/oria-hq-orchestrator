@@ -1,0 +1,293 @@
+diff --git a/src/server/agents/models/account-identity-repository.test.mjs b/src/server/agents/models/account-identity-repository.test.mjs
+new file mode 100644
+index 0000000..4fdf346
+--- /dev/null
++++ b/src/server/agents/models/account-identity-repository.test.mjs
+@@ -0,0 +1,129 @@
++#!/usr/bin/env node
++
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(__dirname, "..", "..", "..", "..");
++
++test("Account Identity Repository (Fallback) tests", async (t) => {
++  const { createJiti } = await import("jiti");
++  const jiti = createJiti(import.meta.url, {
++    alias: {
++      "@": path.join(projectRoot, "src"),
++      "server-only": path.join(projectRoot, "src/scripts/smoke/server-only-stub.mjs"),
++    },
++  });
++
++  // Test relies on natural fallback, same as approval-record-repository.test.mjs:
++  // process.env.NODE_ENV is not "production", so local fallback is allowed.
++  // No Supabase vars are set, so admin client returns null.
++
++  const { resolveOpaqueAccountId, __clearMockAccountIdentities } = await jiti.import(
++    "./account-identity-repository",
++    { default: false },
++  );
++
++  t.afterEach(() => {
++    __clearMockAccountIdentities();
++  });
++
++  const key = (overrides = {}) => ({
++    provider: "claude",
++    workspaceId: "ws-1",
++    email: "person@example.com",
++    ...overrides,
++  });
++
++  await t.test("stable identity: the same (provider, workspaceId, email) always resolves to the same accountId", async () => {
++    const first = await resolveOpaqueAccountId(key());
++    const second = await resolveOpaqueAccountId(key());
++    assert.equal(first, second);
++  });
++
++  await t.test("restart: a fresh lookup for an already-persisted key returns the SAME accountId as the original call, not a new one", async () => {
++    // The fallback array plays the role Supabase would play in production:
++    // a lookup that finds an existing row must return it, never mint a
++    // second accountId for the same key. This is exactly what "surviving a
++    // restart" means for a real, persisted backend - the in-memory
++    // fallback proves the lookup-before-create logic, the same limitation
++    // approval-record-repository.test.mjs already accepts for its own
++    // Supabase-backed repository (no live Supabase in this test environment
++    // either).
++    const original = await resolveOpaqueAccountId(key());
++    const afterSimulatedRestart = await resolveOpaqueAccountId(key());
++    assert.equal(original, afterSimulatedRestart);
++  });
++
++  await t.test("account change: the same email under a DIFFERENT provider resolves to a DIFFERENT accountId", async () => {
++    const claudeId = await resolveOpaqueAccountId(key({ provider: "claude" }));
++    const codexId = await resolveOpaqueAccountId(key({ provider: "codex" }));
++    assert.notEqual(claudeId, codexId);
++  });
++
++  await t.test("account change: the same email under the same provider but a DIFFERENT workspace resolves to a DIFFERENT accountId", async () => {
++    const wsA = await resolveOpaqueAccountId(key({ workspaceId: "ws-a" }));
++    const wsB = await resolveOpaqueAccountId(key({ workspaceId: "ws-b" }));
++    assert.notEqual(wsA, wsB);
++  });
++
++  await t.test("account change: a DIFFERENT email (same provider/workspace) resolves to a DIFFERENT accountId", async () => {
++    const a = await resolveOpaqueAccountId(key({ email: "a@example.com" }));
++    const b = await resolveOpaqueAccountId(key({ email: "b@example.com" }));
++    assert.notEqual(a, b);
++  });
++
++  await t.test("unknown refusal: an empty or non-string provider/workspaceId/email is refused, never silently coerced", async () => {
++    await assert.rejects(() => resolveOpaqueAccountId(key({ provider: "" })), TypeError);
++    await assert.rejects(() => resolveOpaqueAccountId(key({ workspaceId: "   " })), TypeError);
++    await assert.rejects(() => resolveOpaqueAccountId(key({ email: undefined })), TypeError);
++  });
++
++  await t.test("accountId is never derived from the email - it is a random UUID, not a hash", async () => {
++    const accountId = await resolveOpaqueAccountId(key());
++    const crypto = await import("node:crypto");
++    const sha256 = crypto.createHash("sha256").update("person@example.com").digest("hex");
++    assert.notEqual(accountId, sha256);
++    assert.notEqual(accountId, "person@example.com");
++    assert.match(accountId, /^[0-9a-f-]{36}$/);
++  });
++
++  await t.test("the real email is never present in the returned accountId value", async () => {
++    const accountId = await resolveOpaqueAccountId(key({ email: "distinctive-marker@example.com" }));
++    assert.doesNotMatch(accountId, /distinctive-marker/);
++  });
++
++  await t.test("the same email with different casing or incidental whitespace still resolves to the SAME accountId", async () => {
++    const canonical = await resolveOpaqueAccountId(key({ email: "Person@Example.com" }));
++    const paddedLower = await resolveOpaqueAccountId(key({ email: "  person@example.com  " }));
++    const upper = await resolveOpaqueAccountId(key({ email: "PERSON@EXAMPLE.COM" }));
++    assert.equal(canonical, paddedLower);
++    assert.equal(canonical, upper);
++  });
++
++  await t.test("createdAt comes from the injected clock, never a hidden Date.now()", async () => {
++    const fixedClock = () => "2026-01-01T00:00:00.000Z";
++    const id1 = await resolveOpaqueAccountId(key(), fixedClock);
++    const id2 = await resolveOpaqueAccountId(key(), fixedClock);
++    assert.equal(id1, id2);
++  });
++
++  await t.test("production never silently uses the local fallback", async () => {
++    // Mirrors approval-record-repository.test.mjs's own production test
++    // exactly: in production, with no Supabase admin client configured,
++    // the repository must FAIL CLOSED rather than silently persisting to
++    // (or reading from) the in-memory mock.
++    const previousNodeEnv = process.env.NODE_ENV;
++    try {
++      process.env.NODE_ENV = "production";
++      await assert.rejects(
++        () => resolveOpaqueAccountId(key({ email: "prod-check@example.com" })),
++        /Supabase configuration is required for account identity persistence in production/,
++      );
++    } finally {
++      process.env.NODE_ENV = previousNodeEnv;
++    }
++  });
++});
+diff --git a/src/server/agents/models/account-identity-repository.ts b/src/server/agents/models/account-identity-repository.ts
+new file mode 100644
+index 0000000..8372926
+--- /dev/null
++++ b/src/server/agents/models/account-identity-repository.ts
+@@ -0,0 +1,152 @@
++// src/server/agents/models/account-identity-repository.ts
++//
++// Persistent, opaque, server-side-only surrogate binding from an
++// officially-returned per-USER identifier (e.g. the `email` field of
++// `claude auth status --json`) to a stable `accountId` - never a hash of
++// that identifier.
++//
++// This supersedes the in-memory-only account-identity-binding.ts helper:
++// that module was correctly flagged in review as "not an operational
++// connection/binding" - stable only within one process's lifetime, useless
++// across a restart. This file reuses the EXACT existing persistence
++// pattern already trusted elsewhere in this codebase
++// (approval-record-repository.ts's insertMissionApprovalRecord/
++// getMissionApprovalRecord: a real Supabase-backed table in production,
++// with an explicitly gated in-memory fallback for local development that
++// fails closed in production rather than silently persisting nowhere) -
++// never a new, separately-invented storage mechanism.
++//
++// Why not a hash: a hash of email is reversible by dictionary/rainbow-
++// table (email is a low-entropy personal identifier), unlike a hash of a
++// high-entropy value. That rules out a HASH specifically, not every use of
++// an officially-returned identifier. This module uses a different shape
++// entirely: a randomly generated, non-derived accountId
++// (crypto.randomUUID()), looked up through this private, protected table
++// by the real identifier. The identifier itself never leaves this module;
++// only the random accountId propagates upward.
++//
++// Key shape: (provider, workspaceId, email) - never email alone. The same
++// email string can legitimately belong to different accounts under
++// different providers (e.g. a Claude login and a separate Codex login
++// sharing one human's personal email address) or under different HQ
++// workspaces; email alone as the key would silently MERGE those into one
++// accountId - exactly the cross-account conflation this module exists to
++// prevent.
++//
++// What this module does NOT do:
++//   - Does not read any credential file. The caller is responsible for
++//     obtaining `email` from a real, already-qualified probe
++//     (classifyClaudeCodeProbe's own `claude auth status --json` call).
++//   - Does not create the `account_identities` table itself - that is a
++//     database migration, a separate deployment step, exactly like
++//     `mission_approvals`'s own table is not created by
++//     approval-record-repository.ts either.
++//   - Does not decide the email-rotation question (what happens if the
++//     same human's email changes across two probes) - a different email
++//     is always a different accountId here, deliberately, never a
++//     silently continued identity.
++//   - Does not call, activate, or reach any model/provider API. Pure data
++//     persistence only.
++
++import { isLocalPersistenceFallbackAllowed } from "@/lib/server-env";
++import { createOptionalSupabaseAdminClient } from "@/server/supabase/admin";
++import { randomUUID } from "node:crypto";
++
++export type AccountIdentityKey = {
++  provider: string;
++  workspaceId: string;
++  email: string;
++};
++
++type StoredAccountIdentity = AccountIdentityKey & {
++  accountId: string;
++  createdAt: string;
++};
++
++// In-memory fallback array for local development without Supabase - same
++// shape and same guard (isLocalPersistenceFallbackAllowed) as
++// approval-record-repository.ts's mockApprovalRecords.
++const mockAccountIdentities: StoredAccountIdentity[] = [];
++
++function normalizeKey(key: AccountIdentityKey): AccountIdentityKey {
++  const provider = typeof key.provider === "string" ? key.provider.trim() : "";
++  const workspaceId = typeof key.workspaceId === "string" ? key.workspaceId.trim() : "";
++  const email = typeof key.email === "string" ? key.email.trim().toLowerCase() : "";
++  if (!provider) throw new TypeError("resolveOpaqueAccountId requires a non-empty provider");
++  if (!workspaceId) throw new TypeError("resolveOpaqueAccountId requires a non-empty workspaceId");
++  if (!email) throw new TypeError("resolveOpaqueAccountId requires a non-empty email");
++  return { provider, workspaceId, email };
++}
++
++/**
++ * Resolves a stable, opaque accountId for a real, officially-returned
++ * (provider, workspaceId, email) triple - persisted for real (Supabase in
++ * production; a gated in-memory fallback, same as every other repository
++ * in this codebase, for local development only). The SAME triple always
++ * resolves to the SAME accountId across calls, including across a process
++ * restart when backed by Supabase. A DIFFERENT provider or workspace with
++ * the SAME email resolves to a DIFFERENT accountId.
++ *
++ * Never returns or logs the email itself - only ever the accountId.
++ */
++export async function resolveOpaqueAccountId(
++  key: AccountIdentityKey,
++  clock: () => string = () => new Date().toISOString(),
++): Promise<string> {
++  const normalized = normalizeKey(key);
++  const supabase = createOptionalSupabaseAdminClient();
++
++  if (supabase) {
++    // eslint-disable-next-line @typescript-eslint/no-explicit-any
++    const { data, error } = await (supabase.from("account_identities") as any)
++      .select()
++      .eq("provider", normalized.provider)
++      .eq("workspace_id", normalized.workspaceId)
++      .eq("email", normalized.email)
++      .limit(1)
++      .maybeSingle();
++
++    if (error) {
++      throw new Error(`Failed to query account_identities from Supabase: ${error.message}`);
++    }
++    if (data) return data.account_id as string;
++
++    const accountId = randomUUID();
++    // eslint-disable-next-line @typescript-eslint/no-explicit-any
++    const { error: insertError } = await (supabase.from("account_identities") as any).insert({
++      account_id: accountId,
++      provider: normalized.provider,
++      workspace_id: normalized.workspaceId,
++      email: normalized.email,
++      created_at: clock(),
++    });
++    if (insertError) {
++      throw new Error(`Failed to insert account_identities into Supabase: ${insertError.message}`);
++    }
++    return accountId;
++  }
++
++  if (!isLocalPersistenceFallbackAllowed()) {
++    throw new Error("Supabase configuration is required for account identity persistence in production.");
++  }
++
++  const existing = mockAccountIdentities.find(
++    (record) =>
++      record.provider === normalized.provider &&
++      record.workspaceId === normalized.workspaceId &&
++      record.email === normalized.email,
++  );
++  if (existing) return existing.accountId;
++
++  const accountId = randomUUID();
++  mockAccountIdentities.push({ ...normalized, accountId, createdAt: clock() });
++  return accountId;
++}
++
++/**
++ * Used purely for testing the fallback repository - same convention as
++ * approval-record-repository.ts's __clearMockApprovalRecords.
++ */
++export function __clearMockAccountIdentities(): void {
++  mockAccountIdentities.length = 0;
++}

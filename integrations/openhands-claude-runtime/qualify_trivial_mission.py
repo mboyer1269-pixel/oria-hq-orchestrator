@@ -1,4 +1,33 @@
-"""Ready, gated recipe for a real trivial mission (create a text file, verify
+"""REJECTED as a delivery path - kept only as a documented dead end, never
+executed, never developed further. See
+docs/CLAUDE-SUITE-QUALIFICATION-REELLE.md's "Revue du script trivial en
+cours": raw ACP stdio (this file) bypasses BudgetPermissionAgent entirely -
+it cannot impose maxCostCents/maxTokens no matter what this file's own
+budget-shape validation claims to check (confirmed: this candidate's
+bundled claude-agent-acp exposes no maxTurns/maxBudgetUsd/meta passthrough
+at the raw ACP layer - see the module docstring below, unchanged). That
+makes it structurally unable to serve as proof of a budget-respecting
+mission, even though it enforces timeoutSeconds and a single iteration for
+real.
+
+The real, already-built, already-designed path is
+integrations/openhands-runner/run_mission.py's execute() (invoked via
+qualify_run_mission.py for local, isolated, no-model qualification, or via
+dispatch.py/prepare_host_job.py for the real durable launch contract) -
+it constructs a REAL openhands.sdk.Conversation with a REAL
+BudgetPermissionAgent, which DOES forward maxTurns/maxBudgetUsd into the
+real Claude Code CLI session through the SDK's own ACPSessionMeta
+mechanism (see integrations/openhands-permission-extension/budget_agent.py)
+- something raw ACP stdio cannot reach at all. Do not build a second raw-
+ACP path to work around this; reuse that existing contract instead. This
+file is left in place, non-executable by default (its env-var gates are
+unset), purely so the dead end and the reason for it stay documented
+rather than silently disappearing.
+
+--- Original docstring, unchanged, describing what this script DOES do
+--- (never claims proof of budget enforcement beyond what is listed below):
+
+Ready, gated recipe for a real trivial mission (create a text file, verify
 its content) via claude-agent-acp's REAL ACP protocol - never the diagnostic
 override used by qualify_connection_account.py.
 

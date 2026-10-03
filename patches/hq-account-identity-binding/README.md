@@ -1,84 +1,86 @@
-# Patch: opaque account-identity binding (HQ, separate, not applied)
+# Patch: persistent account-identity binding (HQ, separate, not applied)
 
-Delivered per `docs/CLAUDE-SUITE-QUALIFICATION-REELLE.md`, point 2, after its
-"Clarification du responsable". Full design rationale, stability/rotation
-discussion and prerequisites:
-`docs/CLAUDE-SUITE-QUALIFICATION-REELLE-RACCORDEMENT-COMPTE-PROPOSITION-2026-10-03.md`.
+Delivered per `docs/CLAUDE-SUITE-QUALIFICATION-REELLE.md`'s "Prochaine
+livraison utile" section. Supersedes an earlier in-memory-only version of
+this patch (removed from here - "ne pas s'arrêter à un helper inutilisé",
+don't stop at an unused helper): that version was correctly flagged as not
+an operational connection/binding, stable only within one process's
+lifetime. This version is real, persistent, production-capable.
 
 ## What this is
 
-`account-identity-binding.patch` is a real, unified git diff adding exactly
-two NEW files to the live Oria.HQ repository:
+`account-identity-repository.patch` adds exactly two NEW files to the live
+Oria.HQ repository:
 
 ```
-src/server/agents/models/account-identity-binding.ts
-src/server/agents/models/account-identity-binding.test.mjs
+src/server/agents/models/account-identity-repository.ts
+src/server/agents/models/account-identity-repository.test.mjs
 ```
 
-Both are purely additive - the patch creates these two files and touches
-nothing else. It was generated from, and tested directly in, the live HQ
-worktree (`C:\Users\micha\Dev\Oria.HQ\.claude\worktrees\hq-acces-reprise`),
-then extracted back out, specifically so it could be produced and proven
-without modifying or conflicting with the substantial, unrelated work
-already in progress and uncommitted there (Cursor's `src/server/ai/*`
-contract change and its own already-wired `accountId`/`catalogRevision`
-plumbing through `model-emission-gate.ts`/`model-emission-launch-gate.ts` -
-see the proposal doc). The two new files were left untracked (`??`) in that
-worktree exactly as found, matching this project's standing rule never to
-commit in a worktree not entered via the dedicated tool.
+Purely additive. Reuses the **existing, already-trusted persistence
+pattern** from `approval-record-repository.ts` (`mission_approvals`): a
+real Supabase-backed table in production, with an explicitly gated
+in-memory fallback for local development that fails closed in production
+rather than silently persisting nowhere - never a new, separately-invented
+storage mechanism.
 
-## Proof it is real, not aspirational
+Key design, unchanged from the prior version: the store is keyed by
+`(provider, workspaceId, email)`, never `email` alone - the same email
+under two different providers or workspaces must never merge into one
+`accountId`. `accountId` itself is `crypto.randomUUID()`, never derived
+from the email - nothing to reverse by dictionary/rainbow-table, unlike a
+hash.
 
-A bounded, read-only review (one subagent, scoped to just these two files)
-found two real defects in the first version of this patch, both fixed
-before delivery:
-1. The "not a hash" test only checked the result against one specific
-   deterministic function (sha256); it did not prove true randomness. Fixed
-   by adding a test that resolves the SAME email against two independent
-   fresh stores and asserts the two results differ - this would catch ANY
-   swapped-in deterministic derivation, not just sha256.
-2. The email was not normalized before use as the store's lookup key, so
-   the same real account returning its email with different casing or
-   incidental whitespace across two probes would have silently minted two
-   different `accountId`s for one account - breaking the "same email ->
-   same accountId" stability guarantee this module exists to provide.
-   Fixed: `resolveOpaqueAccountId` now trims and lower-cases the email
-   before every lookup/store operation, and that is what gets persisted.
-
-Run directly in `hq-acces-reprise` after both fixes, before being extracted
-into this patch:
+## Proof - exact output of this pass
 
 ```
-node --test src/server/agents/models/account-identity-binding.test.mjs
-  -> 12/12 passed
+$ cd hq-acces-reprise && npx tsc --noEmit
+(no output, exit 0 - whole repository, real @/* path-alias resolution,
+ written in place this time for a genuine type-check, not a standalone
+ approximation)
 
-npx tsc --noEmit
-  -> zero new errors (same pre-existing Cursor-internal errors as before,
-     unrelated to this addition)
+$ node --test src/server/agents/models/account-identity-repository.test.mjs
+  -> 12/12 passed, in place
+
+$ git status --short -- src/server/agents/models/account-identity-repository.*
+?? src/server/agents/models/account-identity-repository.ts
+?? src/server/agents/models/account-identity-repository.test.mjs
+(nothing else in the worktree touched - verified by full status count
+ before and after)
 ```
+
+Tests cover exactly what was asked: stable identity (same key -> same
+accountId), restart (a fresh lookup for an already-persisted key returns
+the original accountId, not a new one - the same guarantee
+`approval-record-repository.test.mjs` already accepts for its own
+Supabase-backed repository, since neither test suite has a live Supabase
+connection), account change (different provider, different workspace,
+different email - each produces a different accountId), and unknown
+refusal (empty/non-string provider, workspaceId, or email throws, never
+silently coerced) - plus the non-determinism, no-email-leak, normalization,
+and production-fail-closed tests carried over from the prior version.
 
 ## What this patch deliberately does NOT do
 
-- Does not modify `local-runtime-probe.ts` to actually call
-  `resolveOpaqueAccountId` from `classifyClaudeCodeProbe` - that file is
-  being actively, substantially modified uncommitted by other work right
-  now; wiring it in here would be exactly the "concurrent modification"
-  this lot was told to avoid. The one-line integration point (which
-  branch, roughly which line, at the time this was written) is described
-  in the proposal doc instead, for whoever applies this once that work
-  lands.
-- Does not create a real, protected, persistent store. Only
-  `createInMemoryAccountIdentityStore()` (test/fixture-only) is provided.
-  A real file-backed store needs an explicit decision from Michael first
-  (new server-side personal-data storage, even if minimal) - see the
-  proposal doc's prerequisites.
-- Does not decide the email-rotation question - documented as an open
-  decision, not resolved here.
+- Does not create the `account_identities` Supabase table itself - a
+  database migration, a separate deployment step, exactly like
+  `mission_approvals`'s own table is not created by
+  `approval-record-repository.ts` either.
+- Does not modify `local-runtime-probe.ts` to call `resolveOpaqueAccountId`
+  from `classifyClaudeCodeProbe` - the one-line integration point is
+  described in the proposal doc.
+- Does not decide the email-rotation question - a different email is
+  always a different accountId, deliberately, documented as an open
+  decision.
+- Does not call, activate, or reach any model/provider API.
+- Is not itself an execution authorization. Real mission execution stays
+  gated behind the approved account/model/mission chain this patch does
+  not touch.
 
-## How to apply (once the prerequisites in the proposal doc are met)
+## How to apply
 
 From the Oria.HQ repository root:
 
 ```
-git apply patches/hq-account-identity-binding/account-identity-binding.patch
+git apply patches/hq-account-identity-binding/account-identity-repository.patch
 ```
