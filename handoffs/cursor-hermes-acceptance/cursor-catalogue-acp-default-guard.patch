@@ -1,0 +1,171 @@
+From 071dbf70cdbec910d7462393df6ac3be83a08fec Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 3 Oct 2026 23:20:39 +0000
+Subject: [PATCH] Exclude ACP profile id default from provider catalog rows
+
+Provider catalog ingestion and the OpenRouter free-model cache no longer
+surface the ACP session mode id as a tarifiable model.
+---
+ src/server/ai/gateway-catalog.test.mjs      | 34 +++++++++++++++++++++
+ src/server/ai/gateway-catalog.ts            | 11 +++++--
+ src/server/ai/hq-model-catalog.test.mjs     | 27 ++++++++++++++++
+ src/server/ai/model-catalog-consultation.ts |  5 ++-
+ 4 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/src/server/ai/gateway-catalog.test.mjs b/src/server/ai/gateway-catalog.test.mjs
+index dd612e8..0414284 100644
+--- a/src/server/ai/gateway-catalog.test.mjs
++++ b/src/server/ai/gateway-catalog.test.mjs
+@@ -524,6 +524,40 @@ test("11 a non-zero per-request fee stays in USD and is not free", async () => {
+   noCents(normalized);
+ });
+ 
++test("ACP profile id default is not ingested as a provider catalog row", async () => {
++  const normalized = await normalizeGatewayCatalog(request({
++    fetch: async () => ({
++      status: 200,
++      body: {
++        data: [
++          {
++            id: "default",
++            pricing: { prompt: "0.000003", completion: "0.000015", request: "0" },
++            supported_parameters: ["tools"],
++          },
++          {
++            id: "openai/live",
++            pricing: { prompt: "0.000003", completion: "0.000015", request: "0.002" },
++            supported_parameters: ["tools"],
++          },
++        ],
++      },
++    }),
++  }));
++  assert.equal(normalized.ok, true);
++  assert.equal(normalized.observations.some((row) => row.modelId === "default"), false);
++  assert.equal(normalized.observations.some((row) => row.modelId === "openai/live"), true);
++  const assessed = assessServerEmission({
++    catalog: normalized.catalog,
++    modelId: "default",
++    workspaceId: WORKSPACE,
++    requiresTools: false,
++    nowMs: NOW,
++  });
++  assert.equal(assessed.emit, false);
++  assert.equal(assessed.block, "not_listed");
++});
++
+ test("12 an unknown price is not free and is not a capability", async () => {
+   const normalized = await normalizeGatewayCatalog(request({
+     fetch: async () => ({
+diff --git a/src/server/ai/gateway-catalog.ts b/src/server/ai/gateway-catalog.ts
+index bc5699b..7e490f2 100644
+--- a/src/server/ai/gateway-catalog.ts
++++ b/src/server/ai/gateway-catalog.ts
+@@ -57,6 +57,11 @@ const SURCHARGE_KEYS = [
+ export type GatewayId = "openrouter" | "nara";
+ export type CatalogObservationClass = "public_list" | "account_entitlement";
+ 
++/** ACP session/profile ids (e.g. modeId `default`) are not provider catalog model ids. */
++export function isProviderCatalogModelId(modelId: string): boolean {
++  return modelId !== "default";
++}
++
+ export type PriceComponent = {
+   key: (typeof SURCHARGE_KEYS)[number];
+   /** Null means the field is present but unreadable. It is not zero. */
+@@ -348,14 +353,14 @@ function parseModels(body: unknown, observationClass: CatalogObservationClass):
+   const observations: GatewayModelObservation[] = [];
+   for (const row of data) {
+     if (typeof row === "string") {
+-      if (row.length === 0 || /\s/.test(row)) continue;
++      if (row.length === 0 || /\s/.test(row) || !isProviderCatalogModelId(row)) continue;
+       observations.push(blankObservation(row, observationClass, { kind: "unknown" }, []));
+       continue;
+     }
+     if (!row || typeof row !== "object") continue;
+     const record = row as Record<string, unknown>;
+     const modelId = record.id;
+-    if (typeof modelId !== "string" || modelId.length === 0 || /\s/.test(modelId)) continue;
++    if (typeof modelId !== "string" || modelId.length === 0 || /\s/.test(modelId) || !isProviderCatalogModelId(modelId)) continue;
+     const modalities = readModalities(record.architecture);
+     observations.push({
+       ...blankObservation(modelId, observationClass, readPrice(record.pricing), []),
+@@ -392,7 +397,7 @@ function parsePlans(body: unknown): GatewayModelObservation[] {
+     }
+     if (!Array.isArray(record.models)) continue;
+     for (const model of record.models) {
+-      if (typeof model !== "string" || model.length === 0 || /\s/.test(model)) continue;
++      if (typeof model !== "string" || model.length === 0 || /\s/.test(model) || !isProviderCatalogModelId(model)) continue;
+       const index = observations.findIndex((row) => row.modelId === model);
+       if (index < 0) {
+         observations.push(blankObservation(model, "public_list", { kind: "unknown" }, announced));
+diff --git a/src/server/ai/hq-model-catalog.test.mjs b/src/server/ai/hq-model-catalog.test.mjs
+index 11640f9..81fb8aa 100644
+--- a/src/server/ai/hq-model-catalog.test.mjs
++++ b/src/server/ai/hq-model-catalog.test.mjs
+@@ -380,6 +380,26 @@ test("a public OpenRouter row without request shows the known components and Nar
+   assertViewSafe(view);
+ });
+ 
++test("provider catalog rows exclude the ACP profile id default", async () => {
++  const view = await loadHqModelCatalog({
++    nowMs: NOW,
++    authorize: async () => null,
++    readCache: () => null,
++    transport: async (url) => catalogBody(url, [
++      {
++        id: "default",
++        pricing: { prompt: "0.000003", completion: "0.000015", request: "0" },
++      },
++      paidModel("openai/live"),
++    ]),
++  });
++  assert.equal(view.ok, true);
++  assert.equal(view.lines.some((line) => line.modelId === "default"), false);
++  assert.equal(view.lines.some((line) => line.modelId === "openai/live"), true);
++  assert.equal(view.lines.find((line) => line.modelId === "openai/live").tariff, "3 / 15 / 0.002");
++  assertViewSafe(view);
++});
++
+ test("a non-zero surcharge stays beside the known tariff and is not labeled free", async () => {
+   const view = await loadHqModelCatalog({
+     nowMs: NOW,
+@@ -441,6 +461,13 @@ test("loading the catalog does not change the approved model choice or the budge
+     readCache: () => null,
+     transport: async (url) => catalogBody(url, [paidModel("openai/live")]),
+   });
++  await loadHqModelCatalog({
++    nowMs: NOW + 5000,
++    refresh: "now",
++    authorize: async () => null,
++    readCache: () => null,
++    transport: async (url) => catalogBody(url, [paidModel("openai/live")]),
++  });
+   assert.equal(JSON.stringify(getCostLadderSnapshot()), costBefore);
+   assert.equal(getLadderCostLog().length, ladderBefore);
+   assert.equal(getCallAccountingLog().length, journalBefore);
+diff --git a/src/server/ai/model-catalog-consultation.ts b/src/server/ai/model-catalog-consultation.ts
+index 8f68617..a73c03a 100644
+--- a/src/server/ai/model-catalog-consultation.ts
++++ b/src/server/ai/model-catalog-consultation.ts
+@@ -38,6 +38,7 @@ import {
+   OPENROUTER_API_KEY_ENV,
+   OPENROUTER_BASE_URL,
+   OPENROUTER_PUBLIC_MODELS_URL,
++  isProviderCatalogModelId,
+   normalizeGatewayCatalog,
+   type GatewayCatalogRequest,
+   type GatewayFetch,
+@@ -534,6 +535,8 @@ function defaultCache(gateway: string): CacheView | null {
+   return {
+     provider: "openrouter",
+     generatedAt: snapshot.generatedAt,
+-    entries: snapshot.entries.map((entry) => ({ id: entry.id, name: entry.name })),
++    entries: snapshot.entries
++      .filter((entry) => isProviderCatalogModelId(entry.id))
++      .map((entry) => ({ id: entry.id, name: entry.name })),
+   };
+ }
+-- 
+2.43.0
+
