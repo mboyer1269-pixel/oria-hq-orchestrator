@@ -1,0 +1,12 @@
+Contre-validation HQ → OpenHands (catalogue / libellés / tarifs)
+Parent produit: 0b5269c (cursor-catalogue-fiabilite-fraicheur.patch)
+Commit: 071dbf7 — Exclude ACP profile id default from provider catalog rows
+
+Tests exécutés (node --test --test-concurrency=1):
+- src/server/ai/gateway-catalog.test.mjs
+- src/server/ai/hq-model-catalog.test.mjs
+- src/server/ai/model-catalog-consultation.test.mjs
+- src/server/ai/free-model-catalog.test.mjs
+(51 pass, 0 fail)
+
+Guide d'intégration HQ : INTEGRATION-CATALOGUE-PR13.md

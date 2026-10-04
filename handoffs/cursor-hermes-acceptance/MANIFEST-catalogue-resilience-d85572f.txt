@@ -1,0 +1,20 @@
+Parent exact: d85572f381e048e23434aa7af0c01d0dabe5e799
+Commit: 2bc64e381e048e23434aa7af0c01d0dabe5e799 (abbrev 2bc64e3)
+Tree: 29b185fc837ad9230d980dd833ee42361b4e2658
+Patch: cursor-catalogue-free-model-resilience-d85572f.patch
+
+Fichiers:
+- src/server/ai/free-model-catalog.ts
+- src/server/ai/free-model-catalog.test.mjs
+- src/server/ai/hq-model-catalog.test.mjs
+
+Empreinte patch sha256: (filled below)
+
+Tests:
+  node --test --test-concurrency=1 \
+    src/server/ai/free-model-catalog.test.mjs \
+    src/server/ai/gateway-catalog.test.mjs \
+    src/server/ai/hq-model-catalog.test.mjs \
+    src/server/ai/model-catalog-consultation.test.mjs
+  npm run typecheck
+Attendu: 57 pass

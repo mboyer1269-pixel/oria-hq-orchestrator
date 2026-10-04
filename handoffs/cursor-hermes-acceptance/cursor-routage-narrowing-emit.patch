@@ -1,0 +1,90 @@
+From 119edca04e8cdd717d6aaf2fe780cfd37e34e7a7 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Oct 2026 18:45:33 +0000
+Subject: [PATCH] Narrow non-API refusals before reading disposition or block.
+
+---
+ src/server/ai/llm-json-provider.ts | 11 +++++++++--
+ src/server/ai/model-router.ts      |  9 ++++++++-
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/server/ai/llm-json-provider.ts b/src/server/ai/llm-json-provider.ts
+index c078798..2fc410a 100644
+--- a/src/server/ai/llm-json-provider.ts
++++ b/src/server/ai/llm-json-provider.ts
+@@ -44,6 +44,7 @@ import {
+   type ApprovedServerBinding,
+   type ServerCapability,
+   type ServerCapabilityCatalog,
++  type ServerEmissionAssessment,
+   type ServerEmissionBlock,
+ } from "@/server/ai/server-capability-catalog";
+ import { generateJsonWithAnthropic, ANTHROPIC_JSON_DEFAULT_MAX_TOKENS, ANTHROPIC_JSON_DEFAULT_MODEL } from "./anthropic-json-client";
+@@ -280,6 +281,12 @@ function entryMatchesBinding(entry: ServerCapability, approved: ApprovedServerBi
+     && entry.billingKind === approved.billingKind;
+ }
+ 
++function isNonApiRefusal(
++  assessment: Extract<ServerEmissionAssessment, { emit: false }>,
++): assessment is Extract<ServerEmissionAssessment, { disposition: "non_api" }> {
++  return "disposition" in assessment && assessment.disposition === "non_api";
++}
++
+ function capabilityBlocked(
+   input: LlmJsonProviderInput,
+   block: ServerEmissionBlock | "catalog_ceiling" | "verified_free" | "subscription",
+@@ -460,7 +467,7 @@ export async function generateStructuredJson(
+       ...(invoked.callable ? { invokedProvider: invoked.provider } : {}),
+     });
+     if (!assessment.emit) {
+-      if (assessment.disposition === "non_api") {
++      if (isNonApiRefusal(assessment)) {
+         if (input.approved && !entryMatchesBinding(assessment.capability, input.approved)) {
+           return capabilityBlocked(input, "binding_mismatch", configured, "capability_blocked", boundAccountId(input));
+         }
+@@ -569,7 +576,7 @@ export async function generateStructuredJson(
+         invokedProvider: provider,
+       });
+       if (!assessment.emit) {
+-        if (assessment.disposition === "non_api") {
++        if (isNonApiRefusal(assessment)) {
+           if (attempts.length === 0) {
+             return capabilityBlocked(
+               input,
+diff --git a/src/server/ai/model-router.ts b/src/server/ai/model-router.ts
+index 5c2d11a..e5c7cd4 100644
+--- a/src/server/ai/model-router.ts
++++ b/src/server/ai/model-router.ts
+@@ -21,6 +21,7 @@ import { executionTargetForModel } from "@/server/ai/execution-models";
+ import {
+   assessServerEmission,
+   type ServerCapabilityCatalog,
++  type ServerEmissionAssessment,
+ } from "@/server/ai/server-capability-catalog";
+ 
+ export type ModelRouteInput = {
+@@ -429,6 +430,12 @@ export function recordBrainRoute(
+   return record;
+ }
+ 
++function isNonApiRefusal(
++  assessment: Extract<ServerEmissionAssessment, { emit: false }>,
++): assessment is Extract<ServerEmissionAssessment, { disposition: "non_api" }> {
++  return "disposition" in assessment && assessment.disposition === "non_api";
++}
++
+ export function chooseModel(input: ModelRouteInput): ModelRouteDecision {
+   const unavailable = new Set(input.unavailableModelIds ?? []);
+   const keywordRoute = routeByKeywords(input);
+@@ -482,7 +489,7 @@ export function chooseModel(input: ModelRouteInput): ModelRouteDecision {
+     });
+     if (!assessment.emit) {
+       execution = "refused";
+-      refusalReason = assessment.disposition === "non_api" ? assessment.billingKind : assessment.block;
++      refusalReason = isNonApiRefusal(assessment) ? assessment.billingKind : assessment.block;
+     }
+   }
+ 
+-- 
+2.43.0
+

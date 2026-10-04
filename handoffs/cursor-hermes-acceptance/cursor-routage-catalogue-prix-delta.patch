@@ -1,0 +1,380 @@
+From 2ed003ae8ad21b6859f54f243a704a48576f2d1c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Oct 2026 19:49:50 +0000
+Subject: [PATCH] Keep per-request fees in USD and drop the parallel catalog
+ selector.
+
+---
+ src/server/ai/gateway-catalog.test.mjs | 168 ++++++++++++++++++-------
+ src/server/ai/gateway-catalog.ts       | 108 +++++-----------
+ 2 files changed, 153 insertions(+), 123 deletions(-)
+
+diff --git a/src/server/ai/gateway-catalog.test.mjs b/src/server/ai/gateway-catalog.test.mjs
+index cd2b78e..64736f4 100644
+--- a/src/server/ai/gateway-catalog.test.mjs
++++ b/src/server/ai/gateway-catalog.test.mjs
+@@ -24,7 +24,6 @@ const contractPath = path.join(projectRoot, "src/server/agents/models/model-prov
+ 
+ const {
+   normalizeGatewayCatalog,
+-  selectGatewayMode,
+   usdPerTokenToPerMillion,
+   OPENROUTER_BASE_URL,
+   OPENROUTER_PUBLIC_MODELS_URL,
+@@ -491,55 +490,128 @@ test("10 a null per_request_limits leaves quota unknown", async () => {
+   assert.equal(normalized.observations[0].announcedQuotas.length, 0);
+ });
+ 
+-test("11 recommended and auto refuse a positive price or an api billing kind", () => {
+-  const positive = {
+-    modelId: "openai/gpt-4",
+-    enabled: true,
+-    recommended: true,
+-    price: { kind: "positive_quote", promptUsdPerMTok: 30, completionUsdPerMTok: 60, perRequestUsd: 0 },
+-    billingKind: null,
+-  };
+-  const api = {
+-    modelId: "claude-haiku-4-5-20251001",
+-    enabled: true,
+-    recommended: true,
+-    price: { kind: "unknown" },
+-    billingKind: "api",
+-  };
+-  for (const candidate of [positive, api]) {
+-    const recommended = selectGatewayMode({ mode: "recommended", candidates: [candidate] });
+-    const auto = selectGatewayMode({ mode: "auto", candidates: [candidate] });
+-    assert.equal(recommended.status, "paid_switch_refused");
+-    assert.equal(recommended.modelId, null);
+-    assert.equal(recommended.paidFallback, null);
+-    assert.equal(auto.status, "paid_switch_refused");
+-    assert.equal(auto.modelId, null);
+-    assert.equal(auto.paidFallback, null);
++test("11 a non-zero per-request fee stays in USD and is not free", async () => {
++  const normalized = await normalizeGatewayCatalog(request({
++    fetch: async () => ({
++      status: 200,
++      body: {
++        data: [{
++          id: "request-fee",
++          pricing: { prompt: "0", completion: "0", request: "0.002" },
++          supported_parameters: ["temperature"],
++        }, {
++          id: "token-and-request",
++          pricing: { prompt: "0.00003", completion: "0.00006", request: "0.002" },
++          supported_parameters: ["temperature"],
++        }],
++      },
++    }),
++  }));
++  const fee = normalized.observations.find((row) => row.modelId === "request-fee");
++  const both = normalized.observations.find((row) => row.modelId === "token-and-request");
++  assert.equal(fee.price.kind, "positive_quote");
++  assert.equal(fee.price.perRequestUsd, 0.002);
++  assert.notEqual(fee.price.perRequestUsd, 2000);
++  assert.equal(fee.price.promptUsdPerMTok, 0);
++  assert.equal(fee.price.completionUsdPerMTok, 0);
++  assert.notEqual(fee.price.kind, "proven_zero");
++  assert.equal(fee.withheld, "price_not_a_capability");
++  assert.equal(both.price.promptUsdPerMTok, 30);
++  assert.equal(both.price.completionUsdPerMTok, 60);
++  assert.equal(both.price.perRequestUsd, 0.002);
++  assert.equal(normalized.catalog.entries.length, 0);
++  assert.equal(normalized.catalog.entries.some((entry) => entry.billingKind === "verified_free"), false);
++  noCents(normalized);
++});
++
++test("12 an unknown price is not free and is not a capability", async () => {
++  const normalized = await normalizeGatewayCatalog(request({
++    fetch: async () => ({
++      status: 200,
++      body: {
++        data: [
++          { id: "absent", supported_parameters: ["temperature"] },
++          { id: "empty", pricing: {}, supported_parameters: ["temperature"] },
++          { id: "partial", pricing: { prompt: "0", completion: "0" }, supported_parameters: ["temperature"] },
++        ],
++      },
++    }),
++  }));
++  assert.equal(normalized.catalog.entries.length, 0);
++  for (const row of normalized.observations) {
++    assert.equal(row.price.kind, "unknown");
++    assert.notEqual(row.price.kind, "proven_zero");
++    assert.equal(row.withheld, "price_unknown");
++    assert.equal(row.executable, false);
+   }
+-  const quiet = selectGatewayMode({
+-    mode: "auto",
+-    candidates: [{
+-      modelId: "listed-zero",
+-      enabled: true,
+-      recommended: true,
+-      price: { kind: "proven_zero" },
+-      billingKind: "verified_free",
+-    }],
++  const assessed = assessServerEmission({
++    catalog: normalized.catalog,
++    modelId: "absent",
++    workspaceId: WORKSPACE,
++    requiresTools: false,
++    nowMs: NOW,
++    invokedProvider: "openrouter",
++    accountId: ACCOUNT,
+   });
+-  assert.equal(quiet.status, "no_gateway_climb");
+-  assert.equal(quiet.modelId, null);
+-  assert.equal(quiet.paidFallback, null);
++  assert.equal(assessed.emit, false);
++  assert.equal(assessed.block, "not_listed");
+ });
+ 
+-test("12 manual divergence from the approved model does not reserve or fetch", async () => {
+-  const decision = selectGatewayMode({
+-    mode: "manual",
+-    requestedModelId: "other-model",
+-    binding: { modelId: "listed-zero", accountId: ACCOUNT },
+-    catalogAccounts: [ACCOUNT],
+-  });
+-  assert.equal(decision.status, "binding_mismatch");
+-  assert.equal(decision.paidFallback, null);
++test("13 a malformed source is rejected before fetch", async () => {
++  let fetches = 0;
++  const fetch = async () => {
++    fetches += 1;
++    throw new Error("fetch must not run");
++  };
++  const sources = [
++    "https://openrouter.ai/api/v1/chat/completions",
++    "https://openrouter.ai/api/v1/models/extra",
++    "not a url",
++    "https://router.bynara.web.id/v1/models",
++  ];
++  for (const sourceUrl of sources) {
++    const result = await normalizeGatewayCatalog(request({ sourceUrl, fetch }));
++    assert.equal(result.ok, false);
++    assert.equal(result.reason, "source_rejected");
++    assert.equal(result.capabilities.length, 0);
++    assert.equal(result.catalog, null);
++    assert.equal(result.fetchCount, 0);
++  }
++  assert.equal(fetches, 0);
++});
++
++test("14 a synchronous fetch or readSecret failure returns a closed result", async () => {
++  const fetched = await normalizeGatewayCatalog(request({
++    fetch: () => {
++      throw new Error("sync fetch");
++    },
++  }));
++  assert.equal(fetched.ok, false);
++  assert.equal(fetched.reason, "unreadable");
++  assert.equal(fetched.capabilities.length, 0);
++  assert.equal(fetched.catalog, null);
++  assert.equal(fetched.fetchCount, 1);
++
++  let fetches = 0;
++  const secret = await normalizeGatewayCatalog(request({
++    observationClass: "account_entitlement",
++    sourceUrl: "https://openrouter.ai/api/v1/models/user",
++    readSecret: () => {
++      throw new Error("sync secret");
++    },
++    fetch: () => {
++      fetches += 1;
++      throw new Error("fetch must not run");
++    },
++  }));
++  assert.equal(secret.ok, false);
++  assert.equal(secret.reason, "unreadable");
++  assert.equal(secret.fetchCount, 0);
++  assert.equal(secret.catalog, null);
++  assert.equal(fetches, 0);
++});
++
++test("15 manual divergence from the approved model does not reserve or fetch", async () => {
+   const normalized = await normalizeGatewayCatalog(request({
+     fetch: async () => ({ status: 200, body: { data: [zeroModel("listed-zero")] } }),
+   }));
+@@ -582,7 +654,7 @@ test("12 manual divergence from the approved model does not reserve or fetch", a
+   assert.equal(result.cost.monetaryUsd, null);
+ });
+ 
+-test("13 openrouter/free, a :free id, and auto/bynara stay unsupported", async () => {
++test("16 openrouter/free, a :free id, and auto/bynara stay unsupported", async () => {
+   for (const modelId of ["openrouter/free", "poolside/laguna-s-2.1:free", "auto/bynara"]) {
+     assert.equal(executionTargetForModel(modelId).callable, false);
+     let fetches = 0;
+@@ -611,7 +683,7 @@ test("13 openrouter/free, a :free id, and auto/bynara stay unsupported", async (
+   }
+ });
+ 
+-test("14 normalization uses the injected fetch and does not call global fetch", async () => {
++test("17 normalization uses the injected fetch and does not call global fetch", async () => {
+   const original = globalThis.fetch;
+   let globalCalls = 0;
+   globalThis.fetch = async () => {
+diff --git a/src/server/ai/gateway-catalog.ts b/src/server/ai/gateway-catalog.ts
+index f06cb50..7c21174 100644
+--- a/src/server/ai/gateway-catalog.ts
++++ b/src/server/ai/gateway-catalog.ts
+@@ -11,9 +11,11 @@
+  * a known tools flag, and only as "listed" (public) or "connected" (account).
+  * State "authorized" and billingKind "api" are never produced here.
+  *
+- * OpenRouter pricing strings are USD per token. promptUsdPerMTok is that
+- * number times one million. The raw per-token string is not stored, and
+- * nothing here becomes notToExceedCents.
++ * prompt and completion are USD per token and are stored as USD per million.
++ * pricing.request is already USD per request and is stored unchanged.
++ * An unknown price is not free and does not become a capability.
++ * This module does not choose a model. The existing router remains the selector.
++ * Nothing here becomes notToExceedCents.
+  *
+  * Public Nara token_cap_daily, including 7000000, is announcedQuota only.
+  */
+@@ -126,21 +128,6 @@ export type GatewayNormalizationSuccess = {
+ 
+ export type GatewayNormalization = GatewayNormalizationFailure | GatewayNormalizationSuccess;
+ 
+-export type GatewayModeCandidate = {
+-  modelId: string;
+-  enabled: boolean;
+-  recommended: boolean;
+-  price: PriceObservation;
+-  billingKind: "api" | "verified_free" | "subscription" | null;
+-};
+-
+-export type GatewayModeDecision = {
+-  mode: "manual" | "recommended" | "auto";
+-  status: "bound" | "binding_mismatch" | "account_mismatch" | "candidate" | "free_unavailable" | "paid_switch_refused" | "no_gateway_climb";
+-  modelId: string | null;
+-  paidFallback: null;
+-};
+-
+ type AllowlistHit = "models" | "plans" | "key";
+ 
+ function isEnvName(value: string): boolean {
+@@ -197,7 +184,15 @@ function failure(
+   };
+ }
+ 
+-/** USD per token string → USD per million tokens. Null when the string is not a plain decimal. */
++/** Plain non-negative USD decimal. Null when the string is not that shape. */
++function parseUsdAmount(raw: string): number | null {
++  if (!/^\d+(\.\d+)?$/.test(raw)) return null;
++  if ((raw.split(".")[1] ?? "").length > 12) return null;
++  const value = Number(raw);
++  return Number.isFinite(value) ? value : null;
++}
++
++/** USD per token string → USD per million tokens. Does not apply to per-request fees. */
+ export function usdPerTokenToPerMillion(raw: string): number | null {
+   if (!/^\d+(\.\d+)?$/.test(raw)) return null;
+   const [whole, frac = ""] = raw.split(".");
+@@ -238,14 +233,14 @@ function readPrice(pricing: unknown): PriceObservation {
+   }
+   const promptPerM = usdPerTokenToPerMillion(prompt);
+   const completionPerM = usdPerTokenToPerMillion(completion);
+-  const requestPerM = usdPerTokenToPerMillion(request);
+-  if (promptPerM === null || completionPerM === null || requestPerM === null) return { kind: "unknown" };
+-  if (promptPerM === 0 && completionPerM === 0 && requestPerM === 0) return { kind: "proven_zero" };
++  const perRequestUsd = parseUsdAmount(request);
++  if (promptPerM === null || completionPerM === null || perRequestUsd === null) return { kind: "unknown" };
++  if (promptPerM === 0 && completionPerM === 0 && perRequestUsd === 0) return { kind: "proven_zero" };
+   return {
+     kind: "positive_quote",
+     promptUsdPerMTok: promptPerM,
+     completionUsdPerMTok: completionPerM,
+-    perRequestUsd: requestPerM,
++    perRequestUsd,
+   };
+ }
+ 
+@@ -402,7 +397,11 @@ export async function normalizeGatewayCatalog(
+ 
+   let secret: string | undefined;
+   if (request.observationClass === "account_entitlement") {
+-    secret = request.readSecret?.(request.apiKeyEnvVar);
++    try {
++      secret = request.readSecret?.(request.apiKeyEnvVar);
++    } catch {
++      return failure("unreadable", 0);
++    }
+     if (typeof secret !== "string" || secret.length === 0) return failure("auth_missing", 0);
+   }
+ 
+@@ -410,14 +409,16 @@ export async function normalizeGatewayCatalog(
+   if (secret) headers.authorization = `Bearer ${secret}`;
+   const controller = new AbortController();
+   let timeoutId: ReturnType<typeof setTimeout> | undefined;
+-  const fetched = request.fetch(request.sourceUrl, {
+-    method: "GET",
+-    headers,
+-    signal: controller.signal,
+-  }).then(
+-    (value) => ({ kind: "response" as const, value }),
+-    (error: unknown) => ({ kind: "error" as const, error }),
+-  );
++  const fetched = Promise.resolve()
++    .then(() => request.fetch(request.sourceUrl, {
++      method: "GET",
++      headers,
++      signal: controller.signal,
++    }))
++    .then(
++      (value) => ({ kind: "response" as const, value }),
++      (error: unknown) => ({ kind: "error" as const, error }),
++    );
+   const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
+     timeoutId = setTimeout(() => {
+       controller.abort();
+@@ -467,46 +468,3 @@ export async function normalizeGatewayCatalog(
+     fetchCount: 1,
+   };
+ }
+-
+-function paidCandidate(candidate: GatewayModeCandidate): boolean {
+-  return candidate.price.kind === "positive_quote" || candidate.billingKind === "api";
+-}
+-
+-/**
+- * Selects a catalog candidate inside an already approved budget.
+- * Does not fetch, does not reserve, and does not set paidFallback.
+- * Auto never returns a gateway model id.
+- */
+-export function selectGatewayMode(input: {
+-  mode: "manual" | "recommended" | "auto";
+-  requestedModelId?: string;
+-  binding?: { modelId: string; accountId: string };
+-  catalogAccounts?: readonly string[];
+-  candidates?: readonly GatewayModeCandidate[];
+-}): GatewayModeDecision {
+-  if (input.mode === "manual") {
+-    if (!input.binding || input.requestedModelId !== input.binding.modelId) {
+-      return { mode: "manual", status: "binding_mismatch", modelId: input.requestedModelId ?? null, paidFallback: null };
+-    }
+-    if (input.catalogAccounts && !input.catalogAccounts.includes(input.binding.accountId)) {
+-      return { mode: "manual", status: "account_mismatch", modelId: input.binding.modelId, paidFallback: null };
+-    }
+-    return { mode: "manual", status: "bound", modelId: input.binding.modelId, paidFallback: null };
+-  }
+-
+-  const candidates = input.candidates ?? [];
+-  if (input.mode === "auto") {
+-    const status = candidates.some(paidCandidate) ? "paid_switch_refused" : "no_gateway_climb";
+-    return { mode: "auto", status, modelId: null, paidFallback: null };
+-  }
+-
+-  const recommended = candidates.filter((candidate) => candidate.enabled && candidate.recommended);
+-  const affordable = recommended.find((candidate) => !paidCandidate(candidate));
+-  if (affordable) {
+-    return { mode: "recommended", status: "candidate", modelId: affordable.modelId, paidFallback: null };
+-  }
+-  if (recommended.some(paidCandidate)) {
+-    return { mode: "recommended", status: "paid_switch_refused", modelId: null, paidFallback: null };
+-  }
+-  return { mode: "recommended", status: "free_unavailable", modelId: null, paidFallback: null };
+-}
+-- 
+2.43.0
+

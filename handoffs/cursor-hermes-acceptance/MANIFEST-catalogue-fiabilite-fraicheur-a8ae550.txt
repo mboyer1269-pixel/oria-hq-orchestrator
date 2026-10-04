@@ -1,0 +1,41 @@
+Produit Oria.HQ.Michael.HQ-APP — correctif catalogue (fraîcheur free-models, delta contenu)
+
+Parent exact: a8ae550f9964981d2634e04c9de87d3848d4f966 (garde ACP default, post-74dfd2f)
+Commit cible: d85572f381e048e23434aa7af0c01d0dabe5e799
+Tree (commit): 45e8c522797c3a2a367a38323d22c7293eea8241
+
+Patch incrémental (un seul commit, pas le cumul mtime 0b5269c):
+  cursor-catalogue-fiabilite-fraicheur-a8ae550.patch
+
+Prérequis: appliquer d’abord cursor-catalogue-acp-default-guard-main74dfd2f.patch (→ a8ae550) si main est encore 74dfd2f.
+
+Défaut corrigé:
+1. loadFreeModelCatalogSnapshot ne voyait que le mtime : réécriture avec mtime figé → snapshot stale.
+2. loadHqModelCatalog conservait le hold OpenRouter 24h malgré réécriture du fichier free-models.
+
+Mécanisme:
+- Invalidation cache module via SHA-256 du contenu (UTF-8, BOM retiré), pas seulement mtime.
+- HeldGateway OpenRouter compare freeCatalogContentSha256 au moment du hold.
+
+Limite documentée (commentaire free-model-catalog.ts):
+- Réécriture octet-identique après normalisation BOM → pas d’invalidation (comportement attendu).
+- mtime reste signal secondaire ; tests utimesSync vérifient la seconde (granularité OS).
+
+Fichiers:
+- src/server/ai/free-model-catalog.ts
+- src/server/ai/free-model-catalog.test.mjs (new)
+- src/server/ai/hq-model-catalog.ts
+- src/server/ai/hq-model-catalog.test.mjs
+
+Empreinte patch (sha256):
+  b0f11dbc766bb0526afc5f20be102c1c787c4278c4e05abeaca77eab52ae6d8b
+
+Tests ciblés (53 pass):
+  node --test --test-concurrency=1 \
+    src/server/ai/free-model-catalog.test.mjs \
+    src/server/ai/gateway-catalog.test.mjs \
+    src/server/ai/hq-model-catalog.test.mjs \
+    src/server/ai/model-catalog-consultation.test.mjs
+  npm run typecheck
+
+Hors scope: Atelier, runner, auth, routeur, VPS, patch ACP (ne pas réécrire).
