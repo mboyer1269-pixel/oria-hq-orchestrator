@@ -8,3 +8,5 @@ Tests exécutés (node --test --test-concurrency=1):
 - src/server/ai/model-catalog-consultation.test.mjs
 - src/server/ai/free-model-catalog.test.mjs
 (51 pass, 0 fail)
+
+Guide d'intégration HQ : INTEGRATION-CATALOGUE-PR13.md
