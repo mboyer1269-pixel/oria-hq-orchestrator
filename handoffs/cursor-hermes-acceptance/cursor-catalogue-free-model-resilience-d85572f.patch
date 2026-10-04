@@ -1,0 +1,179 @@
+From 2bc64e3e0d0f7d920e4a617030d2399f388e182a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 4 Oct 2026 05:08:59 +0000
+Subject: [PATCH] fix(catalog): recover mis-pinned empty free-model cache on
+ content hash hit
+
+Re-read when an empty cached snapshot matches the on-disk hash but the file
+now parses (TOCTOU / concurrent rewrite). Add resilience tests for invalid JSON,
+missing file, concurrent HQ load, and mis-pinned cache.
+---
+ src/server/ai/free-model-catalog.test.mjs | 36 +++++++++++++++++++++-
+ src/server/ai/free-model-catalog.ts       | 36 +++++++++++++++++++---
+ src/server/ai/hq-model-catalog.test.mjs   | 37 +++++++++++++++++++++++
+ 3 files changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/src/server/ai/free-model-catalog.test.mjs b/src/server/ai/free-model-catalog.test.mjs
+index 9416e7b..52a1269 100644
+--- a/src/server/ai/free-model-catalog.test.mjs
++++ b/src/server/ai/free-model-catalog.test.mjs
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env node
+ 
+ import assert from "node:assert/strict";
+-import { readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
++import { readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+ import path from "node:path";
+ import test, { after } from "node:test";
+ import { fileURLToPath } from "node:url";
+@@ -25,6 +25,7 @@ const {
+   loadFreeModelCatalogSnapshot,
+   resetFreeModelCatalogCache,
+   freeModelCatalogSourceContentSha256,
++  pinFreeModelCatalogCacheForTest,
+ } = await jiti.import(catalogPath);
+ 
+ const originalBytes = readFileSync(configPath);
+@@ -84,3 +85,36 @@ test("a content rewrite reloads the snapshot even when filesystem mtime is uncha
+   const reloaded = loadFreeModelCatalogSnapshot();
+   assert.equal(reloaded.entries.some((entry) => entry.id === "test/same-mtime"), true);
+ });
++
++test("a mis-pinned empty cache does not masquerade as fresh when the file has content", () => {
++  resetFreeModelCatalogCache();
++  writeFileSync(configPath, originalBytes);
++  const sha = freeModelCatalogSourceContentSha256();
++  pinFreeModelCatalogCacheForTest({ generatedAt: null, provider: null, entries: [] }, sha);
++  const recovered = loadFreeModelCatalogSnapshot();
++  assert.ok(recovered.entries.length > 0);
++});
++
++test("truncated or invalid JSON yields an empty snapshot without throwing", () => {
++  resetFreeModelCatalogCache();
++  writeFileSync(configPath, '{"provider":"openrouter","models":[');
++  assert.doesNotThrow(() => {
++    const snap = loadFreeModelCatalogSnapshot();
++    assert.equal(snap.entries.length, 0);
++    assert.equal(snap.generatedAt, null);
++  });
++  writeFileSync(configPath, originalBytes);
++  const restored = loadFreeModelCatalogSnapshot();
++  assert.ok(restored.entries.length > 0);
++});
++
++test("a missing free-model file yields an empty snapshot without throwing", () => {
++  resetFreeModelCatalogCache();
++  writeFileSync(configPath, originalBytes);
++  unlinkSync(configPath);
++  assert.doesNotThrow(() => {
++    const snap = loadFreeModelCatalogSnapshot();
++    assert.equal(snap.entries.length, 0);
++  });
++  writeFileSync(configPath, originalBytes);
++});
+diff --git a/src/server/ai/free-model-catalog.ts b/src/server/ai/free-model-catalog.ts
+index 68fc410..6d20d15 100644
+--- a/src/server/ai/free-model-catalog.ts
++++ b/src/server/ai/free-model-catalog.ts
+@@ -80,14 +80,30 @@ function readSnapshotFromDisk(): FreeModelCatalogSnapshot {
+   }
+ }
+ 
++function emptyFreeModelSnapshot(snapshot: FreeModelCatalogSnapshot): boolean {
++  return snapshot.entries.length === 0 && snapshot.generatedAt === null;
++}
++
+ /** Cached snapshot, including the original generated_at. A later read does not refresh that date. */
+ export function loadFreeModelCatalogSnapshot(): FreeModelCatalogSnapshot {
+-  const contentSha = freeModelCatalogSourceContentSha256();
+-  if (cachedSnapshot !== null && cachedSourceContentSha256 === contentSha) {
++  const beforeSha = freeModelCatalogSourceContentSha256();
++  if (cachedSnapshot !== null && cachedSourceContentSha256 === beforeSha) {
++    if (emptyFreeModelSnapshot(cachedSnapshot) && beforeSha !== null) {
++      const probe = readSnapshotFromDisk();
++      if (!emptyFreeModelSnapshot(probe)) {
++        cachedSnapshot = probe;
++      }
++    }
+     return cachedSnapshot;
+   }
+-  cachedSnapshot = readSnapshotFromDisk();
+-  cachedSourceContentSha256 = contentSha;
++  let snapshot = readSnapshotFromDisk();
++  let afterSha = freeModelCatalogSourceContentSha256();
++  if (afterSha !== beforeSha) {
++    snapshot = readSnapshotFromDisk();
++    afterSha = freeModelCatalogSourceContentSha256();
++  }
++  cachedSnapshot = snapshot;
++  cachedSourceContentSha256 = afterSha;
+   return cachedSnapshot;
+ }
+ 
+@@ -106,3 +122,15 @@ export function resetFreeModelCatalogCache(): void {
+   cachedSnapshot = null;
+   cachedSourceContentSha256 = undefined;
+ }
++
++/** Simulates a mis-pinned cache entry (tests only). */
++export function pinFreeModelCatalogCacheForTest(
++  snapshot: FreeModelCatalogSnapshot,
++  contentSha: string | null,
++): void {
++  if (process.env.NODE_ENV !== "test") {
++    throw new Error("pinFreeModelCatalogCacheForTest is only available in test");
++  }
++  cachedSnapshot = snapshot;
++  cachedSourceContentSha256 = contentSha;
++}
+diff --git a/src/server/ai/hq-model-catalog.test.mjs b/src/server/ai/hq-model-catalog.test.mjs
+index 843e6dc..990e62b 100644
+--- a/src/server/ai/hq-model-catalog.test.mjs
++++ b/src/server/ai/hq-model-catalog.test.mjs
+@@ -591,6 +591,43 @@ test("a free-model content rewrite bypasses hold even when mtime is unchanged",
+   }
+ });
+ 
++test("concurrent catalog loads survive a corrupt free-model file and keep Nara consultable", async () => {
++  writeFileSync(freeConfigPath, freeConfigOriginal);
++  resetHqModelCatalogHold();
++  resetFreeModelCatalogCache();
++  let openRouterCalls = 0;
++  const authorize = async () => null;
++  globalThis.fetch = async (url) => {
++    if (String(url) === OPENROUTER_PUBLIC_MODELS_URL) {
++      openRouterCalls += 1;
++      return new Response(JSON.stringify({ data: [paidModel("openai/live")] }), { status: 200 });
++    }
++    if (String(url) === NARA_PUBLIC_PLANS_URL) {
++      return new Response(JSON.stringify(naraPlans().body), { status: 200 });
++    }
++    return new Response("no", { status: 404 });
++  };
++  try {
++    writeFileSync(freeConfigPath, '{"provider":"openrouter","models":[');
++    const [a, b] = await Promise.all([
++      loadHqModelCatalog({ nowMs: NOW, authorize }),
++      loadHqModelCatalog({ nowMs: NOW + 1, authorize }),
++    ]);
++    assert.equal(a.ok, true);
++    assert.equal(b.ok, true);
++    assert.equal(a.executionAuthorized, false);
++    assert.equal(b.executionAuthorized, false);
++    assert.equal(a.lines.some((line) => line.provider === "nara"), true);
++    assert.equal(b.lines.some((line) => line.provider === "nara"), true);
++  } finally {
++    writeFileSync(freeConfigPath, freeConfigOriginal);
++    resetFreeModelCatalogCache();
++    globalThis.fetch = async () => {
++      throw new Error("global fetch must not run");
++    };
++  }
++});
++
+ test("a stale server snapshot refreshes on open and a fresh one does not call again", async () => {
+   writeFileSync(freeConfigPath, freeConfigOriginal);
+   resetHqModelCatalogHold();
+-- 
+2.43.0
+
