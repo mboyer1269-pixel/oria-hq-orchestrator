@@ -1,0 +1,356 @@
+From 71814d76f99965d10599a53b34dc5a9e5f6ab3b9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 3 Oct 2026 04:18:41 +0000
+Subject: [PATCH] Keep partial OpenRouter prices and collapse repeated Nara
+ plan rows.
+
+---
+ src/server/ai/gateway-catalog.test.mjs        | 88 ++++++++++++++++++-
+ src/server/ai/gateway-catalog.ts              | 74 +++++++++++-----
+ src/server/ai/hq-model-catalog.test.mjs       | 43 +++++++++
+ src/server/ai/hq-model-catalog.ts             |  7 ++
+ .../ai/model-catalog-consultation.test.mjs    |  2 +-
+ src/server/ai/model-catalog-consultation.ts   |  9 +-
+ 6 files changed, 197 insertions(+), 26 deletions(-)
+
+diff --git a/src/server/ai/gateway-catalog.test.mjs b/src/server/ai/gateway-catalog.test.mjs
+index 64736f4..a91f6b4 100644
+--- a/src/server/ai/gateway-catalog.test.mjs
++++ b/src/server/ai/gateway-catalog.test.mjs
+@@ -538,12 +538,22 @@ test("12 an unknown price is not free and is not a capability", async () => {
+     }),
+   }));
+   assert.equal(normalized.catalog.entries.length, 0);
++  const absent = normalized.observations.find((row) => row.modelId === "absent");
++  const empty = normalized.observations.find((row) => row.modelId === "empty");
++  const partial = normalized.observations.find((row) => row.modelId === "partial");
++  assert.equal(absent.price.kind, "unknown");
++  assert.equal(empty.price.kind, "unknown");
++  assert.equal(partial.price.kind, "partial_quote");
++  assert.equal(partial.price.promptUsdPerMTok, 0);
++  assert.equal(partial.price.completionUsdPerMTok, 0);
++  assert.equal(partial.price.perRequestUsd, null);
++  assert.notEqual(partial.price.kind, "proven_zero");
+   for (const row of normalized.observations) {
+-    assert.equal(row.price.kind, "unknown");
+-    assert.notEqual(row.price.kind, "proven_zero");
+-    assert.equal(row.withheld, "price_unknown");
+     assert.equal(row.executable, false);
++    assert.notEqual(row.price.kind, "proven_zero");
+   }
++  assert.equal(absent.withheld, "price_unknown");
++  assert.equal(partial.withheld, "price_not_a_capability");
+   const assessed = assessServerEmission({
+     catalog: normalized.catalog,
+     modelId: "absent",
+@@ -748,3 +758,75 @@ test("timeouts, http errors, and missing account auth produce no capability", as
+   assert.equal(missing.fetchCount, 0);
+   assert.equal(fetches, 0);
+ });
++
++test("19 an absent request keeps prompt and completion and does not invent zero", async () => {
++  const normalized = await normalizeGatewayCatalog(request({
++    fetch: async () => ({
++      status: 200,
++      body: {
++        data: [
++          { id: "inclusionai/ling-3.1-flash", pricing: { prompt: "0", completion: "0" } },
++          { id: "vendor/paid-no-request", pricing: { prompt: "0.000003", completion: "0.000015" } },
++          { id: "vendor/prompt-only", pricing: { prompt: "0.000003" } },
++          { id: "typesafe/jev-router", pricing: { prompt: "-1", completion: "-1" } },
++          { id: "vendor/web-search", pricing: { prompt: "0.000003", completion: "0.000015", web_search: "0.01" } },
++        ],
++      },
++    }),
++  }));
++  const freeShape = normalized.observations.find((row) => row.modelId === "inclusionai/ling-3.1-flash");
++  const paid = normalized.observations.find((row) => row.modelId === "vendor/paid-no-request");
++  const promptOnly = normalized.observations.find((row) => row.modelId === "vendor/prompt-only");
++  const negative = normalized.observations.find((row) => row.modelId === "typesafe/jev-router");
++  const searched = normalized.observations.find((row) => row.modelId === "vendor/web-search");
++  assert.equal(freeShape.price.kind, "partial_quote");
++  assert.equal(freeShape.price.promptUsdPerMTok, 0);
++  assert.equal(freeShape.price.completionUsdPerMTok, 0);
++  assert.equal(freeShape.price.perRequestUsd, null);
++  assert.notEqual(freeShape.price.kind, "proven_zero");
++  assert.equal(paid.price.kind, "partial_quote");
++  assert.equal(paid.price.promptUsdPerMTok, 3);
++  assert.equal(paid.price.completionUsdPerMTok, 15);
++  assert.equal(paid.price.perRequestUsd, null);
++  assert.equal(promptOnly.price.kind, "partial_quote");
++  assert.equal(promptOnly.price.promptUsdPerMTok, 3);
++  assert.equal(promptOnly.price.completionUsdPerMTok, null);
++  assert.notEqual(promptOnly.price.completionUsdPerMTok, 0);
++  assert.equal(promptOnly.price.perRequestUsd, null);
++  assert.equal(negative.price.kind, "unknown");
++  assert.equal(searched.price.kind, "unknown");
++  assert.equal(normalized.catalog.entries.length, 0);
++  assert.equal(normalized.observations.every((row) => row.executable === false), true);
++  noCents(normalized);
++});
++
++test("20 repeated Nara plan models stay one row and keep each plan", async () => {
++  const normalized = await normalizeGatewayCatalog(request({
++    gateway: "nara",
++    baseUrl: NARA_BASE_URL,
++    sourceUrl: NARA_PUBLIC_PLANS_URL,
++    apiKeyEnvVar: NARA_API_KEY_ENV,
++    fetch: async () => ({
++      status: 200,
++      body: {
++        data: [
++          { code: "free", token_cap_daily: 7000000, rpm_limit: 15, models: ["agnes-2.5-flash", "only-free"] },
++          { code: "freemium", token_cap_daily: 25000000, rpm_limit: 50, models: ["agnes-2.5-flash", "agnes-2.5-flash"] },
++        ],
++      },
++    }),
++  }));
++  assert.deepEqual(normalized.observations.map((row) => row.modelId), ["agnes-2.5-flash", "only-free"]);
++  const shared = normalized.observations[0];
++  assert.equal(shared.price.kind, "unknown");
++  assert.equal(shared.executable, false);
++  assert.deepEqual(shared.announcedQuotas.map((quota) => `${quota.source}:${quota.unit}:${quota.amount}`), [
++    "public-plan:free:tokens_per_day:7000000",
++    "public-plan:free:requests_per_minute:15",
++    "public-plan:freemium:tokens_per_day:25000000",
++    "public-plan:freemium:requests_per_minute:50",
++  ]);
++  assert.equal(normalized.catalog.entries.length, 0);
++  assert.equal(normalized.accountQuota.kind, "unknown");
++  noCents(normalized);
++});
+diff --git a/src/server/ai/gateway-catalog.ts b/src/server/ai/gateway-catalog.ts
+index 7c21174..8430291 100644
+--- a/src/server/ai/gateway-catalog.ts
++++ b/src/server/ai/gateway-catalog.ts
+@@ -13,7 +13,9 @@
+  *
+  * prompt and completion are USD per token and are stored as USD per million.
+  * pricing.request is already USD per request and is stored unchanged.
+- * An unknown price is not free and does not become a capability.
++ * Each of prompt, completion, and request may be absent. An absent measure
++ * stays unknown and is never stored as zero. A partial quote is not free
++ * and does not become a capability.
+  * This module does not choose a model. The existing router remains the selector.
+  * Nothing here becomes notToExceedCents.
+  *
+@@ -55,6 +57,13 @@ export type PriceObservation =
+       promptUsdPerMTok: number;
+       completionUsdPerMTok: number;
+       perRequestUsd: number;
++    }
++  | {
++      /** Null is an absent or unreadable measure. It is not zero. */
++      kind: "partial_quote";
++      promptUsdPerMTok: number | null;
++      completionUsdPerMTok: number | null;
++      perRequestUsd: number | null;
+     };
+ 
+ export type QuotaObservation =
+@@ -214,30 +223,42 @@ export function usdPerTokenToPerMillion(raw: string): number | null {
+   return Number.isFinite(value) ? value : null;
+ }
+ 
+-function readPrice(pricing: unknown): PriceObservation {
+-  if (!pricing || typeof pricing !== "object") return { kind: "unknown" };
+-  const record = pricing as Record<string, unknown>;
+-  if (Array.isArray(record.overrides) && record.overrides.length > 0) return { kind: "unknown" };
+-  const prompt = record.prompt;
+-  const completion = record.completion;
+-  const request = record.request;
+-  if (typeof prompt !== "string" || typeof completion !== "string" || typeof request !== "string") {
+-    return { kind: "unknown" };
+-  }
++function readMeasure(value: unknown, parse: (raw: string) => number | null): number | null {
++  if (typeof value !== "string") return null;
++  return parse(value);
++}
++
++function surchargeBlocksQuote(record: Record<string, unknown>): boolean {
+   for (const key of SURCHARGE_KEYS) {
+     const value = record[key];
+     if (value === undefined || value === "0") continue;
+-    if (typeof value !== "string") return { kind: "unknown" };
++    if (typeof value !== "string") return true;
+     const perMillion = usdPerTokenToPerMillion(value);
+-    if (perMillion === null || perMillion > 0) return { kind: "unknown" };
++    if (perMillion === null || perMillion > 0) return true;
++  }
++  return false;
++}
++
++function readPrice(pricing: unknown): PriceObservation {
++  if (!pricing || typeof pricing !== "object") return { kind: "unknown" };
++  const record = pricing as Record<string, unknown>;
++  if (Array.isArray(record.overrides) && record.overrides.length > 0) return { kind: "unknown" };
++  if (surchargeBlocksQuote(record)) return { kind: "unknown" };
++  const promptPerM = readMeasure(record.prompt, usdPerTokenToPerMillion);
++  const completionPerM = readMeasure(record.completion, usdPerTokenToPerMillion);
++  const perRequestUsd = readMeasure(record.request, parseUsdAmount);
++  if (promptPerM === null && completionPerM === null && perRequestUsd === null) return { kind: "unknown" };
++  if (promptPerM !== null && completionPerM !== null && perRequestUsd !== null) {
++    if (promptPerM === 0 && completionPerM === 0 && perRequestUsd === 0) return { kind: "proven_zero" };
++    return {
++      kind: "positive_quote",
++      promptUsdPerMTok: promptPerM,
++      completionUsdPerMTok: completionPerM,
++      perRequestUsd,
++    };
+   }
+-  const promptPerM = usdPerTokenToPerMillion(prompt);
+-  const completionPerM = usdPerTokenToPerMillion(completion);
+-  const perRequestUsd = parseUsdAmount(request);
+-  if (promptPerM === null || completionPerM === null || perRequestUsd === null) return { kind: "unknown" };
+-  if (promptPerM === 0 && completionPerM === 0 && perRequestUsd === 0) return { kind: "proven_zero" };
+   return {
+-    kind: "positive_quote",
++    kind: "partial_quote",
+     promptUsdPerMTok: promptPerM,
+     completionUsdPerMTok: completionPerM,
+     perRequestUsd,
+@@ -332,7 +353,18 @@ function parsePlans(body: unknown): GatewayModelObservation[] {
+     if (!Array.isArray(record.models)) continue;
+     for (const model of record.models) {
+       if (typeof model !== "string" || model.length === 0 || /\s/.test(model)) continue;
+-      observations.push(blankObservation(model, "public_list", { kind: "unknown" }, announced));
++      const index = observations.findIndex((row) => row.modelId === model);
++      if (index < 0) {
++        observations.push(blankObservation(model, "public_list", { kind: "unknown" }, announced));
++        continue;
++      }
++      const existing = observations[index];
++      const quotas = [...existing.announcedQuotas];
++      for (const quota of announced) {
++        const seen = quotas.some((item) => item.amount === quota.amount && item.unit === quota.unit && item.source === quota.source);
++        if (!seen) quotas.push(quota);
++      }
++      observations[index] = { ...existing, announcedQuotas: quotas };
+     }
+   }
+   return observations;
+@@ -380,7 +412,7 @@ function projectCapability(
+ 
+ function withholdReason(observation: GatewayModelObservation, request: GatewayCatalogRequest): string | null {
+   if (observation.price.kind === "unknown") return "price_unknown";
+-  if (observation.price.kind === "positive_quote") return "price_not_a_capability";
++  if (observation.price.kind === "positive_quote" || observation.price.kind === "partial_quote") return "price_not_a_capability";
+   if (observation.tools === null) return "tools_unknown";
+   if (filedAccountId(request) === null) return "account_unverified";
+   return null;
+diff --git a/src/server/ai/hq-model-catalog.test.mjs b/src/server/ai/hq-model-catalog.test.mjs
+index 817fd89..83e0f21 100644
+--- a/src/server/ai/hq-model-catalog.test.mjs
++++ b/src/server/ai/hq-model-catalog.test.mjs
+@@ -329,6 +329,49 @@ test("each provider has its own page so Nara is not hidden by OpenRouter", async
+   assert.equal(ignored.sections[0].page, 1);
+ });
+ 
++test("a public OpenRouter row without request shows the known components and Nara models stay unique", async () => {
++  const view = await loadHqModelCatalog({
++    nowMs: NOW,
++    authorize: async () => null,
++    readCache: () => null,
++    transport: async (url) => {
++      if (url === NARA_PUBLIC_PLANS_URL) {
++        return {
++          status: 200,
++          body: {
++            data: [
++              { code: "free", token_cap_daily: 7000000, rpm_limit: 15, models: ["agnes-2.5-flash"] },
++              { code: "freemium", token_cap_daily: 25000000, rpm_limit: 50, models: ["agnes-2.5-flash"] },
++            ],
++          },
++        };
++      }
++      return {
++        status: 200,
++        body: {
++          data: [{ id: "vendor/paid-no-request", pricing: { prompt: "0.000003", completion: "0.000015" } }],
++        },
++      };
++    },
++  });
++  const paid = view.lines.find((line) => line.modelId === "vendor/paid-no-request");
++  const nara = view.lines.filter((line) => line.modelId === "agnes-2.5-flash");
++  assert.equal(paid.tariff, "3 / 15 / inconnu");
++  assert.deepEqual(paid.units, {
++    prompt: "usd_per_million_tokens",
++    completion: "usd_per_million_tokens",
++    request: "unknown",
++  });
++  assert.equal(paid.status, "indisponible");
++  assert.equal(paid.executable, false);
++  assert.equal(paid.executionAuthorized, false);
++  assert.equal(nara.length, 1);
++  assert.equal(nara[0].tariff, "inconnu");
++  assert.equal(view.executionAuthorized, false);
++  assert.equal(JSON.stringify(view).includes("7000000"), false);
++  assertViewSafe(view);
++});
++
+ test("loading the catalog does not change the approved model choice or the budget logs", async () => {
+   const beforeProfile = resolveModelProfile("claude-sonnet-4-6");
+   const before = chooseModel({
+diff --git a/src/server/ai/hq-model-catalog.ts b/src/server/ai/hq-model-catalog.ts
+index 4edc8d3..580ae84 100644
+--- a/src/server/ai/hq-model-catalog.ts
++++ b/src/server/ai/hq-model-catalog.ts
+@@ -151,9 +151,16 @@ function freshHold(observedAtMs: number, nowMs: number): boolean {
+   return nowMs - observedAtMs <= TARIFF_MAX_AGE_MS;
+ }
+ 
++function tariffPart(value: number | null): string {
++  return value === null ? "inconnu" : String(value);
++}
++
+ function tariffFor(price: CatalogConsultationRow["price"]): string {
+   if (price.kind === "unknown") return "inconnu";
+   if (price.kind === "proven_zero") return "0 / 0 / 0";
++  if (price.kind === "partial_quote") {
++    return `${tariffPart(price.promptUsdPerMTok)} / ${tariffPart(price.completionUsdPerMTok)} / ${tariffPart(price.perRequestUsd)}`;
++  }
+   return `${price.promptUsdPerMTok} / ${price.completionUsdPerMTok} / ${price.perRequestUsd}`;
+ }
+ 
+diff --git a/src/server/ai/model-catalog-consultation.test.mjs b/src/server/ai/model-catalog-consultation.test.mjs
+index 0f8d7d8..0f77f5c 100644
+--- a/src/server/ai/model-catalog-consultation.test.mjs
++++ b/src/server/ai/model-catalog-consultation.test.mjs
+@@ -74,7 +74,7 @@ function feeOnlyModel() {
+ }
+ 
+ function unknownModel() {
+-  return { id: "vendor/mystery", pricing: { prompt: "0" } };
++  return { id: "vendor/mystery", pricing: {} };
+ }
+ 
+ function zeroModel(id = "poolside/laguna-s.2:free") {
+diff --git a/src/server/ai/model-catalog-consultation.ts b/src/server/ai/model-catalog-consultation.ts
+index 6d41a09..8f68617 100644
+--- a/src/server/ai/model-catalog-consultation.ts
++++ b/src/server/ai/model-catalog-consultation.ts
+@@ -187,12 +187,19 @@ function isStale(observedAt: string | null, nowMs: number): boolean {
+ }
+ 
+ function unitsFor(price: PriceObservation): CatalogPriceUnits {
++  if (price.kind === "partial_quote") {
++    return {
++      prompt: price.promptUsdPerMTok === null ? "unknown" : "usd_per_million_tokens",
++      completion: price.completionUsdPerMTok === null ? "unknown" : "usd_per_million_tokens",
++      request: price.perRequestUsd === null ? "unknown" : "usd_per_request",
++    };
++  }
+   return price.kind === "unknown" ? UNKNOWN_PRICE_UNITS : KNOWN_PRICE_UNITS;
+ }
+ 
+ function unavailableReason(observation: GatewayModelObservation): string {
+   if (observation.price.kind === "unknown") return "price_unknown";
+-  if (observation.price.kind === "positive_quote") return "price_not_a_capability";
++  if (observation.price.kind === "positive_quote" || observation.price.kind === "partial_quote") return "price_not_a_capability";
+   if (observation.state === "listed") return "public_catalog_only";
+   if (observation.state === "connected") return "not_authorized";
+   return observation.withheld ?? "not_executable";
+-- 
+2.43.0
+

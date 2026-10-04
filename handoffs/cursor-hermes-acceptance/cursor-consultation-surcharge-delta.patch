@@ -1,0 +1,380 @@
+From 2aeebfd4be72f4732a6fae3b3bfc16a0594cbbf3 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 3 Oct 2026 15:15:02 +0000
+Subject: [PATCH] Keep known prompt and completion prices when an optional
+ surcharge is present.
+
+A non-zero or unreadable surcharge is listed with its own amount and unit. It no longer replaces the quote with unknown, and it never becomes a summed total or a proven-zero price.
+---
+ src/server/ai/gateway-catalog.test.mjs  | 118 +++++++++++++++++++++++-
+ src/server/ai/gateway-catalog.ts        |  74 +++++++++++----
+ src/server/ai/hq-model-catalog.test.mjs |  45 +++++++++
+ src/server/ai/hq-model-catalog.ts       |  14 ++-
+ 4 files changed, 229 insertions(+), 22 deletions(-)
+
+diff --git a/src/server/ai/gateway-catalog.test.mjs b/src/server/ai/gateway-catalog.test.mjs
+index a91f6b4..dd612e8 100644
+--- a/src/server/ai/gateway-catalog.test.mjs
++++ b/src/server/ai/gateway-catalog.test.mjs
+@@ -35,7 +35,7 @@ const {
+ const { assessServerEmission, TARIFF_MAX_AGE_MS } = await jiti.import(catalogPath);
+ const { generateStructuredJson, generateHqStructuredJson } = await jiti.import(providerPath);
+ const { executionTargetForModel } = await jiti.import(executionPath);
+-const { OPENROUTER_MODELS_API_ENDPOINT } = await jiti.import(contractPath);
++const { OPENROUTER_MODELS_API_ENDPOINT, isProvenZeroPricing } = await jiti.import(contractPath);
+ 
+ const NOW = Date.parse("2026-10-02T12:00:00.000Z");
+ const FRESH = new Date(NOW - 60_000).toISOString();
+@@ -794,7 +794,14 @@ test("19 an absent request keeps prompt and completion and does not invent zero"
+   assert.notEqual(promptOnly.price.completionUsdPerMTok, 0);
+   assert.equal(promptOnly.price.perRequestUsd, null);
+   assert.equal(negative.price.kind, "unknown");
+-  assert.equal(searched.price.kind, "unknown");
++  assert.equal(searched.price.kind, "partial_quote");
++  assert.equal(searched.price.promptUsdPerMTok, 3);
++  assert.equal(searched.price.completionUsdPerMTok, 15);
++  assert.equal(searched.price.perRequestUsd, null);
++  assert.deepEqual(searched.price.surcharges, [
++    { key: "web_search", amount: 0.01, unit: "usd_per_request" },
++  ]);
++  assert.notEqual(searched.price.surcharges[0].amount, 10000);
+   assert.equal(normalized.catalog.entries.length, 0);
+   assert.equal(normalized.observations.every((row) => row.executable === false), true);
+   noCents(normalized);
+@@ -830,3 +837,110 @@ test("20 repeated Nara plan models stay one row and keep each plan", async () =>
+   assert.equal(normalized.accountQuota.kind, "unknown");
+   noCents(normalized);
+ });
++
++test("21 a non-zero surcharge keeps known components and does not invent a total or a free price", async () => {
++  const normalized = await normalizeGatewayCatalog(request({
++    fetch: async () => ({
++      status: 200,
++      body: {
++        data: [
++          {
++            id: "vendor/cache",
++            pricing: { prompt: "0.0000008", completion: "0.0000032", input_cache_read: "0.00000003" },
++          },
++          {
++            id: "vendor/complete-plus-search",
++            pricing: { prompt: "0.000003", completion: "0.000015", request: "0.002", web_search: "0.01" },
++          },
++          {
++            id: "vendor/true-zero",
++            pricing: { prompt: "0", completion: "0", request: "0", web_search: "0", input_cache_read: "0" },
++          },
++          {
++            id: "vendor/zero-plus-search",
++            pricing: { prompt: "0", completion: "0", request: "0", web_search: "0.01" },
++          },
++          { id: "vendor/missing" },
++          { id: "vendor/empty", pricing: {} },
++          { id: "vendor/bad", pricing: { prompt: "-1", completion: "-1" } },
++          {
++            id: "vendor/unreadable-surcharge",
++            pricing: { prompt: "0.000003", completion: "0.000015", web_search: "-1" },
++          },
++          {
++            id: "vendor/image",
++            pricing: { prompt: "0.00000075", completion: "0.00000375", image: "0.00000075" },
++          },
++          {
++            id: "vendor/overrides",
++            pricing: { prompt: "0.000003", completion: "0.000015", overrides: ["tier"] },
++          },
++        ],
++      },
++    }),
++  }));
++  const cache = normalized.observations.find((row) => row.modelId === "vendor/cache");
++  const complete = normalized.observations.find((row) => row.modelId === "vendor/complete-plus-search");
++  const zero = normalized.observations.find((row) => row.modelId === "vendor/true-zero");
++  const zeroPlus = normalized.observations.find((row) => row.modelId === "vendor/zero-plus-search");
++  const missing = normalized.observations.find((row) => row.modelId === "vendor/missing");
++  const empty = normalized.observations.find((row) => row.modelId === "vendor/empty");
++  const bad = normalized.observations.find((row) => row.modelId === "vendor/bad");
++  const unreadable = normalized.observations.find((row) => row.modelId === "vendor/unreadable-surcharge");
++  const image = normalized.observations.find((row) => row.modelId === "vendor/image");
++  const overrides = normalized.observations.find((row) => row.modelId === "vendor/overrides");
++
++  assert.equal(cache.price.kind, "partial_quote");
++  assert.equal(cache.price.promptUsdPerMTok, 0.8);
++  assert.equal(cache.price.completionUsdPerMTok, 3.2);
++  assert.equal(cache.price.perRequestUsd, null);
++  assert.deepEqual(cache.price.surcharges, [
++    { key: "input_cache_read", amount: 0.03, unit: "usd_per_million_tokens" },
++  ]);
++  assert.equal(cache.withheld, "price_not_a_capability");
++
++  assert.equal(complete.price.kind, "partial_quote");
++  assert.equal(complete.price.promptUsdPerMTok, 3);
++  assert.equal(complete.price.completionUsdPerMTok, 15);
++  assert.equal(complete.price.perRequestUsd, 0.002);
++  assert.deepEqual(complete.price.surcharges, [
++    { key: "web_search", amount: 0.01, unit: "usd_per_request" },
++  ]);
++  assert.equal("total" in complete.price, false);
++  assert.notEqual(complete.price.kind, "positive_quote");
++  assert.notEqual(complete.price.kind, "proven_zero");
++
++  assert.equal(isProvenZeroPricing({ promptUsdPerMTok: 0, completionUsdPerMTok: 0, perRequestUsd: 0 }), true);
++  assert.equal(zero.price.kind, "proven_zero");
++  assert.deepEqual(zero.price.surcharges.map((item) => item.amount), [0, 0]);
++  assert.equal(isProvenZeroPricing({ promptUsdPerMTok: 0, completionUsdPerMTok: 0, perRequestUsd: null }), false);
++  assert.equal(zeroPlus.price.kind, "partial_quote");
++  assert.equal(zeroPlus.price.promptUsdPerMTok, 0);
++  assert.equal(zeroPlus.price.completionUsdPerMTok, 0);
++  assert.equal(zeroPlus.price.perRequestUsd, 0);
++  assert.equal(zeroPlus.price.surcharges[0].amount, 0.01);
++  assert.notEqual(zeroPlus.price.kind, "proven_zero");
++
++  assert.equal(missing.price.kind, "unknown");
++  assert.equal(empty.price.kind, "unknown");
++  assert.equal(bad.price.kind, "unknown");
++  assert.equal(unreadable.price.kind, "partial_quote");
++  assert.equal(unreadable.price.promptUsdPerMTok, 3);
++  assert.equal(unreadable.price.completionUsdPerMTok, 15);
++  assert.equal(unreadable.price.perRequestUsd, null);
++  assert.deepEqual(unreadable.price.surcharges, [
++    { key: "web_search", amount: null, unit: "unknown" },
++  ]);
++
++  assert.equal(image.price.promptUsdPerMTok, 0.75);
++  assert.deepEqual(image.price.surcharges, [
++    { key: "image", amount: 0.00000075, unit: "unknown" },
++  ]);
++  assert.notEqual(image.price.surcharges[0].amount, 0.75);
++
++  assert.equal(overrides.price.kind, "unknown");
++  assert.equal(normalized.catalog.entries.length, 0);
++  assert.equal(normalized.observations.every((row) => row.executable === false), true);
++  assert.equal(JSON.stringify(normalized).includes("gratuit"), false);
++  noCents(normalized);
++});
+diff --git a/src/server/ai/gateway-catalog.ts b/src/server/ai/gateway-catalog.ts
+index 8430291..bc5699b 100644
+--- a/src/server/ai/gateway-catalog.ts
++++ b/src/server/ai/gateway-catalog.ts
+@@ -16,12 +16,20 @@
+  * Each of prompt, completion, and request may be absent. An absent measure
+  * stays unknown and is never stored as zero. A partial quote is not free
+  * and does not become a capability.
++ * A present optional surcharge does not erase known prompt or completion.
++ * Each surcharge keeps its own amount and unit. Nothing here sums them into
++ * a total. proven_zero reuses isProvenZeroPricing and also requires every
++ * present surcharge to be a known exact zero. web_search is USD per request.
++ * Cache and internal_reasoning follow the per-token conversion. image is the
++ * raw USD decimal with unit unknown. pricing.overrides still withhold the
++ * whole quote.
+  * This module does not choose a model. The existing router remains the selector.
+  * Nothing here becomes notToExceedCents.
+  *
+  * Public Nara token_cap_daily, including 7000000, is announcedQuota only.
+  */
+ 
++import { isProvenZeroPricing } from "@/server/agents/models/model-provider-contract";
+ import type { ServerCapability, ServerCapabilityCatalog } from "@/server/ai/server-capability-catalog";
+ 
+ export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+@@ -49,22 +57,34 @@ const SURCHARGE_KEYS = [
+ export type GatewayId = "openrouter" | "nara";
+ export type CatalogObservationClass = "public_list" | "account_entitlement";
+ 
++export type PriceComponent = {
++  key: (typeof SURCHARGE_KEYS)[number];
++  /** Null means the field is present but unreadable. It is not zero. */
++  amount: number | null;
++  unit: "usd_per_million_tokens" | "usd_per_request" | "unknown";
++};
++
++type PriceSurcharges = {
++  /** Present surcharge fields only. Absent keys are omitted, not stored as zero. */
++  surcharges?: readonly PriceComponent[];
++};
++
+ export type PriceObservation =
+   | { kind: "unknown" }
+-  | { kind: "proven_zero" }
+-  | {
++  | ({ kind: "proven_zero" } & PriceSurcharges)
++  | ({
+       kind: "positive_quote";
+       promptUsdPerMTok: number;
+       completionUsdPerMTok: number;
+       perRequestUsd: number;
+-    }
+-  | {
++    } & PriceSurcharges)
++  | ({
+       /** Null is an absent or unreadable measure. It is not zero. */
+       kind: "partial_quote";
+       promptUsdPerMTok: number | null;
+       completionUsdPerMTok: number | null;
+       perRequestUsd: number | null;
+-    };
++    } & PriceSurcharges);
+ 
+ export type QuotaObservation =
+   | { kind: "unknown" }
+@@ -228,40 +248,60 @@ function readMeasure(value: unknown, parse: (raw: string) => number | null): num
+   return parse(value);
+ }
+ 
+-function surchargeBlocksQuote(record: Record<string, unknown>): boolean {
+-  for (const key of SURCHARGE_KEYS) {
+-    const value = record[key];
+-    if (value === undefined || value === "0") continue;
+-    if (typeof value !== "string") return true;
+-    const perMillion = usdPerTokenToPerMillion(value);
+-    if (perMillion === null || perMillion > 0) return true;
++function readSurcharge(key: (typeof SURCHARGE_KEYS)[number], value: unknown): PriceComponent | null {
++  if (value === undefined) return null;
++  if (typeof value !== "string") return { key, amount: null, unit: "unknown" };
++  if (key === "image") {
++    return { key, amount: parseUsdAmount(value), unit: "unknown" };
++  }
++  if (key === "web_search") {
++    const amount = parseUsdAmount(value);
++    return { key, amount, unit: amount === null ? "unknown" : "usd_per_request" };
+   }
+-  return false;
++  const amount = usdPerTokenToPerMillion(value);
++  return { key, amount, unit: amount === null ? "unknown" : "usd_per_million_tokens" };
+ }
+ 
+ function readPrice(pricing: unknown): PriceObservation {
+   if (!pricing || typeof pricing !== "object") return { kind: "unknown" };
+   const record = pricing as Record<string, unknown>;
+   if (Array.isArray(record.overrides) && record.overrides.length > 0) return { kind: "unknown" };
+-  if (surchargeBlocksQuote(record)) return { kind: "unknown" };
++  const surcharges = SURCHARGE_KEYS.flatMap((key) => {
++    const component = readSurcharge(key, record[key]);
++    return component ? [component] : [];
++  });
+   const promptPerM = readMeasure(record.prompt, usdPerTokenToPerMillion);
+   const completionPerM = readMeasure(record.completion, usdPerTokenToPerMillion);
+   const perRequestUsd = readMeasure(record.request, parseUsdAmount);
+-  if (promptPerM === null && completionPerM === null && perRequestUsd === null) return { kind: "unknown" };
+-  if (promptPerM !== null && completionPerM !== null && perRequestUsd !== null) {
+-    if (promptPerM === 0 && completionPerM === 0 && perRequestUsd === 0) return { kind: "proven_zero" };
++  const descriptor = {
++    promptUsdPerMTok: promptPerM,
++    completionUsdPerMTok: completionPerM,
++    perRequestUsd,
++  };
++  const listed = surcharges.length > 0 ? { surcharges } : {};
++  const surchargesAreZero = surcharges.every((item) => item.amount === 0);
++  if (isProvenZeroPricing(descriptor) && surchargesAreZero) return { kind: "proven_zero", ...listed };
++  if (promptPerM !== null && completionPerM !== null && perRequestUsd !== null && surchargesAreZero) {
+     return {
+       kind: "positive_quote",
+       promptUsdPerMTok: promptPerM,
+       completionUsdPerMTok: completionPerM,
+       perRequestUsd,
++      ...listed,
+     };
+   }
++  const anyKnown =
++    promptPerM !== null ||
++    completionPerM !== null ||
++    perRequestUsd !== null ||
++    surcharges.some((item) => item.amount !== null);
++  if (!anyKnown && surcharges.length === 0) return { kind: "unknown" };
+   return {
+     kind: "partial_quote",
+     promptUsdPerMTok: promptPerM,
+     completionUsdPerMTok: completionPerM,
+     perRequestUsd,
++    ...listed,
+   };
+ }
+ 
+diff --git a/src/server/ai/hq-model-catalog.test.mjs b/src/server/ai/hq-model-catalog.test.mjs
+index 83e0f21..64936de 100644
+--- a/src/server/ai/hq-model-catalog.test.mjs
++++ b/src/server/ai/hq-model-catalog.test.mjs
+@@ -372,6 +372,51 @@ test("a public OpenRouter row without request shows the known components and Nar
+   assertViewSafe(view);
+ });
+ 
++test("a non-zero surcharge stays beside the known tariff and is not labeled free", async () => {
++  const view = await loadHqModelCatalog({
++    nowMs: NOW,
++    authorize: async () => null,
++    readCache: () => null,
++    transport: async (url) => catalogBody(url, [
++      {
++        id: "vendor/surcharge",
++        pricing: {
++          prompt: "0.000003",
++          completion: "0.000015",
++          web_search: "0.01",
++          input_cache_read: "0.00000003",
++        },
++      },
++      { id: "vendor/true-zero", pricing: { prompt: "0", completion: "0", request: "0" } },
++      { id: "vendor/missing", pricing: {} },
++    ]),
++  });
++  const paid = view.lines.find((line) => line.modelId === "vendor/surcharge");
++  const zero = view.lines.find((line) => line.modelId === "vendor/true-zero");
++  const missing = view.lines.find((line) => line.modelId === "vendor/missing");
++  assert.equal(
++    paid.tariff,
++    "3 / 15 / inconnu ; web_search 0.01 usd_per_request ; input_cache_read 0.03 usd_per_million_tokens",
++  );
++  assert.equal(paid.tariff.includes("10000"), false);
++  assert.equal(paid.tariff.includes("18.03"), false);
++  assert.equal(paid.tariff.includes("gratuit"), false);
++  assert.deepEqual(paid.units, {
++    prompt: "usd_per_million_tokens",
++    completion: "usd_per_million_tokens",
++    request: "unknown",
++  });
++  assert.equal(paid.status, "indisponible");
++  assert.equal(paid.executable, false);
++  assert.equal(paid.executionAuthorized, false);
++  assert.equal(zero.tariff, "0 / 0 / 0");
++  assert.equal(zero.status, "indisponible");
++  assert.equal(missing.tariff, "inconnu");
++  assert.deepEqual(missing.units, { prompt: "unknown", completion: "unknown", request: "unknown" });
++  assert.equal(view.executionAuthorized, false);
++  assertViewSafe(view);
++});
++
+ test("loading the catalog does not change the approved model choice or the budget logs", async () => {
+   const beforeProfile = resolveModelProfile("claude-sonnet-4-6");
+   const before = chooseModel({
+diff --git a/src/server/ai/hq-model-catalog.ts b/src/server/ai/hq-model-catalog.ts
+index 580ae84..429ca2f 100644
+--- a/src/server/ai/hq-model-catalog.ts
++++ b/src/server/ai/hq-model-catalog.ts
+@@ -155,13 +155,21 @@ function tariffPart(value: number | null): string {
+   return value === null ? "inconnu" : String(value);
+ }
+ 
++function surchargeSuffix(price: CatalogConsultationRow["price"]): string {
++  if (price.kind === "unknown" || !price.surcharges || price.surcharges.length === 0) return "";
++  const text = price.surcharges
++    .map((item) => `${item.key} ${item.amount === null ? "inconnu" : String(item.amount)} ${item.unit}`)
++    .join(" ; ");
++  return ` ; ${text}`;
++}
++
+ function tariffFor(price: CatalogConsultationRow["price"]): string {
+   if (price.kind === "unknown") return "inconnu";
+-  if (price.kind === "proven_zero") return "0 / 0 / 0";
++  if (price.kind === "proven_zero") return `0 / 0 / 0${surchargeSuffix(price)}`;
+   if (price.kind === "partial_quote") {
+-    return `${tariffPart(price.promptUsdPerMTok)} / ${tariffPart(price.completionUsdPerMTok)} / ${tariffPart(price.perRequestUsd)}`;
++    return `${tariffPart(price.promptUsdPerMTok)} / ${tariffPart(price.completionUsdPerMTok)} / ${tariffPart(price.perRequestUsd)}${surchargeSuffix(price)}`;
+   }
+-  return `${price.promptUsdPerMTok} / ${price.completionUsdPerMTok} / ${price.perRequestUsd}`;
++  return `${price.promptUsdPerMTok} / ${price.completionUsdPerMTok} / ${price.perRequestUsd}${surchargeSuffix(price)}`;
+ }
+ 
+ function statusFor(row: CatalogConsultationRow, consultationStale: boolean): HqCatalogLine["status"] {
+-- 
+2.43.0
+

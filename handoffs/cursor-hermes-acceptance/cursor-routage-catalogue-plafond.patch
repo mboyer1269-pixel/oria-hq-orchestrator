@@ -1,0 +1,699 @@
+From ddf0eb2c9bac3edf3a76a6ecfe6b2bf3e30901e7 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Oct 2026 05:51:19 +0000
+Subject: [PATCH] Apply the server catalog ceiling and separate free from a
+ zero tariff.
+
+The strict HQ entry refuses a missing catalog. A foreign provider, a stale
+capability, and a hold above the catalog cap do not open a socket.
+---
+ src/server/ai/call-reservation.ts             |  49 ++++
+ src/server/ai/llm-json-provider.ts            |  46 ++-
+ src/server/ai/model-router.ts                 |   4 +
+ .../ai/server-capability-catalog.test.mjs     | 276 +++++++++++++++++-
+ src/server/ai/server-capability-catalog.ts    |  63 +++-
+ 5 files changed, 431 insertions(+), 7 deletions(-)
+
+diff --git a/src/server/ai/call-reservation.ts b/src/server/ai/call-reservation.ts
+index c91f094..cd43713 100644
+--- a/src/server/ai/call-reservation.ts
++++ b/src/server/ai/call-reservation.ts
+@@ -260,6 +260,12 @@ export async function authorizeCallAttempt(input: {
+   maxTokens: number;
+   inputBytes: number;
+   hasApiKey: boolean;
++  /**
++   * Positive USD cents from the server capability catalog. When set, a hold
++   * above this cap is released before mark and does not open a socket.
++   * This is not a client price and not an observed spend of zero.
++   */
++  catalogCeilingCents?: number;
+ }): Promise<AttemptAuthorization> {
+   if (!input.configured) {
+     return {
+@@ -326,6 +332,19 @@ export async function authorizeCallAttempt(input: {
+     };
+   }
+ 
++  if (
++    input.catalogCeilingCents !== undefined
++    && (!Number.isSafeInteger(input.catalogCeilingCents) || input.catalogCeilingCents < 1)
++  ) {
++    return {
++      emit: false,
++      reservation: {
++        ...emptyHold("refused", true, "catalog_ceiling"),
++        accessClass,
++      },
++    };
++  }
++
+   const reserved = await readGate(() => gate.reserve({
+     ...identity,
+     accessClass,
+@@ -337,6 +356,36 @@ export async function authorizeCallAttempt(input: {
+     return { emit: false, reservation: { ...reserved, configured: true, accessClass } };
+   }
+ 
++  if (
++    input.catalogCeilingCents !== undefined
++    && reserved.reservedCents > input.catalogCeilingCents
++  ) {
++    const released = await readGate(() => gate.release(identity));
++    if (
++      released.status === "released"
++      && released.networkEmitted === false
++      && released.reconciliationRequired === false
++    ) {
++      return {
++        emit: false,
++        reservation: { ...released, configured: true, accessClass, reason: "catalog_ceiling" },
++      };
++    }
++    return {
++      emit: false,
++      reservation: {
++        configured: true,
++        accessClass,
++        status: "held",
++        currency: "USD",
++        reservedCents: reserved.reservedCents,
++        networkEmitted: false,
++        reconciliationRequired: true,
++        reason: "catalog_ceiling",
++      },
++    };
++  }
++
+   const emitted = await readGate(() => gate.markEmitted(identity));
+   if (markConfirmed(emitted, reserved.reservedCents)) {
+     return {
+diff --git a/src/server/ai/llm-json-provider.ts b/src/server/ai/llm-json-provider.ts
+index 3f05d09..30b9515 100644
+--- a/src/server/ai/llm-json-provider.ts
++++ b/src/server/ai/llm-json-provider.ts
+@@ -88,6 +88,11 @@ export type LlmJsonProviderInput = {
+   requiresTools?: boolean;
+   /** Clock for tariff age. Defaults to Date.now(). */
+   nowMs?: number;
++  /**
++   * Set only by generateHqStructuredJson. Legacy callers leave this unset.
++   * An unset catalog is not a security proof.
++   */
++  requireServerCatalog?: boolean;
+   // Per-provider fetch overrides for test injection.
+   fetchFns?: {
+     anthropic?: typeof fetch;
+@@ -143,6 +148,7 @@ export type LlmJsonProviderErrorCode =
+   | "all_providers_failed"
+   | "model_unsupported"
+   | "capability_blocked"
++  | "non_api_authorized"
+   | "reservation_blocked";
+ 
+ export type LlmJsonProviderFailure = {
+@@ -209,8 +215,9 @@ function observedFrom(result: { observedModelId?: string | null }): string | nul
+ 
+ function capabilityBlocked(
+   input: LlmJsonProviderInput,
+-  block: ServerEmissionBlock,
++  block: ServerEmissionBlock | "catalog_ceiling" | "verified_free" | "subscription",
+   configured: boolean,
++  errorCode: LlmJsonProviderErrorCode = "capability_blocked",
+ ): LlmJsonProviderFailure {
+   const reservation: CallReservationSnapshot = configured
+     ? {
+@@ -227,7 +234,7 @@ function capabilityBlocked(
+   const cost = refused();
+   return {
+     ok: false,
+-    errorCode: "capability_blocked",
++    errorCode,
+     fallbackReason: block,
+     failureChain: [],
+     requestedModelId: requestedModelIdOf(input),
+@@ -361,16 +368,30 @@ export async function generateStructuredJson(
+   const gate = configured ? (input.reservationGate ?? createDurableCallReservationGate()) : null;
+   const callerId = randomUUID();
+   let reservation: CallReservationSnapshot = unavailableReservation();
++  let catalogCeilingCents: number | undefined;
++
++  if (input.requireServerCatalog && (!input.serverCatalog || !input.modelId || !input.workspaceId)) {
++    return capabilityBlocked(input, "catalog_required", configured);
++  }
+ 
+   if (input.serverCatalog && input.modelId) {
++    const invoked = executionTargetForModel(input.modelId);
+     const assessment = assessServerEmission({
+       catalog: input.serverCatalog,
+       modelId: input.modelId,
+       workspaceId: input.workspaceId ?? "",
+       requiresTools: input.requiresTools === true,
+       nowMs: input.nowMs ?? Date.now(),
++      ...(invoked.callable ? { invokedProvider: invoked.provider } : {}),
+     });
+     if (!assessment.emit) return capabilityBlocked(input, assessment.block, configured);
++    if (assessment.billingKind !== "api") {
++      return capabilityBlocked(input, assessment.billingKind, configured, "non_api_authorized");
++    }
++    if (invoked.callable) {
++      catalogCeilingCents = assessment.notToExceedCents;
++      if (!configured) return capabilityBlocked(input, "catalog_ceiling", configured);
++    }
+   }
+ 
+   if (input.modelId) {
+@@ -442,11 +463,23 @@ export async function generateStructuredJson(
+         workspaceId: input.workspaceId ?? "",
+         requiresTools: input.requiresTools === true,
+         nowMs: input.nowMs ?? Date.now(),
++        invokedProvider: provider,
+       });
+       if (!assessment.emit) {
+         if (attempts.length === 0) return capabilityBlocked(input, assessment.block, configured);
+         break;
+       }
++      if (assessment.billingKind !== "api") {
++        if (attempts.length === 0) {
++          return capabilityBlocked(input, assessment.billingKind, configured, "non_api_authorized");
++        }
++        break;
++      }
++      catalogCeilingCents = assessment.notToExceedCents;
++      if (!configured) {
++        if (attempts.length === 0) return capabilityBlocked(input, "catalog_ceiling", configured);
++        break;
++      }
+     }
+     const maxTokens = maxTokensFor(provider, input.maxTokens);
+     const decision = await authorizeCallAttempt({
+@@ -460,6 +493,7 @@ export async function generateStructuredJson(
+       maxTokens,
+       inputBytes,
+       hasApiKey: providerHasApiKey(provider),
++      ...(catalogCeilingCents !== undefined ? { catalogCeilingCents } : {}),
+     });
+     reservation = decision.reservation;
+     if (!decision.emit) {
+@@ -469,6 +503,7 @@ export async function generateStructuredJson(
+         decision.reservation.reason === "access_class" ||
+         decision.reservation.reason === "emit_right_held" ||
+         decision.reservation.reason === "mark_unconfirmed" ||
++        decision.reservation.reason === "catalog_ceiling" ||
+         decision.reservation.status === "lost" ||
+         decision.reservation.status === "unavailable";
+       failureChain.push(`${provider}: reservation ${decision.reservation.reason ?? decision.reservation.status}`);
+@@ -588,3 +623,10 @@ export async function generateStructuredJson(
+     cost,
+   };
+ }
++
++/** New HQ entry. Refuses when the server catalog, workspace, model, or authorization is missing. */
++export async function generateHqStructuredJson(
++  input: Omit<LlmJsonProviderInput, "requireServerCatalog">,
++): Promise<LlmJsonProviderResult> {
++  return generateStructuredJson({ ...input, requireServerCatalog: true });
++}
+diff --git a/src/server/ai/model-router.ts b/src/server/ai/model-router.ts
+index a8333e4..06cf1b8 100644
+--- a/src/server/ai/model-router.ts
++++ b/src/server/ai/model-router.ts
+@@ -475,10 +475,14 @@ export function chooseModel(input: ModelRouteInput): ModelRouteDecision {
+       workspaceId: input.workspaceId ?? "",
+       requiresTools: input.requiresTools === true,
+       nowMs: input.nowMs ?? Date.now(),
++      invokedProvider: target.provider,
+     });
+     if (!assessment.emit) {
+       execution = "refused";
+       refusalReason = assessment.block;
++    } else if (assessment.billingKind !== "api") {
++      execution = "refused";
++      refusalReason = assessment.billingKind;
+     }
+   }
+ 
+diff --git a/src/server/ai/server-capability-catalog.test.mjs b/src/server/ai/server-capability-catalog.test.mjs
+index de68414..67ad090 100644
+--- a/src/server/ai/server-capability-catalog.test.mjs
++++ b/src/server/ai/server-capability-catalog.test.mjs
+@@ -21,7 +21,7 @@ const providerPath = path.join(projectRoot, "src/server/ai/llm-json-provider.ts"
+ const routerPath = path.join(projectRoot, "src/server/ai/model-router.ts");
+ 
+ const { assessServerEmission, TARIFF_MAX_AGE_MS } = await jiti.import(catalogPath);
+-const { generateStructuredJson } = await jiti.import(providerPath);
++const { generateStructuredJson, generateHqStructuredJson } = await jiti.import(providerPath);
+ const { chooseModel } = await jiti.import(routerPath);
+ 
+ const NOW = Date.parse("2026-10-02T12:00:00.000Z");
+@@ -37,6 +37,7 @@ function entry(overrides = {}) {
+     source: "server-discovery",
+     observedAt: FRESH,
+     tools: true,
++    billingKind: "api",
+     tariff: {
+       currency: "USD",
+       notToExceedCents: 40,
+@@ -59,6 +60,7 @@ function assess(overrides = {}, call = {}) {
+     workspaceId: WORKSPACE,
+     requiresTools: false,
+     nowMs: NOW,
++    invokedProvider: "anthropic",
+     ...call,
+   });
+ }
+@@ -223,17 +225,65 @@ test("a present catalog still blocks a static api id that is not authorized", as
+   assert.equal(result.fallbackReason, "not_listed");
+ });
+ 
++function holdingGate(cents) {
++  return {
++    async reserve() {
++      return {
++        configured: true,
++        status: "held",
++        currency: "USD",
++        reservedCents: cents,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++    },
++    async markEmitted() {
++      return {
++        configured: true,
++        status: "emitted_unknown",
++        currency: "USD",
++        reservedCents: cents,
++        networkEmitted: true,
++        reconciliationRequired: true,
++      };
++    },
++    async release() {
++      return {
++        configured: true,
++        status: "released",
++        currency: null,
++        reservedCents: null,
++        networkEmitted: false,
++        reconciliationRequired: false,
++      };
++    },
++    async consume() {
++      return {
++        configured: true,
++        status: "consumed",
++        currency: "USD",
++        reservedCents: cents,
++        networkEmitted: true,
++        reconciliationRequired: false,
++      };
++    },
++  };
++}
++
+ test("observed execution is the response model, and estimation stays on chooseModel", async () => {
+   process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.HQ_CALL_RESERVATION = "1";
+   const observed = "claude-haiku-4-5-20251001-observed";
+   const result = await generateStructuredJson({
+     providerPreference: "anthropic",
+     modelId: HAIKU,
+     workspaceId: WORKSPACE,
++    callSubjectId: "subject-observed",
+     systemPrompt: "sys",
+     userPrompt: "user",
+     nowMs: NOW,
+     serverCatalog: catalog([entry()]),
++    reservationGate: holdingGate(40),
+     fetchFns: {
+       anthropic: async () => ({
+         ok: true,
+@@ -247,6 +297,7 @@ test("observed execution is the response model, and estimation stays on chooseMo
+     },
+   });
+   delete process.env.ANTHROPIC_API_KEY;
++  delete process.env.HQ_CALL_RESERVATION;
+   assert.equal(result.ok, true);
+   assert.equal(result.requestedModelId, HAIKU);
+   assert.equal(result.modelId, HAIKU);
+@@ -367,3 +418,226 @@ test("a lost provider response is followed by a single emission", async () => {
+     delete process.env.ANTHROPIC_API_KEY;
+   }
+ });
++
++test("zero cents is not verified free, and free or subscription invents no zero cost", async () => {
++  const zero = {
++    currency: "USD",
++    notToExceedCents: 0,
++    source: "server-quote",
++    observedAt: FRESH,
++  };
++  assert.equal(assess({ tariff: zero }).block, "tariff_unknown");
++  assert.equal(assess({ billingKind: "verified_free", tariff: zero }).block, "tariff_unknown");
++  assert.equal(assess({ billingKind: "subscription", tariff: zero }).block, "tariff_unknown");
++  const free = assess({ billingKind: "verified_free", tariff: null });
++  const subscription = assess({ billingKind: "subscription", tariff: null });
++  assert.equal(free.emit, true);
++  assert.equal(free.billingKind, "verified_free");
++  assert.equal(free.capability.tariff, null);
++  assert.equal(subscription.emit, true);
++  assert.equal(subscription.billingKind, "subscription");
++
++  let fetches = 0;
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const sent = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: catalog([entry({ billingKind: "verified_free", tariff: null })]),
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("free must not open the api adapter");
++      },
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(fetches, 0);
++  assert.equal(sent.ok, false);
++  assert.equal(sent.errorCode, "non_api_authorized");
++  assert.equal(sent.fallbackReason, "verified_free");
++  assert.equal(sent.executedModelId, null);
++  assert.equal(sent.cost.monetaryUsd, null);
++  assert.notEqual(sent.cost.monetaryUsd, 0);
++  assert.equal(sent.cost.networkRequestSent, false);
++});
++
++test("a catalog ceiling above the server hold does not emit", async () => {
++  process.env.HQ_CALL_RESERVATION = "1";
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  let fetches = 0;
++  let marks = 0;
++  let releases = 0;
++  const over = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-ceiling",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: catalog([entry()]),
++    reservationGate: {
++      ...holdingGate(41),
++      async markEmitted() {
++        marks += 1;
++        throw new Error("mark must not run above the catalog ceiling");
++      },
++      async release() {
++        releases += 1;
++        return {
++          configured: true,
++          status: "released",
++          currency: null,
++          reservedCents: null,
++          networkEmitted: false,
++          reconciliationRequired: false,
++        };
++      },
++    },
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("fetch must not run");
++      },
++    },
++  });
++  assert.equal(fetches, 0);
++  assert.equal(marks, 0);
++  assert.equal(releases, 1);
++  assert.equal(over.ok, false);
++  assert.equal(over.reservation.reason, "catalog_ceiling");
++  assert.equal(over.cost.networkRequestSent, false);
++  assert.equal(over.cost.monetaryUsd, null);
++
++  const within = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-ceiling-ok",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    serverCatalog: catalog([entry()]),
++    reservationGate: holdingGate(40),
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        return {
++          ok: true,
++          status: 200,
++          json: async () => ({
++            model: HAIKU,
++            content: [{ type: "text", text: JSON.stringify({ reply: "ok" }) }],
++            usage: { input_tokens: 1, output_tokens: 1 },
++          }),
++        };
++      },
++    },
++  });
++  delete process.env.HQ_CALL_RESERVATION;
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(fetches, 1);
++  assert.equal(within.ok, true);
++  assert.equal(within.executedModelId, HAIKU);
++  assert.equal(within.cost.monetaryUsd, null);
++});
++
++test("a stale or future capability and a foreign provider do not emit", async () => {
++  const staleAt = new Date(NOW - TARIFF_MAX_AGE_MS - 1).toISOString();
++  const futureAt = new Date(NOW + 60_000).toISOString();
++  assert.equal(assess({ observedAt: staleAt }).block, "capability_stale");
++  assert.equal(assess({ observedAt: futureAt }).block, "capability_stale");
++
++  let fetches = 0;
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  process.env.OPENAI_API_KEY = "synthetic";
++  process.env.HQ_CALL_RESERVATION = "1";
++  const collided = await generateHqStructuredJson({
++    providerPreference: "auto",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    callSubjectId: "subject-collision",
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    paidFallback: { authorized: true, workspaceId: WORKSPACE },
++    serverCatalog: catalog([
++      entry({ provider: "openai" }),
++      entry({ provider: "anthropic", state: "listed" }),
++    ]),
++    reservationGate: holdingGate(40),
++    fetchFns: {
++      anthropic: async () => {
++        fetches += 1;
++        throw new Error("anthropic must not run on a listed adapter");
++      },
++      openai: async () => {
++        fetches += 1;
++        throw new Error("openai authorization must not be reused");
++      },
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  delete process.env.OPENAI_API_KEY;
++  delete process.env.HQ_CALL_RESERVATION;
++  assert.equal(fetches, 0);
++  assert.equal(collided.ok, false);
++  assert.equal(collided.fallbackReason, "public_catalog_only");
++  assert.equal(collided.attempts.length, 0);
++  assert.equal(collided.cost.networkRequestSent, false);
++
++  const mismatch = assess({ provider: "openai" });
++  assert.equal(mismatch.block, "provider_mismatch");
++});
++
++test("the strict HQ entry refuses a missing catalog, and legacy absence is not a proof", async () => {
++  let strictFetches = 0;
++  let legacyFetches = 0;
++  process.env.ANTHROPIC_API_KEY = "synthetic";
++  const strict = await generateHqStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    nowMs: NOW,
++    fetchFns: {
++      anthropic: async () => {
++        strictFetches += 1;
++        throw new Error("strict path must not fetch");
++      },
++    },
++  });
++  const legacy = await generateStructuredJson({
++    providerPreference: "anthropic",
++    modelId: HAIKU,
++    workspaceId: WORKSPACE,
++    systemPrompt: "sys",
++    userPrompt: "user",
++    fetchFns: {
++      anthropic: async () => {
++        legacyFetches += 1;
++        return {
++          ok: true,
++          status: 200,
++          json: async () => ({
++            model: HAIKU,
++            content: [{ type: "text", text: JSON.stringify({ reply: "legacy" }) }],
++          }),
++        };
++      },
++    },
++  });
++  delete process.env.ANTHROPIC_API_KEY;
++  assert.equal(strictFetches, 0);
++  assert.equal(strict.errorCode, "capability_blocked");
++  assert.equal(strict.fallbackReason, "catalog_required");
++  assert.equal(strict.cost.networkRequestSent, false);
++  assert.equal(legacyFetches, 1);
++  assert.equal(legacy.ok, true);
++  assert.equal(legacy.executedModelId, HAIKU);
++});
+diff --git a/src/server/ai/server-capability-catalog.ts b/src/server/ai/server-capability-catalog.ts
+index a753136..0248369 100644
+--- a/src/server/ai/server-capability-catalog.ts
++++ b/src/server/ai/server-capability-catalog.ts
+@@ -21,6 +21,9 @@ export type ServerTariff = {
+   observedAt: string;
+ };
+ 
++/** Metered API, verified free, or an existing subscription. These are not interchangeable. */
++export type ServerBillingKind = "api" | "verified_free" | "subscription";
++
+ export type ServerCapability = {
+   modelId: string;
+   provider: string;
+@@ -28,6 +31,8 @@ export type ServerCapability = {
+   source: string;
+   observedAt: string;
+   tools: boolean;
++  billingKind: ServerBillingKind;
++  /** Positive USD cents for `api` only. Null for free and subscription. Never a zero-dollar observation. */
+   tariff: ServerTariff | null;
+   workspaceId: string;
+ };
+@@ -43,12 +48,26 @@ export type ServerEmissionBlock =
+   | "public_catalog_only"
+   | "not_authorized"
+   | "workspace_mismatch"
++  | "provider_mismatch"
++  | "capability_stale"
+   | "tools_unavailable"
+   | "tariff_unknown"
+-  | "tariff_stale";
++  | "tariff_stale"
++  | "catalog_required";
+ 
+ export type ServerEmissionAssessment =
+-  | { emit: true; capability: ServerCapability }
++  | {
++      emit: true;
++      capability: ServerCapability;
++      billingKind: "api";
++      /** Server cap that authorizeCallAttempt must enforce. Not an observed spend. */
++      notToExceedCents: number;
++    }
++  | {
++      emit: true;
++      capability: ServerCapability;
++      billingKind: "verified_free" | "subscription";
++    }
+   | { emit: false; block: ServerEmissionBlock; requestedModelId: string };
+ 
+ export function assessServerEmission(input: {
+@@ -57,6 +76,8 @@ export function assessServerEmission(input: {
+   workspaceId: string;
+   requiresTools: boolean;
+   nowMs: number;
++  /** Adapter that would actually be called. A different catalog provider is not a match. */
++  invokedProvider?: string;
+ }): ServerEmissionAssessment {
+   const requestedModelId = input.modelId;
+   const entries = Array.isArray(input.catalog?.entries) ? input.catalog.entries : [];
+@@ -75,7 +96,18 @@ export function assessServerEmission(input: {
+     return { emit: false, block: "workspace_mismatch", requestedModelId };
+   }
+ 
+-  const entry = sameWorkspace[0];
++  const invoked = input.invokedProvider;
++  const matchingProvider = invoked
++    ? sameWorkspace.filter((entry) => entry.provider === invoked)
++    : sameWorkspace;
++  if (invoked && matchingProvider.length === 0) {
++    return { emit: false, block: "provider_mismatch", requestedModelId };
++  }
++
++  const entry = matchingProvider[0];
++  if (readObservedAt(entry.observedAt, input.nowMs)) {
++    return { emit: false, block: "capability_stale", requestedModelId };
++  }
+   if (entry.state === "listed") {
+     return { emit: false, block: "public_catalog_only", requestedModelId };
+   }
+@@ -89,11 +121,26 @@ export function assessServerEmission(input: {
+     return { emit: false, block: "tools_unavailable", requestedModelId };
+   }
+ 
++  if (entry.billingKind === "verified_free" || entry.billingKind === "subscription") {
++    if (entry.tariff !== null) {
++      return { emit: false, block: "tariff_unknown", requestedModelId };
++    }
++    return { emit: true, capability: entry, billingKind: entry.billingKind };
++  }
++  if (entry.billingKind !== "api") {
++    return { emit: false, block: "tariff_unknown", requestedModelId };
++  }
++
+   const tariffBlock = readTariff(entry.tariff, input.nowMs);
+   if (tariffBlock) {
+     return { emit: false, block: tariffBlock, requestedModelId };
+   }
+-  return { emit: true, capability: entry };
++  return {
++    emit: true,
++    capability: entry,
++    billingKind: "api",
++    notToExceedCents: entry.tariff!.notToExceedCents,
++  };
+ }
+ 
+ function verifiedEntry(entry: ServerCapability): boolean {
+@@ -103,6 +150,7 @@ function verifiedEntry(entry: ServerCapability): boolean {
+     && typeof entry.provider === "string"
+     && entry.provider.length > 0
+     && (entry.state === "listed" || entry.state === "connected" || entry.state === "authorized")
++    && (entry.billingKind === "api" || entry.billingKind === "verified_free" || entry.billingKind === "subscription")
+     && typeof entry.source === "string"
+     && entry.source.length > 0
+     && Number.isFinite(Date.parse(entry.observedAt))
+@@ -111,6 +159,13 @@ function verifiedEntry(entry: ServerCapability): boolean {
+   );
+ }
+ 
++function readObservedAt(observedAt: string, nowMs: number): "capability_stale" | null {
++  const parsed = Date.parse(observedAt);
++  if (!Number.isFinite(parsed) || parsed > nowMs) return "capability_stale";
++  if (nowMs - parsed > TARIFF_MAX_AGE_MS) return "capability_stale";
++  return null;
++}
++
+ function readTariff(
+   tariff: ServerTariff | null,
+   nowMs: number,
+-- 
+2.43.0
+

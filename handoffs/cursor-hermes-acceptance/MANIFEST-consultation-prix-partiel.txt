@@ -1,0 +1,20 @@
+Delta depuis 0309b8d5d85678faa8944e5d829c2c3f295f798d.
+Produit 71814d76f99965d10599a53b34dc5a9e5f6ab3b9
+Arbre f6cf4ca1abd45cfc7313b38b269c8b53426fda46
+Patch cursor-consultation-prix-partiel-delta.patch
+SHA256 ae8d1323bc22400bb176d568d13372d1a91a7e27b8cdc58d6448482709d14287
+
+Constat public, sans clé, le 2026-10-03.
+GET https://openrouter.ai/api/v1/models : 466 modèles. pricing.prompt et pricing.completion sont des chaînes sur les 466. pricing.request est absent sur les 466. readPrice exigeait les trois chaînes et renvoyait unknown, donc le tarif affiché était inconnu.
+GET https://router.bynara.id/api/plans : 5 plans, 20 modèles distincts, 17 identifiants répétés (jusqu'à 4 plans).
+
+Fichiers
+src/server/ai/gateway-catalog.ts
+src/server/ai/gateway-catalog.test.mjs
+src/server/ai/model-catalog-consultation.ts
+src/server/ai/model-catalog-consultation.test.mjs
+src/server/ai/hq-model-catalog.ts
+src/server/ai/hq-model-catalog.test.mjs
+
+Hors delta : page runtime, missions, Tooltip, chooseModel, budgets.
+Une surcharge non nulle ou des overrides laissent encore le prix entier inconnu. Une mesure absente n'est pas écrite 0. Un devis partiel n'est pas une capacité.
