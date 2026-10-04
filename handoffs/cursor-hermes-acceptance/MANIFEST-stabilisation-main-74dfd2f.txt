@@ -1,0 +1,26 @@
+Stabilisation catalogue — base produit accessible la plus récente
+Révision testée (avant correctif): origin/main @ 74dfd2f (feat OpenHands mission proof Atelier #368)
+Révision après correctif unique: a8ae550 (cherry-pick logique 071dbf7)
+
+Contre-vérification (tests ciblés, pas suite complète):
+- Tarifs partiels / surcharges: OK (tests gateway + hq-model-catalog existants, 49 pass)
+- Quota/coût inconnu ≠ zéro gratuit: OK (tests 7M announced-only, unknown price, etc.)
+- Cache périmé actualisable (consultation if-stale/now): OK (model-catalog-consultation.test.mjs)
+- Identité ACP default vs modèle fournisseur: ÉCHEC sur 74dfd2f (default ingéré avec tarif) → corrigé a8ae550
+
+Non corrigé dans ce lot (1 seul défaut autorisé):
+- free-model-catalog mtime + hold OpenRouter (cursor-catalogue-fiabilite-fraicheur.patch, parent 0834abd) — absent de main
+
+Patch pour main: cursor-catalogue-acp-default-guard-main74dfd2f.patch
+Parent git am: 74dfd2f
+
+Tests exécutés post-patch:
+node --test --test-concurrency=1 \
+  src/server/ai/gateway-catalog.test.mjs \
+  src/server/ai/hq-model-catalog.test.mjs \
+  src/server/ai/model-catalog-consultation.test.mjs
+(49 pass, 0 fail)
+
+Régressions default:
+- ACP profile id default is not ingested as a provider catalog row
+- provider catalog rows exclude the ACP profile id default
