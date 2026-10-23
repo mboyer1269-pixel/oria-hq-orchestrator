@@ -6,6 +6,17 @@ from pathlib import Path
 permission_probe = "--permission-probe" in sys.argv
 cancel_probe = "--cancel-probe" in sys.argv
 pending_prompt_id = None
+model_selections = 0
+model_probe = sys.argv[sys.argv.index("--model-probe") + 1] if "--model-probe" in sys.argv else None
+model_log = Path(sys.argv[sys.argv.index("--model-log") + 1]) if "--model-log" in sys.argv else None
+
+def model_options(current="fixture-model-1"):
+    return [{"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": current, "options": [
+                 {"value": "default", "name": "Default"},
+                 {"value": "fixture-model-1", "name": "One"},
+                 {"value": "fixture-model-2", "name": "Two"}]}]
+
 
 
 def send(message):
@@ -15,6 +26,9 @@ def send(message):
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
+    if model_log:
+        with model_log.open("a", encoding="utf-8") as log:
+            log.write(json.dumps(message) + "\n")
     request_id = message.get("id")
     if method == "initialize":
         result = {
@@ -25,6 +39,26 @@ for line in sys.stdin:
         }
     elif method == "session/new":
         result = {"sessionId": "hq-synthetic-session"}
+        if model_probe and model_probe != "absent":
+            result["configOptions"] = model_options()
+    elif method == "session/set_mode" and model_probe:
+        if message['params']['modeId'] != 'default':
+            send({'jsonrpc': '2.0', 'id': request_id,
+                  'error': {'code': -32602, 'message': 'Only default mode supported'}})
+            continue
+        result = {}
+    elif method == "session/set_config_option" and model_probe:
+        model_selections += 1
+        if model_probe == "timeout" and model_selections > 1:
+            continue
+        if model_probe == "disconnect" and model_selections > 1:
+            sys.exit(0)
+        requested = message["params"]["value"]
+        if model_probe == "reject" or requested not in ("default", "fixture-model-1", "fixture-model-2"):
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32602, "message": "Synthetic model rejected"}})
+            continue
+        result = {"configOptions": [] if model_probe == "missing-ack" else model_options("fixture-model-1" if model_probe == "mismatch" else requested)}
     elif method == "session/prompt":
         marker = "HQ_SYNTHETIC_PROTOCOL_OK"
         if cancel_probe:
@@ -48,6 +82,9 @@ for line in sys.stdin:
             }})
             # The driver imposes a hard deadline in addition to SDK timeouts.
             response = json.loads(sys.stdin.readline())
+            if model_log:
+                with model_log.open("a", encoding="utf-8") as log:
+                    log.write(json.dumps(response) + "\n")
             assert response.get("id") == "permission-probe", response
             outcome = response["result"]["outcome"]
             if outcome == {"outcome": "selected", "optionId": "allow-once"}:
